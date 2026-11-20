@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-020（新 target 五段复采 + 文档 W9 口径核对）**
+- 当前任务：**NOF-021（4 线程诊断五段 + 盘型核对：bdev 是排队还是介质底板）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -85,7 +85,8 @@
 | NOF-016 | 已关闭 2026-11-20（**通过**） | yin target 已起：PID 341038、md5 736a902f…、listener **192.168.84.149:4457**、strip 256K/11 成员、dev udmac0d1e2；旧三进程全退；我方键清空、yin 键未动；master 重启 PID 2462234（leader/serving、enabled=0）；回滚快照已存 |
 | NOF-017 | 已关闭 2026-11-20（**通过**） | 新 target 上 mount rc[0]（233ms）；1024 分区 reconcile 全通过（60s+ 复查仍 0）；quota 181,399 B；device_identity=5805fd63… 与新 raid 一致；**mount 期 target W9≈70µs（n=10，旧 target 255–288µs）** |
 | NOF-018 | 已关闭 2026-11-20（**通过**） | writer 400/0，1.5625 GiB，0.39s，4091.95 MiB/s；写时延 Avg 977.53 / P50 901.03 / P99 2775.35；**写窗口 target W9 23,550 ns（旧 24,840，−5.2%）** ⇒ 换 target 不影响写路径，5× 差异在读路径 |
-| NOF-019 | 已关闭 2026-11-20（**通过**） | **端到端基本不变**：R16 p50 719.0（旧 714.9，+0.58%）、R4 602.5（旧 591.1，+1.93%，均在臂内离散内）；**target 读 W9 254.8µs（旧 283–288，−11%）** ⇒ target 变快未传导到端到端；5× 差距未闭合（4.66×，且 54.68 口径为读/写待核） |
+| NOF-019 | 已关闭 2026-11-20（**通过**） | **端到端基本不变**：R16 p50 719.0（旧 714.9，+0.58%）、R4 602.5（旧 591.1，+1.93%，均在臂内离散内）；**target 读 W9 254.8µs（旧 283–288，−11%）** ⇒ target 变快未传导到端到端 |
+| NOF-020 | 已关闭 2026-11-20（**通过**） | **文档 54.68µs = 11 盘写路径样本**（非读！"5× 差距"系读/写跨口径，撤回）；新 target 读五段 p50：roundtrip 514 / target 424 / **bdev 387（与旧 target 完全相同）** / data 13 / outside 59 / residual 60；`target_valid=98.9%`（TRACE=0 不影响遥测）；端到端诊断 P50 779，控制面+应用约 265µs |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -296,6 +297,17 @@
 - 读 W9（254.8µs）与写 W9（23.6µs）相差 **10.8×**：读写 target 执行特性差异极大。
 - 5× 差距：若按读口径，仍是 4.66×；但**54.68µs 是读还是写口径需核对**（NOF-020 B）。
 - 6 遍 failed=0、verify 0 错；qrpc p50 66–96µs；无新增 master/target 错误。
+
+### NOF-020 关键事实（口径更正 + 新 target 五段，2026-11-20）
+
+- **文档口径更正**：§3.3 原文明确 `11 盘 avg=54.68µs（n=4023，TOTAL=59µs，exec 91.2%）——11 盘写路径样本`。⇒ 54.68µs 是**写路径**，不是读；此前"读 W9 254.8 vs 54.68、5× 差距"属**读/写跨口径比较，撤回**。文档同样未给出 11 盘**读**路径的 W9。
+- **新 target 读五段（16 线程，诊断口径 p50）**：roundtrip **514** / target **424** / **bdev 387** / data 13 / outside 59 / residual 60 / pre_send 0 µs；bdev/roundtrip=75.3%、bdev/target=91.3%。
+- **bdev 387µs 与旧 gap target 完全相同（0 变化）** ⇒ 换 target 的收益只在 data/outside/residual（分别 32→13、81→59、82→60），不在盘执行段。
+- `target_valid=1` 占 **98.9%**（2,686/2,713 读阶段）⇒ `TARGET_TRACE_ENTRIES=0` 不影响 target 段遥测。
+- 端到端（诊断）：Min 510.76 / Avg 858.27 / **P50 779.19** / P90 1173.18 / P99 2200.19；诊断开销 P50 +8.4%。roundtrip p50 514 与 bench P50 779 相差 ~265µs = 控制面 + 应用层/流水线。
+- 同阈值 400µs 下 SLOW_IO 条数 4,675→2,790（−40%），但 p50 仅 −2.7% ⇒ 改善集中在长尾。
+- target W 块：诊断窗口 W9 270.3µs（滚动窗口，与 NOF-019 的 254.7 不可严格比较）、exec 94.8%。
+- **结论**：读路径的盘执行段（bdev ~387µs）是当前最大单项且未随 target 构建变化；要到 300µs 端到端，必须动 bdev 本身或减少/重排 child，而不是继续换 target。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -1176,7 +1188,7 @@ R16/R4 中位 P50/P90/P99/Avg；与旧 target 同臂的差；target 读窗口 W9
 
 ---
 
-# NOF-020（待执行 · 新 target 五段复采 + 文档 W9 口径核对 · 2026-11-20）
+# NOF-020（已关闭 · 通过 · 新 target 五段复采 + 文档 W9 口径核对 · 2026-11-20）
 
 ## 目的
 
@@ -1203,3 +1215,36 @@ R16/R4 中位 P50/P90/P99/Avg；与旧 target 同臂的差；target 读窗口 W9
 ## 回执必答（第一行）
 
 新 target 五段 p50（roundtrip/target/bdev/pre_send/outside/residual）及与旧的差；`target_valid` 分布；target W9；54.68µs 的读/写口径原文。
+
+---
+
+# NOF-021（待执行 · 4 线程诊断五段 + 盘型核对 · 2026-11-20）
+
+## 目的
+
+1. 判断 **bdev ~387µs** 是"排队放大"还是"盘的介质底板"：把并发降到 4 线程再采五段，看 bdev_us 是否下降。
+2. 识别 11 块成员盘的型号/固件（判断是 TLC 还是 QLC、随机读介质延迟量级）。
+
+## A. 4 线程诊断读（node3，1 遍）
+
+- 环境与 NOF-020 相同（`VSEG_DIAGNOSTIC=1`、`VSEG_SLOW_IO_US=400`、`MC_HIFREQ_LOG_SAMPLE_RATE=1`；400 keys × 4 MiB、batch 1、warmup 5、seq、verify=true、节点 node3、master 50056、admin 9006、dev `udmac0d1e2`）。
+- **唯一改动：`--num_threads=4`**。
+- 采集：
+  1. 读阶段 p50/p90：roundtrip / target / bdev / data / outside / residual / pre_send；
+  2. `target_valid` 分布；SLOW_IO 条数；
+  3. 端到端 Min/Avg/P50/P90/P99/Max；failed/verify；
+  4. 跑完立即采 target W 块（W9/n/exec%）。
+- 与 16 线程诊断（NOF-020：roundtrip 514 / target 424 / bdev 387 / outside 59 / residual 60）并排对比。
+
+## B. 盘型核对（只读）
+
+- 通过 target RPC `bdev_get_bdevs` 读取成员 bdev `Nvme0n1…Nvme10n1` 的 `product_name`/model、`block_size`、`num_blocks`；若 RPC 不提供型号，从 target 启动日志/内核日志（`dmesg` 或 `/var/log`，只读）找 NVMe model string。
+- 报告：型号、固件（若可得）、容量；并注明是否为常见 QLC/TLC 系列（只报事实，不推断性能）。
+
+## C. 边界
+
+- 只读；仅 1 遍诊断 reader；不改其它负载参数；不动 target/master；不重启；失败停手。
+
+## 回执必答（第一行）
+
+4 线程五段 p50（roundtrip/target/bdev/outside/residual）与 16 线程的差；bdev 是否随并发下降（降多少）；盘型号/固件；target W9/n；有无失败。
