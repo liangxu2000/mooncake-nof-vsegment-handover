@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-012（读路径旋钮矩阵：chunk 128K→4M × qpairs，诊断关闭，每臂 3 遍）**
+- 当前任务：**NOF-013（验证 chunk 是否作用于读路径 + 提取文档优化方向原文）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -78,6 +78,7 @@
 | NOF-009 | 已关闭 2026-11-20（**通过**） | writer 400/0，1.5625 GiB，0.40 s，3970.7 MiB/s；master logical_used 精确 +1,677,721,600 B；无 ERROR；target 仅周期 W 汇总（per-IO detail 未开） |
 | NOF-010 | 已关闭 2026-11-20（**通过**） | 我们的读：400/400、verify 0 错；**Avg 801.29 / P50 791.06 / P90 1017.98 / P99 1709.42 / Max 1886.75µs**；URMA_SLOW_IO=0（打点默认关、阈值 100ms）；控制面逐 key RPC 158–386µs；target 读窗口 W9 285.87µs/exec 94.3% |
 | NOF-011 | 已关闭 2026-11-20（**通过**） | 采到 5,044 条 `URMA_SLOW_IO`（读阶段 4,675）；**p50 五段：roundtrip 528 / target 430 / bdev 387 / data 32 / outside 81 / residual 82µs**；bdev 占 target 90%、占 roundtrip 73%；诊断开销 +17.7%（Avg 801→943）；阈值 400µs 覆盖 36.5% child IO |
+| NOF-012 | 已关闭 2026-11-20（**无定论**） | 15/15 遍成功；各臂 p50 中位 721–759µs，臂间差 < 臂内极差（35–75µs）⇒ chunk/qpairs 在本次样本下无可辨识影响；target W9 277.8µs 未变；chunk 是否生效无法证明（诊断关、日志无 child 记录） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -206,6 +207,16 @@
 - 二进制确认含 `URMA_SLOW_IO` 格式串（node3/node1 各 1 处）；`MC_STORE_TRANSFER_DIAG` 在二进制中无符号（无效，已记录）。
 - target 窗口：W9 avg 283,010 ns、exec 93.9%、push 5.8%；per-IO `URMA_BDEV_DETAIL` 仍 0 增长。
 - 结论（事实层）：**盘上执行 bdev 是读路径最大单项**（p50 387µs，占 73%）；控制面每 key RPC（NOF-010 的 150–400µs）与 bdev 是两个独立大头。是否由"128KiB < 256KiB strip 导致单盘定向"解释，待 NOF-012 矩阵验证。
+
+### NOF-012 关键事实（旋钮矩阵无定论，2026-11-20）
+
+- 15/15 遍成功（failed=0、verify 0 错、无超时）；单遍 10–11 s；诊断关。
+- 各臂 p50 中位：V0 732.94 / **V1 721.17（最优，−1.61%）** / V2 729.06 / V3 759.02（+3.56%，p99 +248µs 最差）/ V4 744.67（qpairs 16，+1.60%）µs。
+- 臂内 3 遍极差 35–75µs > 臂间最大差 26µs ⇒ **本次样本无法区分各臂**。
+- target W9 avg 277,840 ns（−1.6% vs 跑前）、exec 94.8%；**chunk/qpairs 对 target SSD 执行段无影响**。
+- **关键疑点**：chunk 是否真正生效无法证明——诊断关闭后 V0 与 V3 日志行数完全相同、无 child/chunk 级记录；需要诊断口径 A/B（NOF-013）。
+- 控制面 `qrpc_total_p50` 74–92µs（与端到端无相关）；get_into 的 query_us ≈120µs。
+- 口径偏差：bench `--duration` 不支持 remote_memory；本矩阵为"400 keys/遍 × 3 遍取中位"，非 120s。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -758,7 +769,7 @@ reader 读成功多少、失败多少；Avg/P50/P90/P99/Max；`URMA_SLOW_IO` 条
 
 ---
 
-# NOF-012（待执行 · 读路径旋钮矩阵 · 2026-11-20）· chunk 128K→4M × qpairs，诊断关闭
+# NOF-012（已关闭 · 无定论 · 读路径旋钮矩阵 · 2026-11-20）· chunk 128K→4M × qpairs，诊断关闭
 
 ## 背景与问题
 
@@ -801,3 +812,41 @@ reader 读成功多少、失败多少；Avg/P50/P90/P99/Max；`URMA_SLOW_IO` 条
 ## 回执必答（第一行）
 
 各臂中位 P50/P99/Avg（列出 V0–V4）；哪一臂最好、差距多少；有无 failed/verify 错误；V3 是否受 inflight 限流（如实）；chunk 与读时延的关系（只报事实）。
+
+---
+
+# NOF-013（待执行 · chunk 生效性 A/B + 文档优化方向 · 2026-11-20）
+
+## 目的
+
+1. 证明/证伪 `MC_NOF_SUBMIT_CHUNK_BYTES` 是否作用于**读路径**（NOF-012 无法区分：V0 与 V3 日志行数相同、target W9 未变）。
+2. 取交接文档里同事给出的**根因结论与优化方向原文**，作为下一步实验依据。
+
+## A. 文档取证（只读；总输出 ≤40 行原文）
+
+1. §3.1 端到端表（L45–54）逐行原文；
+2. §3.2 内部拆分（L56–63）逐行原文；
+3. §3.4 控制面（L79–83）逐行原文；
+4. §四 根因结论 + "优化方向"表（L85–99）原文；
+5. §八 交接建议（L145–151）5 条原文。
+
+## B. chunk 生效性 A/B（两遍 reader，诊断口径）
+
+- 环境：与 NOF-011 相同诊断开关（`VSEG_DIAGNOSTIC=1`、`VSEG_SLOW_IO_US=400`、`MC_HIFREQ_LOG_SAMPLE_RATE=1`）；负载与 NOF-012 相同（400 keys × 4 MiB、16 线程、batch 1、warmup 5、seq、verify=true）。
+- 两遍，按顺序：
+  - **V0**：`MC_NOF_SUBMIT_CHUNK_BYTES=131072`
+  - **V3**：`MC_NOF_SUBMIT_CHUNK_BYTES=4194304`
+- 每遍跑完后立即采集 target W 块（n、W9 avg、exec%），并保存完整日志 `run/chunkab_V0.log`、`run/chunkab_V3.log`（node3）。
+- 从每份日志提取（读阶段按行号切分，剔除 warmup）：
+  1. `URMA_SLOW_IO` 条数；
+  2. opcode=2 的 `blocks` 字段：min / p50 / max、出现次数 top3 值；
+  3. 端到端 p50/p99（诊断口径，仅相对参考）。
+- **判定（只报事实）**：V3 的 blocks 是否从 256（128 KiB）变为 4096（2 MiB 切片）或 8192（4 MiB）？SLOW_IO 条数是否相应约为 1/16 或 1/32？
+
+## C. 边界
+
+- 只读；仅两遍 reader（V0/V3）；不改其它负载参数；不动 target/master；不重启；失败停手。
+
+## 回执必答（第一行）
+
+V0/V3 的 blocks p50 与 SLOW_IO 条数、target W n；chunk 是否作用于读路径（给判断依据）；文档优化方向 3 条原文要点。
