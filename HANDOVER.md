@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-017（mount 新 target 192.168.84.149:4457 + reconcile 门禁）**
+- 当前任务：**NOF-018（writer 重灌 400 keys 到新 target）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -83,6 +83,7 @@
 | NOF-014 | 已关闭 2026-11-20（**通过**） | 15/15 遍成功；**只有降线程有效**：L3（4 线程）p50 591.1 vs 714.9（−17.3%）、p99 −49.5%；8MiB inflight 无益、2MiB 灾难（+670%）；副本缓存 env 在二进制中不存在；target W9 在 L3 满窗口仍 254–259µs |
 | NOF-015 | 已关闭 2026-11-20（**通过**） | env 自证 chunk 已进进程（131072/262144/2097152），但读路径 NVMe IO 恒为 **128KiB**（blocks p50=256）⇒ **代码层固定**，env 无法改；vsegment child=2MiB（planned_children=2），128KiB 是更下层 IO 粒度 |
 | NOF-016 | 已关闭 2026-11-20（**通过**） | yin target 已起：PID 341038、md5 736a902f…、listener **192.168.84.149:4457**、strip 256K/11 成员、dev udmac0d1e2；旧三进程全退；我方键清空、yin 键未动；master 重启 PID 2462234（leader/serving、enabled=0）；回滚快照已存 |
+| NOF-017 | 已关闭 2026-11-20（**通过**） | 新 target 上 mount rc[0]（233ms）；1024 分区 reconcile 全通过（60s+ 复查仍 0）；quota 181,399 B；device_identity=5805fd63… 与新 raid 一致；**mount 期 target W9≈70µs（n=10，旧 target 255–288µs）** |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -267,6 +268,15 @@
 - 唯一额外动作：wrapper 仅存在于 node1，已原样 scp 到 node3 `/tmp/run_vesegment_target.sh`（md5 一致）。
 - HugePages：Free 347（yin target 占 ~8.4 GiB）。
 - **待验证**：`TARGET_TRACE_ENTRIES=0`（wrapper 本次默认）是否影响 target 侧 per-IO 遥测（URMA_SLOW_IO 的 target 段）；NOF-019 读时观察 `target_valid`。
+
+### NOF-017 关键事实（新 target mount 通过，2026-11-20）
+
+- mount rc[0]（`elapsed_us[233163]`，233 ms）；`init_rc=0`、`Attached`、`Opened NoF segment ns=1 io_qpairs=4`；设备映射 20 条（udmac0d1e2 + 两个 provider）。
+- **P6 在新 target 上再次通过**：`scanned=1024, owned_by_me=1024, reconcile_fail=0`；`VSegment Status: enabled=1, partitions_installed=1024, vsegments=1024, logical_capacity=64 GiB`；60 s+ 复查仍 0。
+- etcd：`/cvm/vseg_nofvseg/` 8 键（quota 181,399 B）、`/oplog/` 32 键；segment 描述符 `device_identity=5805fd63…` = 新 yin raid0 的 nguid（与 NOF-016 记录一致）。
+- **quota 发布延迟 +18 s**（mount 16:34:52 → 发布 16:35:11）：后续门禁检查必须等 ≥20 s，否则易误判。
+- **target W9 在 mount 期 ≈ 70,210 ns（n=10，仅控制面/探测 IO）**——与旧 gap target 的 255–288µs 形成量级差异，也与同事文档 54.7–68µs 同档。样本很小，**仅作线索**，待读流量验证。
+- 唯一 target ERROR 是预检 TCP 探测造成的 `handshake failed rc=-104`（16:34:43），非 mount 失败；`/tmp/nvmf_tgt.log` 已增长至 43 KB。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -1031,7 +1041,7 @@ yin target 是否在 4457 起来（PID/md5）、listener 地址/NQN/ns/strip/dev
 
 ---
 
-# NOF-017（待执行 · mount 新 target + reconcile 门禁 · 2026-11-20）
+# NOF-017（已关闭 · 通过 · mount 新 target + reconcile 门禁 · 2026-11-20）
 
 ## 背景
 
@@ -1069,3 +1079,42 @@ yin target 是否在 4457 起来（PID/md5）、listener 地址/NQN/ns/strip/dev
 ## 回执必答（第一行）
 
 mount 是否 rc[0]；设备映射数/provider；reconcile failures 与 partitions_installed；etcd quota；失败则错误链与 target 侧日志。
+
+---
+
+# NOF-018（待执行 · writer 重灌 · 2026-11-20）· 新 target 上写入 400 keys
+
+## 背景
+
+- NOF-017：新 yin target 上 mount rc[0]，1024 分区 reconcile 全通过；`logical_used=0`。
+- 本单把 400 keys × 4MiB 重新写入（新 raid 上的数据布局与旧数据无关联；覆盖范围同前，用户已授权）。
+- **不跑 reader**；不动 target/master 配置；不重启。
+
+## 1. 预检（只读）
+
+1. master：PID 2462234 存活、`enabled=1`、`partitions_installed=1024`、`logical_used=0`。
+2. target：PID 341038 存活、4457 LISTEN；记录跑前 W 块基线。
+3. etcd：`/cvm/vseg_nofvseg/` 8 键、`/oplog/vseg_nofvseg/` 32 键。
+
+## 2. 运行 writer（与 NOF-009 完全相同）
+
+- node1，root，`stress_cluster_bench`（同二进制 md5 `575d2151…`）；日志 `run/writer_r2.log`：
+  - `--metadata-server=etcd://141.61.84.*:2379 --master-server=192.168.84.*:50056 --local-hostname=141.61.84.* --global-segment-size=0 --local-buffer-size=10737418240 --device-name=udmac0d1e2 --segment_write_vsegment=true --scenario=remote_memory --role=writer --num_keys=400 --value_size=4194304 --protocol=ub --verify=false --num_threads=16 --batch_size=16 --master_admin_port=9006 --vsegment_nof_io=true --nof_whole_pool_register=true --nof_qpairs_per_segment=4 --replica_num=1 --nof_replica_num=0`
+  - env 按 NOF-009 清单（`MC_URMA_TRANS_MODE=RM`、`MC_URMA_BONDING_MULTIPATH_ENABLE=off`、`MC_NOF_SUBMIT_CHUNK_BYTES=131072`、`MC_NOF_INFLIGHT_BYTES_LIMIT=33554432`、`MC_NOF_WORKERS=4`、`SPDK_URMA_DEV_NAME=udmac0d1e2`、`SPDK_URMA_CAPSULE_TRANSPORT=urma`、`MC_STORE_PARTITION_SLOT_COUNT=1024`）。
+- 等待 `400 succeeded, 0 failed`；超时 10 min 停手。
+
+## 3. 验证（只读）
+
+1. writer 输出：成功/失败数、写时延统计（Min/Avg/P50/P99）。
+2. master：`logical_used` = 1,677,721,600 B；NVMe-oF SSD ≈1.56 GB / 100 GB；Keys=400；无 ERROR。
+3. etcd：`/oplog/vseg_nofvseg/` 键数增长（32→约 1230）；`/cvm/` 仍 8 键。
+4. **target W 块（跑完立即采）**：n、W9 avg、TOTAL、exec%/push%（这是与旧 target 对比的关键）：旧 gap target 写窗口 W9≈24.8–25µs? 实测旧值为**写路径 W9 avg 24,840 ns**（NOF-009，n=12,807）；新 target 同窗口对比。
+5. 无真实写入错误（区分预检 TCP 探测的 handshake -104）。
+
+## 4. 边界
+
+- 只写本实验 400 keys；不跑 reader；不动 target/master；不重启；失败停手不重试。
+
+## 回执必答（第一行）
+
+writer 是否 400/0；`logical_used`；**target 侧写窗口 W9 avg / n / exec%**（与旧值 24,840 ns 对比）；master/target 有无错误。
