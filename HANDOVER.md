@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-025（关键 A/B：plain NoF 基线）**；NOF-026 已关闭（750/300 无实测依据，300 无推导）
+- 当前任务：**NOF-027（vsegment 布局调优：1024→64 分区，消除随机/顺序混淆）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -91,7 +91,8 @@
 | NOF-022 | 已关闭 2026-11-20（**通过，含 1 次误写**） | Mooncake T1 bdev 425µs、端到端 P50 571.1；**裸 SPDK 128K T1B1：客户端 p50 41.3µs、target W9 30.2µs**；同 target 下 Mooncake W9 259µs（T1/T4/T16 不变）⇒ 8.6× 差在 target 执行层；但裸=顺序、Mooncake=随机 2MiB，**访问模式是混淆变量**，NOF-023 受控验证；urma_perf preflight 在 LBA0 写了一次（已授权修复） |
 | NOF-023 | 已关闭 2026-11-20（**通过**） | **8.6× 主体 = 随机 vs 顺序**：QD1 target exec 30.35→190.58µs（6.3×）；QD 只次要（seq +36%、rand +8%）；**随机下 Mooncake 259 vs 裸 SPDK 190–206µs = 1.26–1.36×**；LBA0 修复完成（writer 400/0、verify 0 错）；yin urma_perf ABI 不兼容（WIRE v6 vs v4） |
 | NOF-024 | 已关闭 2026-11-20（**旋钮证否**） | T1 下 qpairs 4/8/16 × workers 4/8：P50 中位 551.5/542.7/537.5/537.8µs（差 < 臂内极差）；**target W9 恒 250.5–251.2µs**；最好 537.5µs，距 300 差 1.79×；target 执行占 251µs（46.7%），客户端流水线 ~287µs；12/12 无失败 |
-| NOF-025 | 已下发（用户最终目标驱动，待执行） | plain NoF 基线：临时关 vsegment、同 target 同负载写 400 keys 并读（16t/T1 各 3 遍），与 VSegment 537.5/719µs 做 A/B；测完保留 plain 环境，按结论决定 vsegment 布局调优 |
+| NOF-025 | 已关闭 2026-11-20（**判决：VSegment 慢**，含布局混淆） | plain NoF：**T1 P50 258.3µs vs VSegment 537.5µs（plain 快 2.08×）**；16t 打平（718.7 vs 719.0）；写 P50 273.0 vs 738.6（plain 快 2.7×）；target W9 plain 96.9/194–196µs vs VSeg 250.5/259.6µs；但 plain 数据连续堆放 1.6GiB、VSeg 散在 1024 分区 ⇒ **布局是混淆变量**，NOF-027 消除 |
+| NOF-027 | 已下发 | vsegment 布局调优：分区数 1024→64（master+client `MC_STORE_PARTITION_SLOT_COUNT=64`），同 target/负载写读，与 plain 258.3/718.7 和 vsegment-1024 537.5/719 对比 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
@@ -382,6 +383,16 @@
 - 口径差异：文档 662/669 是 **8MiB/单线程/6 盘**；我们 537.5/719 是 **4MiB/400 keys/verify/11 盘**，不可直接相减。
 - **决定**：不补"6 盘校准臂"（需重配 target，且 750 出处不影响 A/B）；直接执行 NOF-025（同环境 plain NoF vs VSegment）。
 - 750 的 6 盘原始 profile 在 node1 `…/vsegment-results/20261118-201528-*/`（未取，`[未获取]`）；3 张 PNG 未解析。
+
+### NOF-025 关键事实（判决：VSegment 比 plain NoF 慢，2026-11-20）
+
+- 同 target、同客户端、同负载（400×4MiB、verify）：
+  - **T1 P50：plain NoF 258.3µs（242.1–262.8） vs VSegment 537.5µs（L16）/551.5（L4）⇒ plain 快 2.08–2.14×**；plain T1 已进入 300µs 区间。
+  - 16t：plain 718.7 vs VSegment 719.0（差 0.3µs，打平）；target W9 plain 194–196µs vs VSeg 259.6µs ⇒ 16t 时端到端由客户端/流水线主导，target 差异未传导。
+  - 写：plain 400/0、1.56GB、0.11s、**14,316.6 MiB/s、P50 273.0µs** vs VSegment 0.33s、4910.7 MiB/s、P50 738.6µs ⇒ plain 快 2.7×。
+  - target W9：plain T1 96.9µs、16t 194–196µs、写 27.8µs；VSeg T1 250.5µs、16t 259.6µs。
+- **布局混淆（关键）**：plain 把 400×4MiB 连续写满最前 1.6GiB（顺序布局）；VSegment 按哈希散到 **1024 个分区**（跨 100GiB 随机布局）⇒ 2.08× 差异可能同时含"vsegment 路径开销"与"随机 vs 顺序布局"，本单无法拆分（NOF-027 处理）。
+- 环境：plain master PID 2627750（`VSegment Status: enabled=0`，etcd 3 键、无 quota），Keys=400、NVMe-oF SSD 1.56GB/100GB；yin master/target 未动。旧 vsegment 数据已被 plain 写入覆盖（恢复需重跑 writer）。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -1446,7 +1457,7 @@ L4/L8/L16/L16W8 中位 P50/P90/P99/Avg；最优组合；target W9/n；T1 端到�
 
 ---
 
-# NOF-025（待执行 · 关键 A/B：plain NoF 基线 · 2026-11-20）
+# NOF-025（已关闭 · 关键 A/B：plain NoF 基线 · 2026-11-20）
 
 ## 背景与目标
 
@@ -1525,3 +1536,54 @@ plain NoF 的 T1 / 16t 中位 P50/P90/P99/Avg；与 VSegment 的差；target W9�
 ## 回执必答（第一行）
 
 750 的原文与口径（是否开 vsegment、Avg/P50）；300 是否有推导（有→原文，无→[未获取]）；资料里是否存在"不开 vsegment 的 Mooncake 端到端"数字。
+
+---
+
+# NOF-027（待执行 · vsegment 布局调优：1024→64 分区 · 2026-11-20）
+
+## 背景
+
+- NOF-025 判决：**VSegment T1 537.5µs vs plain NoF 258.3µs（plain 快 2.08×）**；但存在布局混淆——plain 数据连续堆在最前 1.6GiB（顺序），VSegment 散在 1024 个分区（随机）。
+- 假设：把分区数从 **1024 降到 64**，每个分区约 6 个 key、在 64MiB vsegment 内连续摆放 ⇒ I/O 变顺序，vsegment 时延应向 plain 靠拢甚至反超。
+- 本单只改 `MC_STORE_PARTITION_SLOT_COUNT`（master 与 client 必须一致），其余参数不变。
+
+## A. 参数核对（只读）
+
+1. 确认分区数由 `MC_STORE_PARTITION_SLOT_COUNT` 决定（master 日志 `SaveClusterMeta ... slot_count=`；quota 快照 partitions 数）；client 启动日志/rpc 里同 env。
+2. 预算：64 分区 × 100GiB/64 = 1.5625GiB/分区；每分区约 6–7 keys × 4MiB = 24–28MiB < 64MiB initial vsegment ⇒ 每个 key 都落在首卷、连续分配。
+3. 若环境不生效（slot_count 仍 1024）→ **停手回报**，不要改其它参数硬凑。
+
+## B. 切换 vsegment-64（只动我方 master/cluster）
+
+1. 停 plain master 2627750；清**仅我方**键 `/cvm/vseg_nofvseg/` + `/oplog/vseg_nofvseg/`。
+2. 启动 vsegment master：NOF-004/007 同参数（cluster `vseg_nofvseg`、50056/9006、udmac0d1e2、20 项 vsegment/HA 参数）+ **`MC_STORE_PARTITION_SLOT_COUNT=64`**。
+3. `nof_register` 同命令（192.168.84.149:4457、100GiB、base0、nsid1）；等 quota 发布 ≥20s。
+4. 验证：quota 快照分区数 = **64**；`reconcile_fail=0`；`partitions_installed=64`、`vsegments≈64`；`logical_capacity` 记录实际值。
+
+## C. 写 + 读（同 NOF-018/019 口径）
+
+1. writer 400 keys × 4MiB（vsegment flags 同 NOF-018）+ **client `MC_STORE_PARTITION_SLOT_COUNT=64`**；确认 400/0、`logical_used=1,677,721,600`。
+2. reader：**T1 × 3 遍 + 16t × 3 遍**（verify=true、诊断关）；记录 Avg/P50/P90/P99/Max、failed/verify；target W 块按"下一次连接打印上一轮"对齐。
+3. 另记录 reader 的 `query_rpc_breakdown` p50（控制面）。
+
+## D. 对比与回执
+
+- 对比表（同口径）：
+
+| 场景 | T1 P50 | 16t P50 | target W9 |
+|---|---|---|---|
+| plain NoF（NOF-025） | 258.3 | 718.7 | 96.9 / 194–196 |
+| VSegment-1024（NOF-024/019） | 537.5 | 719.0 | 250.5 / 259.6 |
+| **VSegment-64（本单）** | ? | ? | ? |
+
+- 明确回答：**分区数从 1024 降到 64 后，vsegment 时延是否明显下降？是否已快过 plain NoF？** 若仍慢，写清差值与 target W9 对比（判断是布局还是 vsegment 路径开销）。
+- 保留 vsegment-64 环境；失败停手。
+
+## E. 边界
+
+- 只动我方 master/cluster；不动 yin/target 配置；target 仅正常读写；不重启 target。
+- 回滚：plain 环境恢复 = NOF-025 的 plain master 参数 + nof_register + writer（均已记录）。
+
+## 回执必答（第一行）
+
+VSegment-64 的 T1/16t P50/P90/P99/Avg；target W9；与 plain 258.3/718.7 及 VSegment-1024 537.5/719 的差；**vsegment 是否已赢 plain**；有无失败。
