@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-021（4 线程诊断五段 + 盘型核对：bdev 是排队还是介质底板）**
+- 当前任务：**NOF-022（裸 SPDK 底板 vs Mooncake 单线程：定位 4× 路径差）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -87,6 +87,7 @@
 | NOF-018 | 已关闭 2026-11-20（**通过**） | writer 400/0，1.5625 GiB，0.39s，4091.95 MiB/s；写时延 Avg 977.53 / P50 901.03 / P99 2775.35；**写窗口 target W9 23,550 ns（旧 24,840，−5.2%）** ⇒ 换 target 不影响写路径，5× 差异在读路径 |
 | NOF-019 | 已关闭 2026-11-20（**通过**） | **端到端基本不变**：R16 p50 719.0（旧 714.9，+0.58%）、R4 602.5（旧 591.1，+1.93%，均在臂内离散内）；**target 读 W9 254.8µs（旧 283–288，−11%）** ⇒ target 变快未传导到端到端 |
 | NOF-020 | 已关闭 2026-11-20（**通过**） | **文档 54.68µs = 11 盘写路径样本**（非读！"5× 差距"系读/写跨口径，撤回）；新 target 读五段 p50：roundtrip 514 / target 424 / **bdev 387（与旧 target 完全相同）** / data 13 / outside 59 / residual 60；`target_valid=98.9%`（TRACE=0 不影响遥测）；端到端诊断 P50 779，控制面+应用约 265µs |
+| NOF-021 | 已关闭 2026-11-20（**通过**） | 4 线程 vs 16 线程：**bdev 418 vs 380µs（+10%，不降反升）** ⇒ 不是客户端排队；盘 = 11× 华为 HWE7AP457T6L005N（7.68TB）；target W9 259.8µs（exec 96.3%）；4 线程端到端诊断 P50 656.5µs |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -308,6 +309,16 @@
 - 同阈值 400µs 下 SLOW_IO 条数 4,675→2,790（−40%），但 p50 仅 −2.7% ⇒ 改善集中在长尾。
 - target W 块：诊断窗口 W9 270.3µs（滚动窗口，与 NOF-019 的 254.7 不可严格比较）、exec 94.8%。
 - **结论**：读路径的盘执行段（bdev ~387µs）是当前最大单项且未随 target 构建变化；要到 300µs 端到端，必须动 bdev 本身或减少/重排 child，而不是继续换 target。
+
+### NOF-021 关键事实（bdev 不是排队，是路径底板，2026-11-20）
+
+- 4 线程 vs 16 线程（同一百分位算法重算）：roundtrip 446 vs 513（−13%）、target 427 vs 417、**bdev 418 vs 380（+10.0%，不降反升）**、data 6 vs 11、outside 14 vs 46、residual 14 vs 46（µs, p50）。
+- ⇒ 降并发只压缩了 outside/residual/data；**bdev 没有随并发下降**，不支持"客户端排队放大"的解释。
+- 4 线程端到端（诊断口径）：Min 497.29 / Avg 657.06 / **P50 656.54** / P90 758.91 / P99 896.89 / Max 942.34 µs；400/400、verify 0 错。
+- 盘：11 块成员全部 **Huawei HWE7AP457T6L005N**（vendor 0x19e5，7.68 TB，FW 1049×9 / 1019×2，512B 块）；TLC/QLC `[未获取]`（RPC/日志无介质字段）。
+- target W9：259,780 ns（n=25,777）、TOTAL 269µs、exec 96.3%、push 3.2%。
+- 诊断采样：4 线程读阶段 opcode=2 800 条，target_valid {1:767, 0:33}。
+- **与文档裸 SPDK 的对比线索**：文档 §3.1 裸 SPDK 11 盘基线 exec avg **68µs**（8MiB、非 vsegment）；我们 Mooncake 路径 target W9 平均 ~260µs、慢 IO bdev p50 ~380–418µs ⇒ 路径层差 ~4×，需裸 SPDK 实测确认（NOF-022）。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -1218,7 +1229,7 @@ R16/R4 中位 P50/P90/P99/Avg；与旧 target 同臂的差；target 读窗口 W9
 
 ---
 
-# NOF-021（待执行 · 4 线程诊断五段 + 盘型核对 · 2026-11-20）
+# NOF-021（已关闭 · 通过 · 4 线程诊断五段 + 盘型核对 · 2026-11-20）
 
 ## 目的
 
@@ -1248,3 +1259,46 @@ R16/R4 中位 P50/P90/P99/Avg；与旧 target 同臂的差；target 读窗口 W9
 ## 回执必答（第一行）
 
 4 线程五段 p50（roundtrip/target/bdev/outside/residual）与 16 线程的差；bdev 是否随并发下降（降多少）；盘型号/固件；target W9/n；有无失败。
+
+---
+
+# NOF-022（待执行 · 裸 SPDK 底板 vs Mooncake 单线程 · 2026-11-20）
+
+## 目的
+
+- NOF-021：Mooncake 路径 bdev ~380–418µs、target W9 ~260µs，且不随并发下降；文档裸 SPDK 基线 exec **68µs**（8MiB、256KiB child）。差 ~4×。
+- 本单用**同一个 yin target**、同一批盘，分别测：
+  1. Mooncake reader **1 线程**（最接近裸 SPDK `-T1 -b1` 的并发）五段；
+  2. **裸 SPDK `urma_perf`** 的逐 IO 延迟（128KiB / 256KiB / 8MiB object），拿硬件/驱动真实底板。
+- 判断 4× 差是"Mooncake 客户端路径"还是"盘/驱动底板"。
+
+## A. Mooncake 1 线程诊断读（node3，1 遍）
+
+- 环境与 NOF-020 相同（`VSEG_DIAGNOSTIC=1`、`VSEG_SLOW_IO_US=400`、`MC_HIFREQ_LOG_SAMPLE_RATE=1`；400 keys × 4 MiB、batch 1、warmup 5、seq、verify=true、dev udmac0d1e2）。
+- **唯一改动：`--num_threads=1`**。
+- 采集：读阶段 p50/p90（roundtrip/target/bdev/data/outside/residual）、target_valid 分布、端到端 P50/P99、target W9（跑完即采）。
+
+## B. 裸 SPDK `urma_perf`（node1 → yin target）
+
+1. 定位二进制：node1 `~/gap/spdk/build/examples/urma_perf`（GAP 项目沿用；**先 `--help`** 确认目标地址/端口/NQN/nsid 参数与 `-o`/`-T`/`-b`/`-t` 语义，并记录 md5）。
+2. 连接参数：traddr `192.168.84.149`、trsvcid `4457`、NQN `nqn.2026-01.io.spdk:urma-gpu-test`、nsid 1；env `SPDK_URMA_DEV_NAME=udmac0d1e2`、`URMA_PERF_ADDR_MODE=seq`（按 `--help` 实际参数调整，**不改源码**）。
+3. 三个短探针（各 5–10 s，读，`-T 1 -b 1`）：
+   - `-o 131072`（128KiB IO）
+   - `-o 262144`（256KiB IO）
+   - `-o 8388608`（8MiB，对齐文档裸基线口径）
+4. 每个探针：记录 avg/P50/P99 延迟、IOPS、bytes；并在**运行中**采一次 target W 块（W9/n/exec%）——用于对比"裸 SPDK 驱动下的 target exec"与"Mooncake 驱动下的 target exec"。
+5. 只读；不写盘；若 urma_perf 报 ABI/参数错误 → 停手回报 `--help` 与错误，不自行改源码/换二进制。
+
+## C. 分析与回执（只报事实）
+
+- 表：Mooncake 1t 的 roundtrip/target/bdev p50；裸 SPDK 三种 IO 的延迟；各自期间的 target W9。
+- 明确回答：**4× 差距在 Mooncake 客户端路径，还是在盘/驱动底板？**
+- 停止规则：任一步失败（reader failed/verify、urma_perf 报错）→ 停手回报。
+
+## D. 边界
+
+- 只读；不写盘；不动 target/master；不重启；不增删探针；不自行换二进制/改源码。
+
+## 回执必答（第一行）
+
+Mooncake 1t 五段 p50（尤 bdev）；裸 SPDK 128K/256K/8M 的延迟与 target W9；4× 差落在哪一层（给判断依据）。
