@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**等待用户决策：是否把 node3 的 target 换成同事构建（yin spdk-cpu）**；批准后下发换 target 任务
+- 当前任务：**NOF-016（换 target 为同事构建；用户已批准破坏性操作）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -82,6 +82,7 @@
 | NOF-013 | 已关闭 2026-11-20（**结论待复核**） | 当时判"chunk 对读路径无效"（blocks 恒 256）；但复核代码后：vsegment 读路径本应读该 env，怀疑**运行环境被脚本硬编码覆盖**，NOF-015 用环境自证复测。文档 §3.1/3.2/3.4/§四/§八原文已取 |
 | NOF-014 | 已关闭 2026-11-20（**通过**） | 15/15 遍成功；**只有降线程有效**：L3（4 线程）p50 591.1 vs 714.9（−17.3%）、p99 −49.5%；8MiB inflight 无益、2MiB 灾难（+670%）；副本缓存 env 在二进制中不存在；target W9 在 L3 满窗口仍 254–259µs |
 | NOF-015 | 已关闭 2026-11-20（**通过**） | env 自证 chunk 已进进程（131072/262144/2097152），但读路径 NVMe IO 恒为 **128KiB**（blocks p50=256）⇒ **代码层固定**，env 无法改；vsegment child=2MiB（planned_children=2），128KiB 是更下层 IO 粒度 |
+| NOF-016 | 已下发（用户已批准） | 换 target：停旧 gap target/master → 保存回滚快照 → yin spdk-cpu 构建重启 target（4457/strip256K/udmac0d1e2）→ 重启我方 master；不 mount、不写数据 |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -248,14 +249,11 @@
 - C1（256KiB）出现少量 171/85-block 碎片与偶发 4096-block，但 p50 未变；三臂端到端 p50 851–898µs、target W9 275.8–283.6µs，差异均在噪声内。
 - **方向②（128K→256K）只能改代码**，且改动点在 NoF/URMA 驱动层（固定 128KiB 的位置），不属于"只改 Mooncake 分层"。
 
-### 决策点（2026-11-20，待用户批准）
+### 决策点（2026-11-20，用户已批准换 target）
 
 - 最大未验证差异：**target 构建**。现役旧 gap target（`urma_p99` 构建）实测每 IO W9 ~255–288µs；同事文档的 yin target 达 **54.7–68µs**（5× 差距，非负载可完全解释：4 线程时我们 W9 仍 ~255µs）。旧 target 带 p99 门控/不同 iobuf/queue 参数，是首要嫌疑。
-- 可选路径：
-  1. **换 target 为 yin spdk-cpu 构建**（停旧 gap target/master → takeover 重绑 11 盘 → 起同事 target → 清我方集群重挂 → 重测）。动 11 盘、旧 GAP 数据可能受影响（用户已允许必要时重灌）。
-  2. 只读比对两套 target 的构建/启动参数后再决定（多一轮，不动现场）。
-  3. 不换 target，改代码放大 NVMe IO 粒度（需先自建构建，周期长）。
-- 推荐：路径 1（signal 最强、直接对齐同事环境）。
+- **用户已批准（2026-11-20）**：停旧 gap target/master、重绑 11 盘、用 yin spdk-cpu 构建重启 target；旧 GAP 数据可能受影响，用户同意必要时重灌。
+- 分阶段执行：NOF-016 换 target + 重启 master（不 mount）；NOF-017 mount + reconcile 门禁；NOF-018 writer 重灌；NOF-019 reader 基线对比（看 5× 差距是否闭合）。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -965,3 +963,55 @@ V0/V3 的 blocks p50 与 SLOW_IO 条数、target W n；chunk 是否作用于读�
 ## 回执必答（第一行）
 
 每臂实际生效的 chunk 值（自证）；blocks p50；SLOW_IO 条数；target W n；chunk 是否真正作用到读路径。
+
+---
+
+# NOF-016（待执行 · 换 target 为同事构建 · 2026-11-20）· 用户已批准破坏性操作
+
+## 授权与范围
+
+- 用户已批准：停旧 gap target/master、重绑 11 盘、用 **yin spdk-cpu** 构建重启 target；旧 GAP 数据可能受影响（已同意必要时重灌）。
+- 本单只做"换 target + 重启我方 master"，**不 mount、不注册、不写数据**；mount/门禁在 NOF-017。
+- 只动 node3 的旧 gap 进程与我方 master；**不动 yin 的进程/键、不动 node1**。
+
+## A. 预检与回滚信息（先做，只读）
+
+1. 记录：gap target PID 3243095（cmdline/cwd/exe md5）、gap master PID 3673976、我方 master PID 2162056；`ss -ltnp` 相关端口。
+2. **保存回滚快照**到 node3 `run/rollback_gap_target.json`：
+   - RPC 全量：`nvmf_get_subsystems`、`nvmf_get_transports`、`bdev_get_bdevs`、`bdev_raid_get_bdevs all`；
+   - `/home/l00955908/gap/logs/target_start.log` 的建靶参数/ iobuf / mask / 设备等关键行（≤15 行）；
+   - gap `nvmf_tgt` md5（`6668b490…`）。
+3. 记录 yin target 二进制：`/home/yin/nof/spdk-cpu/build/bin/nvmf_tgt` 的 md5/大小；takeover 脚本 md5/大小。
+4. 读 node1 `run_vesegment_target.sh` 与 `target_nvme_takeover.sh` 相关段：给出本单使用的**确切启动链路**（在哪台机、如何调用 takeover、NQN/端口如何注入、盘列表如何生成），≤20 行摘要。
+5. 确认 11 块 7T 盘当前 vfio 绑定（BDF 列表）与 HugePages 现状。
+
+## B. 停止旧环境（按 PID；先 TERM，10s 不退再 KILL）
+
+1. 停我方 master 2162056。
+2. 停 gap master 3673976。
+3. 停 gap target 3243095；确认无 `nvmf_tgt`/`spdk_tgt` 进程、4457 释放。
+4. **只删我方 cluster 键**：`/cvm/vseg_nofvseg/` + `/oplog/vseg_nofvseg/`；yin 的键一律不动。
+
+## C. 启动 yin target（按 A4 链路）
+
+- 用 yin 的 takeover/wrapper，参数按 A4 确认后的原样：`-w /home/yin/nof/spdk-cpu`、11 盘、`-R 256`、`-p urma`、`-N udmac0d1e2`、`-m '[2-7]'`、`-C 64`、`-L /usr/lib64`、`-i <node3 fabric IP>`、`-s <dump sec>`、NQN `nqn.2026-01.io.spdk:urma-gpu-test`、端口 **4457**、`-y`。
+- 等待 4457 就绪；失败贴日志尾部 ≤30 行并**停手**（回滚快照已存）。
+- 若 takeover 拒绝（仍有 SPDK 进程），确认 B 全部退出后再试一次；**不绕过脚本校验**。
+
+## D. 验证（只读）
+
+1. `nvmf_get_subsystems`：NQN、listener（trtype URMA、traddr/trsvcid）、nsid 1 → raid0。
+2. `nvmf_get_transports`：dev_name（应为 udmac0d1e2）、max_io_size、capsule 配置。
+3. raid0：strip 256 KiB、11 成员（target 日志确认）。
+4. yin `nvmf_tgt` 进程 PID 与 md5；4457 LISTEN。
+5. **重启我方 master**（同一套参数/env：cluster `vseg_nofvseg`、50056/9006、`SPDK_URMA_DEV_NAME=udmac0d1e2`、`VSEG_URMA_DEVICE=udmac0d1e2`），验证 leader/serving、无 ERROR、`enabled=0`。
+6. 记录新 target 的**实际 listener 地址**与 trsvcid（NOF-017 mount 用）。
+
+## E. 边界
+
+- 不 mount/不注册/不写数据；不跑 writer/reader；不动 node1；不动 yin 的进程与 etcd 键；不重启系统；盘绑定只由 takeover 脚本执行（已授权）。
+- 失败停手，不做 A4 链路之外的临时改动。
+
+## 回执必答（第一行）
+
+yin target 是否在 4457 起来（PID/md5）、listener 地址/NQN/ns/strip/dev_name；我方 master 是否重启正常；旧进程是否全部退出；回滚快照路径。
