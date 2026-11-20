@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-007（重启我方 master：SPDK_URMA_DEV_NAME=udmac0d1e2，验证设备映射）**
+- 当前任务：**NOF-008（重新 mount + reconcile 门禁；设备映射在 mount 时验证）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -73,6 +73,7 @@
 | NOF-004 | 已关闭 2026-11-20 | 我方 master 在 node1 稳定运行（PID 2091164，50056/9006），全新 cluster 无 oplog 重放、0 reconcile 失败；8086 未启用（见事实） |
 | NOF-005 | 已关闭 2026-11-20（**未通过**） | mount 失败：master attach rc=-19 / URMA qpair err=-5（Operation not permitted）；客户端谎报成功；P6 门禁未获得有效验证 |
 | NOF-006 | 已关闭 2026-11-20 | **不是协议问题**（两树 WIRE v4 一致）；是设备/provider 问题：master 用 udmac1d1e2 导致 0 个 `/dev/uburma` 映射、未加载 URMA provider；同一二进制在 yin master（udmac0d1e2）下正常；现役 target 也是 udmac0d1e2 |
+| NOF-007 | 已关闭 2026-11-20 | master 已按 `udmac0d1e2` 重启（PID 2162056，端口正常、无新 ERROR）；**设备映射验收口径有误**——SPDK 惰性初始化，未 mount 不产生映射；映射验证并入 NOF-008 |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -150,6 +151,14 @@
 - **target 侧无握手记录**：14:41:35 窗口 target 日志无任何行（唯一 14:4x 行为 14:40:57 的 `handshake failed rc=-104 peer=node1`，早于 register 38s）⇒ 失败发生在 initiator 本地，进一步支持设备层。
 - 换 target 前置（备用）：现役 gap target 占 4293 页 2MiB 大页（8.38 GiB）；停 target 可释放至 ~4639/4640 页；takeover 在已有 SPDK 进程时会硬拒绝（L416/L446/L289），必须先停；正向模板 `-N` 设备必须显式选 `udmac0d1e2`，listener 会改用 fabric IP。
 - **结论与对策**：改用 `SPDK_URMA_DEV_NAME=udmac0d1e2`（并按 yin 环境补 `VSEG_URMA_DEVICE=udmac0d1e2`）重启我方 master 即可，**无需换 target**（NOF-007 验证）。
+
+### NOF-007 关键事实（master 设备口径切换 + 惰性初始化，2026-11-20）
+
+- 新 master：PID 2162056（root，15:01:57），env 已确认 `SPDK_URMA_DEV_NAME=udmac0d1e2`、`VSEG_URMA_DEVICE=udmac0d1e2`；50056/9006 LISTEN；除启动期 1 条已知 etcd lease 超时外无 ERROR；`enabled=0`、auto-plan deferred。
+- 旧 master 2091164 已 TERM 退出（1 s），yin master 151060 未动；etcd 键数不变（3/1）。
+- **重要机制**：SPDK/URMA 初始化是**惰性**的——只在收到 mount 请求时才发生。证据：r2 日志 `spdk_wrapper` 行数 0；r1 日志的 4 条 SPDK 行全部出现在 14:41:35（NOF-005 的 mount 时刻）；yin master 日志同样是 SPDK init 与 MountNoFSegment 同一时刻。
+- 因此"启动后 `/dev/uburma` 映射=0"不是故障；yin master 现有 18 条映射是因为它曾经 mount 成功、设备打开后常驻。
+- **验收口径修正**：设备/provider 映射必须在 mount 请求时验证，不能作为"未 mount"阶段的验收项。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -474,7 +483,7 @@ attach 失败更像"协议/transport 不兼容"还是"设备/路径/权限"？�
 
 ---
 
-# NOF-007（待执行 · 重启我方 master 修正 URMA 设备 · 2026-11-20）· 只换设备名，不 mount、不动 node3
+# NOF-007（已关闭 · 重启我方 master 修正 URMA 设备 · 2026-11-20）· 只换设备名，不 mount、不动 node3
 
 ## 背景
 
@@ -517,3 +526,52 @@ attach 失败更像"协议/transport 不兼容"还是"设备/路径/权限"？�
 ## 回执必答（第一行）
 
 新 PID 是否存活并监听 50056/9006；`/dev/uburma` 映射数与 `udmac0d1e2` 是否出现；两个 URMA provider 是否加载；与 yin master 的对比；有无 ERROR。
+
+---
+
+# NOF-008（待执行 · 重新 mount + reconcile 门禁 · 2026-11-20）· 设备映射改为 mount 时验证
+
+## 背景与口径修正
+
+- NOF-007 已把 master 的设备口径改为 `udmac0d1e2`（PID 2162056，端口正常）。
+- NOF-007 的"启动后映射>0"验收**作废**：SPDK/URMA 惰性初始化，未 mount 不会打开设备。**设备/provider 映射改为在 mount 请求触发的同一时刻验证。**
+- 本单用与 NOF-005 **完全相同**的 `nof_register` 参数重试一次；不改参数、不做二次重试。若失败，停手回报。
+- 不写盘、不动 node3 进程、不重启 master。
+
+## 1. 预检（只读）
+
+1. master：PID 2162056 存活；50056/9006 LISTEN；`/proc/2162056/environ` 中设备名仍为 `udmac0d1e2`。
+2. target：node1 → `141.61.84.*:4457` 建连测试 OK；node3 `ss -lnt | grep 4457` 正常。
+3. etcd：`/cvm/vseg_nofvseg/` 3 键、无 `snapshot/vsegment_partition_quota`；`/oplog/vseg_nofvseg/` 1 键。
+
+## 2. mount（与 NOF-005 同参数，唯一一次）
+
+- 在 **node1** 用同事 `nof_register`（md5 `1655b48aa849297b96249c1aa132a0f3`），root，输出 `run/register_100gib_r2.log`：
+  ```
+  <build>/mooncake-store/src/nof_register \
+    "nqn.2026-01.io.spdk:urma-gpu-test" 1 <node3 141.61.84.*> 4457 URMA \
+    <node1 192.168.84.*:50056> 107374182400
+  ```
+- **不要额外 export 任何 env**（与 yin 脚本的 register 调用一致）。
+- 记录客户端输出与退出码。
+
+## 3. 验证（mount 触发后立即采集，只读）
+
+1. master 日志新增行（≤40 行）：`SPDK initialization CPU affinity … init_rc=?`、`Attaching to …`、`Opened NoF segment …`、`MountNoFSegment_slow … rc[?]`、任何 attach/URMA/capsule ERROR。
+2. **设备映射（关键，此时才有意义）**：`sudo -n grep -c '/dev/uburma' /proc/2162056/maps`；是否出现 `/dev/uburma/udmac0d1e2`；`liburma-udma.so`、`liburma_ubagg.so` 是否加载。
+3. 若 `rc[0]`：
+   - `published vsegment quota generation 1 with 1024 …`、`VSegment pool formed`、`vsegment service published … first full reconcile sweep`；
+   - `reconcile failures` **=0**、`Failed to refresh vsegment ownership` =0；
+   - `reconcile stats`：`owned_by_me=1024`、`reconcile_fail=0`；
+   - `VSegment Status`：`enabled=1, generation=1, profiles=1, partitions_installed=1024, vsegments=1024`；
+   - etcd：`snapshot/vsegment_partition_quota` 存在；60 s 后再复查一次门禁。
+4. 若失败：记录 master 错误链 + 该时刻 node3 target 日志（`~/gap/logs/nvmf_tgt.log`）窗口行（≤20 行），**停手**；不换设备名、不改参数重试。
+
+## 4. 边界
+
+- 不跑 writer/reader；不写盘；不动 node3 进程/盘；不重启 master；不碰 yin 的进程与 etcd 既有键。
+- 失败不做任何修改性动作。
+
+## 回执必答（第一行）
+
+mount 是否 rc[0]；设备映射数（mount 时刻）与 udmac0d1e2/provider 状态；reconcile failures 与 partitions_installed；若失败，错误链与 target 侧对应日志；P6 是否首次得到有效验证。
