@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-013（验证 chunk 是否作用于读路径 + 提取文档优化方向原文）**
+- 当前任务：**NOF-014（读时延并发/在途扫描：threads × inflight × replica-cache）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -79,6 +79,7 @@
 | NOF-010 | 已关闭 2026-11-20（**通过**） | 我们的读：400/400、verify 0 错；**Avg 801.29 / P50 791.06 / P90 1017.98 / P99 1709.42 / Max 1886.75µs**；URMA_SLOW_IO=0（打点默认关、阈值 100ms）；控制面逐 key RPC 158–386µs；target 读窗口 W9 285.87µs/exec 94.3% |
 | NOF-011 | 已关闭 2026-11-20（**通过**） | 采到 5,044 条 `URMA_SLOW_IO`（读阶段 4,675）；**p50 五段：roundtrip 528 / target 430 / bdev 387 / data 32 / outside 81 / residual 82µs**；bdev 占 target 90%、占 roundtrip 73%；诊断开销 +17.7%（Avg 801→943）；阈值 400µs 覆盖 36.5% child IO |
 | NOF-012 | 已关闭 2026-11-20（**无定论**） | 15/15 遍成功；各臂 p50 中位 721–759µs，臂间差 < 臂内极差（35–75µs）⇒ chunk/qpairs 在本次样本下无可辨识影响；target W9 277.8µs 未变；chunk 是否生效无法证明（诊断关、日志无 child 记录） |
+| NOF-013 | 已关闭 2026-11-20（**通过**） | **chunk env 对读路径无效**：V0/V3 的 `blocks` 恒为 256（128KiB），SLOW_IO 反增 20.6%；同事文档 §3.1/3.2/3.4/§四/§八原文已取（根因=raid0 单 child 单盘 + 排队；3 条优化方向） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -217,6 +218,17 @@
 - **关键疑点**：chunk 是否真正生效无法证明——诊断关闭后 V0 与 V3 日志行数完全相同、无 child/chunk 级记录；需要诊断口径 A/B（NOF-013）。
 - 控制面 `qrpc_total_p50` 74–92µs（与端到端无相关）；get_into 的 query_us ≈120µs。
 - 口径偏差：bench `--duration` 不支持 remote_memory；本矩阵为"400 keys/遍 × 3 遍取中位"，非 120s。
+
+### NOF-013 关键事实（chunk 对读无效 + 同事优化方向原文，2026-11-20）
+
+- **chunk 对读路径无效**：V0（128KiB）与 V3（4MiB）的 `URMA_SLOW_IO` `blocks` 恒为 **256**（256×512B=128KiB），无 4096/8192；SLOW_IO 条数 4,388→5,290（+20.6%）；端到端 p50 863.67→1028.40µs（诊断口径）。⇒ 每 key 仍 32 个 128KiB child，**"方向② 用 nof_chunk_bytes 把 128K→256K"在当前二进制下不可行**（env 不作用于该读路径）。
+- **文档 §3.1**：裸 SPDK 11 盘基线 Get 236µs / exec 68µs；VSegment 6 盘 Get Avg 662 / P50 669 / P99 913µs，bdev 538.8µs（慢 child 均值）；裸 SPDK sweep 128K/256K = 233–255µs。
+- **文档 §3.2**：Query（master RPC）128.9 / Submit 19.1 / **Wait 494.4（76%）** / 其他 9.0 µs。
+- **文档 §3.4**：GetReplicaList 客户端缓存（`MC_REPLICA_CACHE_TTL_MS`，默认 0 关闭；容量 10 万）→ 端到端 p50 **841→610µs**；参数调优仅 ~3%；plain NoF 12.89 vs VSeg 13.07（4MiB 批量）⇒ vsegment 路由层排除嫌疑。
+- **文档 §四 根因**：① raid0.c 单 child 单盘定向（`module/bdev/raid/raid0.c:86-91`，IO 禁止跨 strip，`assert(false)`）——每条 128KiB child 必落单盘；② 排队放大：瓶颈=在途 child 数 vs 盘数，6 盘时每盘排队 3~5 深 ≈ 54.7µs×5≈294µs；③ 盘数是第一变量：6→11 盘 W9 294→54.7µs（−81%），称已达裸基线；④ 数据链已收敛：控制面已优化 → URMA 洗净（4+17µs）→ 只剩 bdev 执行层。
+- **文档 §四 优化方向**：① 提高 child 并发（nof_inflight_bytes 当前 32MiB）；② child 尺寸对齐 strip（128K→256K，nof_chunk_bytes / vsegment_stripe 2MiB）；③ 跨 child 条带并行读（Mooncake 分层改造，SPDK 侧不动）。
+- **文档 §八 交接建议**：check → 处理 target 冲突 → 解 P6 → 跑一键实验填 comparison.md → 按三条方向深挖（改造点在 mooncake 分层）。
+- **我方对照**：我们 11 盘 target 的 W9 仍 **278–288µs**，不是文档的 54.7µs ⇒ 我们的在途 child/每盘排队仍深（16 线程 × 32 child）；这正是 NOF-014 要验证的。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -815,7 +827,7 @@ reader 读成功多少、失败多少；Avg/P50/P90/P99/Max；`URMA_SLOW_IO` 条
 
 ---
 
-# NOF-013（待执行 · chunk 生效性 A/B + 文档优化方向 · 2026-11-20）
+# NOF-013（已关闭 · 通过 · chunk 生效性 A/B + 文档优化方向 · 2026-11-20）
 
 ## 目的
 
@@ -850,3 +862,40 @@ reader 读成功多少、失败多少；Avg/P50/P90/P99/Max；`URMA_SLOW_IO` 条
 ## 回执必答（第一行）
 
 V0/V3 的 blocks p50 与 SLOW_IO 条数、target W n；chunk 是否作用于读路径（给判断依据）；文档优化方向 3 条原文要点。
+
+---
+
+# NOF-014（待执行 · 读时延并发/在途扫描 · 2026-11-20）
+
+## 背景
+
+- 文档 §四：6 盘 W9 294µs = 单盘服务 54.7µs × 排队 3~5 深；11 盘应降到 ~55µs。**我们实测 11 盘 W9 仍 278–288µs** ⇒ 可能在途 child 太多、每盘排队仍深。
+- 本单扫三个客户端旋钮：线程数、NoF 在途上限（inflight）、控制面副本缓存 TTL；诊断关闭；不改 target/master。
+
+## 臂定义（全部：node3，400 keys × 4 MiB，batch 1，warmup 5，order=seq，verify=true，chunk 128KiB，qpairs 4，诊断关）
+
+| 臂 | 线程 | `MC_NOF_INFLIGHT_BYTES_LIMIT` | 副本缓存 |
+|---|---|---|---|
+| L0 | 16 | 33554432（32MiB，基线） | 关 |
+| L1 | 16 | 8388608（8MiB） | 关 |
+| L2 | 16 | 2097152（2MiB） | 关 |
+| L3 | 4 | 33554432 | 关 |
+| L4 | 16 | 33554432 | `MC_REPLICA_CACHE_TTL_MS=1000` |
+
+- 其余 env 与 NOF-012/013 相同（`MC_NOF_WORKERS=4`、`MC_NOF_SUBMIT_CHUNK_BYTES=131072`、`SPDK_URMA_DEV_NAME=udmac0d1e2` 等）。
+- 每臂 3 遍（独立进程）；每遍前确认 procs=0；每臂跑完立即采一次 target W 块（注明滚动窗口口径）。
+
+## 采集
+
+1. 每遍：Min/Avg/P50/P90/P99/Max、failed、verify 错误、起止时间；日志 `run/conc_L<n>_p<m>.log`。
+2. 每遍 `query_rpc_breakdown` 的 `total_us` p50。
+3. 汇总：臂 × 遍次 + 每臂中位；target W9 每臂数值。
+4. 停止规则：任一遍 failed>0 或 verify 错误>0 → 立即停手回报。
+
+## 边界
+
+- 只读；仅上述客户端 env/参数；不写盘；不动 target/master；不重启；不增删臂。
+
+## 回执必答（第一行）
+
+各臂中位 P50/P90/P99/Avg；哪个旋钮最能降时延、降了多少；target W9 随臂如何变；缓存臂效果；有无失败。
