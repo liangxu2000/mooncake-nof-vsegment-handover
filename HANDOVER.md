@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-014（读时延并发/在途扫描：threads × inflight × replica-cache）**
+- 当前任务：**NOF-015（chunk 复测：环境自证 + 128K/256K/2M 三臂诊断，确认 128KiB 是否可改）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -79,7 +79,8 @@
 | NOF-010 | 已关闭 2026-11-20（**通过**） | 我们的读：400/400、verify 0 错；**Avg 801.29 / P50 791.06 / P90 1017.98 / P99 1709.42 / Max 1886.75µs**；URMA_SLOW_IO=0（打点默认关、阈值 100ms）；控制面逐 key RPC 158–386µs；target 读窗口 W9 285.87µs/exec 94.3% |
 | NOF-011 | 已关闭 2026-11-20（**通过**） | 采到 5,044 条 `URMA_SLOW_IO`（读阶段 4,675）；**p50 五段：roundtrip 528 / target 430 / bdev 387 / data 32 / outside 81 / residual 82µs**；bdev 占 target 90%、占 roundtrip 73%；诊断开销 +17.7%（Avg 801→943）；阈值 400µs 覆盖 36.5% child IO |
 | NOF-012 | 已关闭 2026-11-20（**无定论**） | 15/15 遍成功；各臂 p50 中位 721–759µs，臂间差 < 臂内极差（35–75µs）⇒ chunk/qpairs 在本次样本下无可辨识影响；target W9 277.8µs 未变；chunk 是否生效无法证明（诊断关、日志无 child 记录） |
-| NOF-013 | 已关闭 2026-11-20（**通过**） | **chunk env 对读路径无效**：V0/V3 的 `blocks` 恒为 256（128KiB），SLOW_IO 反增 20.6%；同事文档 §3.1/3.2/3.4/§四/§八原文已取（根因=raid0 单 child 单盘 + 排队；3 条优化方向） |
+| NOF-013 | 已关闭 2026-11-20（**结论待复核**） | 当时判"chunk 对读路径无效"（blocks 恒 256）；但复核代码后：vsegment 读路径本应读该 env，怀疑**运行环境被脚本硬编码覆盖**，NOF-015 用环境自证复测。文档 §3.1/3.2/3.4/§四/§八原文已取 |
+| NOF-014 | 已关闭 2026-11-20（**通过**） | 15/15 遍成功；**只有降线程有效**：L3（4 线程）p50 591.1 vs 714.9（−17.3%）、p99 −49.5%；8MiB inflight 无益、2MiB 灾难（+670%）；副本缓存 env 在二进制中不存在；target W9 在 L3 满窗口仍 254–259µs |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -219,9 +220,9 @@
 - 控制面 `qrpc_total_p50` 74–92µs（与端到端无相关）；get_into 的 query_us ≈120µs。
 - 口径偏差：bench `--duration` 不支持 remote_memory；本矩阵为"400 keys/遍 × 3 遍取中位"，非 120s。
 
-### NOF-013 关键事实（chunk 对读无效 + 同事优化方向原文，2026-11-20）
+### NOF-013 关键事实（chunk 复核中 + 同事优化方向原文，2026-11-20）
 
-- **chunk 对读路径无效**：V0（128KiB）与 V3（4MiB）的 `URMA_SLOW_IO` `blocks` 恒为 **256**（256×512B=128KiB），无 4096/8192；SLOW_IO 条数 4,388→5,290（+20.6%）；端到端 p50 863.67→1028.40µs（诊断口径）。⇒ 每 key 仍 32 个 128KiB child，**"方向② 用 nof_chunk_bytes 把 128K→256K"在当前二进制下不可行**（env 不作用于该读路径）。
+- **[待复核] chunk 疑似被运行环境覆盖**：NOF-013 观测到 V0（128KiB）与 V3（4MiB）的 `URMA_SLOW_IO` `blocks` 恒为 256（128KiB）；但代码复核显示 vsegment 读路径本应读取 `MC_NOF_SUBMIT_CHUNK_BYTES`（`transfer_task.cpp` 的 SpdkNofQos），且 GAP 项目同系统在 256KiB child 下曾得到显著更低时延（8MiB 读 387µs vs 128KiB 时 1194µs）。怀疑 NOF-012/013 运行方式下该 env 被脚本硬编码 131072 覆盖或未传入进程。**NOF-015 用环境自证复测。**
 - **文档 §3.1**：裸 SPDK 11 盘基线 Get 236µs / exec 68µs；VSegment 6 盘 Get Avg 662 / P50 669 / P99 913µs，bdev 538.8µs（慢 child 均值）；裸 SPDK sweep 128K/256K = 233–255µs。
 - **文档 §3.2**：Query（master RPC）128.9 / Submit 19.1 / **Wait 494.4（76%）** / 其他 9.0 µs。
 - **文档 §3.4**：GetReplicaList 客户端缓存（`MC_REPLICA_CACHE_TTL_MS`，默认 0 关闭；容量 10 万）→ 端到端 p50 **841→610µs**；参数调优仅 ~3%；plain NoF 12.89 vs VSeg 13.07（4MiB 批量）⇒ vsegment 路由层排除嫌疑。
@@ -229,6 +230,14 @@
 - **文档 §四 优化方向**：① 提高 child 并发（nof_inflight_bytes 当前 32MiB）；② child 尺寸对齐 strip（128K→256K，nof_chunk_bytes / vsegment_stripe 2MiB）；③ 跨 child 条带并行读（Mooncake 分层改造，SPDK 侧不动）。
 - **文档 §八 交接建议**：check → 处理 target 冲突 → 解 P6 → 跑一键实验填 comparison.md → 按三条方向深挖（改造点在 mooncake 分层）。
 - **我方对照**：我们 11 盘 target 的 W9 仍 **278–288µs**，不是文档的 54.7µs ⇒ 我们的在途 child/每盘排队仍深（16 线程 × 32 child）；这正是 NOF-014 要验证的。
+
+### NOF-014 关键事实（并发/在途扫描，2026-11-20）
+
+- 15/15 遍成功；诊断关。
+- 各臂中位：L0（16线程/32MiB）p50 714.9 / avg 754.9 / p99 1672.3；L1（8MiB）726.1（+1.6%，p99 +714µs）；**L2（2MiB）5507.2（+670%，pipeline 被串行化，推算）**；**L3（4线程）591.1（−17.3%）、avg −20.8%、p99 −49.5%、臂内极差仅 28.7µs（最稳）**；L4（缓存）719.2（+0.6%，无效果）。
+- **L4 无效原因**：`MC_REPLICA_CACHE_TTL_MS` 在 node1/node3 两个 bench 二进制中**均无符号**（env 未实现），不是策略无效。
+- **target W9**：L3 满窗口 254–259µs、exec 96.8–97.2%（历史满窗口 283–288µs）⇒ 降并发后每条 child 的 target 执行时间仍 ~255µs；L0 未捕到满窗口（快照 n=0/1），不能严格对比。
+- 结论（事实层）：**降线程能降端到端（−17%）与长尾（−50%）**，但每条 child 的 target 底板 ~255µs 未明显下降 ⇒ 底部成本可能在 target/盘执行层，而非纯客户端排队；需要与"chunk 256KiB"（GAP 经验值 387µs）结合验证。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -865,7 +874,7 @@ V0/V3 的 blocks p50 与 SLOW_IO 条数、target W n；chunk 是否作用于读�
 
 ---
 
-# NOF-014（待执行 · 读时延并发/在途扫描 · 2026-11-20）
+# NOF-014（已关闭 · 通过 · 读时延并发/在途扫描 · 2026-11-20）
 
 ## 背景
 
@@ -899,3 +908,42 @@ V0/V3 的 blocks p50 与 SLOW_IO 条数、target W n；chunk 是否作用于读�
 ## 回执必答（第一行）
 
 各臂中位 P50/P90/P99/Avg；哪个旋钮最能降时延、降了多少；target W9 随臂如何变；缓存臂效果；有无失败。
+
+---
+
+# NOF-015（待执行 · chunk 复测：环境自证 · 2026-11-20）
+
+## 目的
+
+确认 `MC_NOF_SUBMIT_CHUNK_BYTES` 是否真的作用到**读路径**。NOF-013 判"无效"可能被运行环境覆盖（reader 脚本硬编码 131072）；代码复核显示 vsegment 读路径本该读取该 env（`transfer_task.cpp` SpdkNofQos）。本单用**环境自证**重测。
+
+## A. 启动方式（关键）
+
+1. 先读 `run_vesegment_reader.sh`，确认它对 `MC_NOF_SUBMIT_CHUNK_BYTES` 是否无条件 `export`（给行号）。
+2. **不经过该脚本的 env 注入**：用显式 env 直接 exec bench；启动前把相关 env 写入 `run/envproto_<tag>.txt`（`env | grep -E 'MC_NOF_SUBMIT_CHUNK_BYTES|MC_NOF_INFLIGHT_BYTES_LIMIT|MC_NOF_WORKERS|VSEG_DIAGNOSTIC|MC_HIFREQ_LOG_SAMPLE_RATE|SPDK_URMA'`）；必要时运行中读 `/proc/<pid>/environ` 自证。
+3. 其余参数/环境与 NOF-011 诊断口径一致：400 keys × 4 MiB、16 线程、batch 1、warmup 5、order=seq、verify=true、`VSEG_DIAGNOSTIC=1`、`VSEG_SLOW_IO_US=400`、`MC_HIFREQ_LOG_SAMPLE_RATE=1`、`SPDK_URMA_DEV_NAME=udmac0d1e2`。
+
+## B. 三臂（各 1 遍，诊断开）
+
+| 臂 | `MC_NOF_SUBMIT_CHUNK_BYTES` |
+|---|---|
+| C0 | 131072（128KiB） |
+| C1 | 262144（256KiB） |
+| C2 | 2097152（2MiB，等于 vsegment stripe） |
+
+每臂跑前自证 env；跑后立即采 target W 块（n、W9）。
+
+## C. 采集（读阶段按行号切分，剔除 warmup）
+
+1. 每臂 `URMA_SLOW_IO` 条数；opcode=2 的 `blocks` 分布（p50 / max / top3）。
+2. 判定：若 chunk 生效 → C1 blocks≈512（256KiB）、C2 blocks≈4096（2MiB）；若三臂都 256 → **代码层固定 128KiB**，需改代码。
+3. 端到端 p50/p99（诊断口径，仅相对参考）；failed / verify 错误（应 0）。
+4. 每臂实际生效的 env（env 文件内容 + 进程 environ 自证）。
+
+## D. 边界
+
+- 只读；仅三遍 reader；不改其它参数；不动 target/master；不重启；失败停手。
+
+## 回执必答（第一行）
+
+每臂实际生效的 chunk 值（自证）；blocks p50；SLOW_IO 条数；target W n；chunk 是否真正作用到读路径。
