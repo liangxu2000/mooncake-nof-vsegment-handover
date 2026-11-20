@@ -121,6 +121,14 @@
 - 启动 1 s 后出现 1 条 `etcd_helper.cpp:352 lease keep alive ... timeout` ERROR，之后未复现（yin master 同期同形态，判为启动期瞬时）。
 - 产物：`/home/l00955908/mooncake-nof-vsegment/run/master_50056.log`（root）；停止命令 `sudo -n kill -TERM 2091164`（10s 不退再 KILL）。
 
+### 数字口径核对（2026-11-20 用户提出"750/300、800+、380"来源疑问）
+
+- `750→300µs`：交接文档 L5 的目标口径（VSegment 端到端读，精确测量点待 §3.1 原文确认）。
+- `841→610µs`：交接文档 L81 的 `GetReplicaList 缓存 p50`，是**文档内**数字；它究竟是"整个 Get 端到端"还是"仅元数据 RPC"，需 §3.1/§3.4 原文确认。
+- **`~380µs` 不在本交接文档的任何回执里**。最接近的 `387.23µs` 来自**上一个 GAP 项目**（GAP-16：Mooncake 8MiB seq 读 avg，P50 389.12；同一轮裸 SPDK 258.60µs）——那是**不带 vsegment 的普通 Mooncake NoF**、8MiB、reader 在远端节点。
+- 因此"vsegment 841 vs 不开 vsegment 387"是**跨项目、跨版本、跨盘数、跨尺寸、跨客户端位置**的对比，不是受控 A/B，不能据此判定 vsegment 更慢。**受控对比**要用同一环境同时测"带/不带 vsegment"两组（我们的环境具备条件）。
+- 文档内 6 盘 VSegment：Get Avg 662 / P50 669 / P99 913µs；五段 roundtrip 548 / target 519 / bdev 513µs；裸 SPDK 11 盘 Get 236 / exec 68µs；W9 6→11 盘 294→54.68µs。待办：NOF-006 提取文档 §3.1/§3.2/§3.4 原表并建立"同口径臂表"。
+
 ### 口径与数据安全（2026-11-20 用户补充）
 
 - **数据保留**：GAP 旧数据是盘起始连续的 ~2.47 TB（294,669 keys × 8 MiB）；用户要求尽量保留，**实在不行可清理、后续重新 prefill**。新 vsegment 段为 100GiB @ offset 0，writer 只写 400×4MiB=1.6GiB ⇒ 只覆盖最前 1.6GiB；若要零覆盖，需改造 `nof_register` 传入 `base=5TiB`（mount RPC 支持 `base`，该 CLI 写死 0），暂不做。
