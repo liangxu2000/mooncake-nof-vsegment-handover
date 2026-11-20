@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-019（新 target 读基线对比：16 线程/4 线程各 3 遍）**
+- 当前任务：**NOF-020（新 target 五段复采 + 文档 W9 口径核对）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -85,6 +85,7 @@
 | NOF-016 | 已关闭 2026-11-20（**通过**） | yin target 已起：PID 341038、md5 736a902f…、listener **192.168.84.149:4457**、strip 256K/11 成员、dev udmac0d1e2；旧三进程全退；我方键清空、yin 键未动；master 重启 PID 2462234（leader/serving、enabled=0）；回滚快照已存 |
 | NOF-017 | 已关闭 2026-11-20（**通过**） | 新 target 上 mount rc[0]（233ms）；1024 分区 reconcile 全通过（60s+ 复查仍 0）；quota 181,399 B；device_identity=5805fd63… 与新 raid 一致；**mount 期 target W9≈70µs（n=10，旧 target 255–288µs）** |
 | NOF-018 | 已关闭 2026-11-20（**通过**） | writer 400/0，1.5625 GiB，0.39s，4091.95 MiB/s；写时延 Avg 977.53 / P50 901.03 / P99 2775.35；**写窗口 target W9 23,550 ns（旧 24,840，−5.2%）** ⇒ 换 target 不影响写路径，5× 差异在读路径 |
+| NOF-019 | 已关闭 2026-11-20（**通过**） | **端到端基本不变**：R16 p50 719.0（旧 714.9，+0.58%）、R4 602.5（旧 591.1，+1.93%，均在臂内离散内）；**target 读 W9 254.8µs（旧 283–288，−11%）** ⇒ target 变快未传导到端到端；5× 差距未闭合（4.66×，且 54.68 口径为读/写待核） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -286,6 +287,15 @@
 - etcd：`/cvm/` 8 键不变；`/oplog/` 32→1232。
 - **target 写窗口 W9 avg 23,550 ns（n=12,801）vs 旧 gap target 24,840 ns（−5.2%）**；TOTAL 67µs；exec 34.9%、jfc 63.8%。
 - **结论（事实层）**：换 target 构建对**写路径** target 侧执行几乎无影响；旧 target 的 5× 差距出现在**读路径**（旧读 W9 255–288µs vs 新 mount 控制 IO 70µs），待 NOF-019 读基线确认。
+
+### NOF-019 关键事实（换 target 后端到端不变，2026-11-20）
+
+- 端到端（3 遍中位）：**R16 p50 719.0 / avg 780.6 / p99 1737.6 µs**（旧 target：714.9 / 754.9 / 1672.3；差 +0.58%，小于臂内极差 118.8）；**R4 p50 602.5 / avg 603.5 / p99 816.3 µs**（旧：591.1 / 597.9 / 845.4；+1.93%，极差 23.5）。
+- target 读窗口：**W9 avg 254,780–254,820 ns（旧 283–288µs，−10~11.5%）**；TOTAL 265µs（旧 289–312）；exec 96.0%、push 3.5%。
+- **结论**：target 构建换掉后，target 侧读执行变快 ~11%，但**端到端没有传导**；瓶颈已不在 target 的 bdev 执行段。
+- 读 W9（254.8µs）与写 W9（23.6µs）相差 **10.8×**：读写 target 执行特性差异极大。
+- 5× 差距：若按读口径，仍是 4.66×；但**54.68µs 是读还是写口径需核对**（NOF-020 B）。
+- 6 遍 failed=0、verify 0 错；qrpc p50 66–96µs；无新增 master/target 错误。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -1130,7 +1140,7 @@ writer 是否 400/0；`logical_used`；**target 侧写窗口 W9 avg / n / exec%*
 
 ---
 
-# NOF-019（待执行 · 新 target 读基线对比 · 2026-11-20）
+# NOF-019（已关闭 · 通过 · 新 target 读基线对比 · 2026-11-20）
 
 ## 目的
 
@@ -1163,3 +1173,33 @@ writer 是否 400/0；`logical_used`；**target 侧写窗口 W9 avg / n / exec%*
 ## 回执必答（第一行）
 
 R16/R4 中位 P50/P90/P99/Avg；与旧 target 同臂的差；target 读窗口 W9 avg/n；5× W9 差距是否闭合；有无失败。
+
+---
+
+# NOF-020（待执行 · 新 target 五段复采 + 文档 W9 口径核对 · 2026-11-20）
+
+## 目的
+
+1. 在新 yin target 上重采 `URMA_SLOW_IO` 五段/七字段，找出"target 变快 11%、端到端不变"的原因——钱现在花在哪一段。
+2. 核对交接文档 `W9 54.68µs`（n=4023）的上下文：是**读**还是**写**口径、来自哪一臂。
+
+## A. 诊断读（node3，1 遍）
+
+- 环境与 NOF-011 相同：`VSEG_DIAGNOSTIC=1`、`VSEG_SLOW_IO_US=400`、`MC_HIFREQ_LOG_SAMPLE_RATE=1`；负载 400 keys × 4 MiB、**16 线程**、batch 1、warmup 5、seq、verify=true；其余 env 与 NOF-019 R16 相同。
+- 采集：
+  1. 读阶段（按行号剔除 warmup）`URMA_SLOW_IO` 条数；opcode=2 的 29 字段统计（p50/p90）：roundtrip / target_us / bdev_us / data_us / pre_send_us / outside_us / residual_us / rx_buffer_us / buffer_exec_us；
+  2. **`target_valid` 的分布**（0/1 各多少条）——验证 `TARGET_TRACE_ENTRIES=0` 是否让 target 段遥测失效；
+  3. target W 块（W9/n/exec%）。
+- 与旧 target（NOF-011 读阶段 p50：roundtrip 528 / target 430 / bdev 387 / data 32 / outside 81 / residual 82）并排对比。
+
+## B. 文档口径核对（只读，≤10 行原文）
+
+- 读 `交接文档_NoF_VSegment性能测试.md` §3.3（L65–77）的表头与上下文，确认 `W9 6 盘 294µs / 11 盘 54.68µs（n=7649/4023）` 是**读**还是**写**、来自哪一臂、什么负载参数。
+
+## C. 边界
+
+- 只读；仅 1 遍诊断 reader；不改负载参数；不动 target/master；不重启；失败停手。
+
+## 回执必答（第一行）
+
+新 target 五段 p50（roundtrip/target/bdev/pre_send/outside/residual）及与旧的差；`target_valid` 分布；target W9；54.68µs 的读/写口径原文。
