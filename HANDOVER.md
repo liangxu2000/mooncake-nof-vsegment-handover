@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-016（换 target 为同事构建；用户已批准破坏性操作）**
+- 当前任务：**NOF-017（mount 新 target 192.168.84.149:4457 + reconcile 门禁）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -82,7 +82,7 @@
 | NOF-013 | 已关闭 2026-11-20（**结论待复核**） | 当时判"chunk 对读路径无效"（blocks 恒 256）；但复核代码后：vsegment 读路径本应读该 env，怀疑**运行环境被脚本硬编码覆盖**，NOF-015 用环境自证复测。文档 §3.1/3.2/3.4/§四/§八原文已取 |
 | NOF-014 | 已关闭 2026-11-20（**通过**） | 15/15 遍成功；**只有降线程有效**：L3（4 线程）p50 591.1 vs 714.9（−17.3%）、p99 −49.5%；8MiB inflight 无益、2MiB 灾难（+670%）；副本缓存 env 在二进制中不存在；target W9 在 L3 满窗口仍 254–259µs |
 | NOF-015 | 已关闭 2026-11-20（**通过**） | env 自证 chunk 已进进程（131072/262144/2097152），但读路径 NVMe IO 恒为 **128KiB**（blocks p50=256）⇒ **代码层固定**，env 无法改；vsegment child=2MiB（planned_children=2），128KiB 是更下层 IO 粒度 |
-| NOF-016 | 已下发（用户已批准） | 换 target：停旧 gap target/master → 保存回滚快照 → yin spdk-cpu 构建重启 target（4457/strip256K/udmac0d1e2）→ 重启我方 master；不 mount、不写数据 |
+| NOF-016 | 已关闭 2026-11-20（**通过**） | yin target 已起：PID 341038、md5 736a902f…、listener **192.168.84.149:4457**、strip 256K/11 成员、dev udmac0d1e2；旧三进程全退；我方键清空、yin 键未动；master 重启 PID 2462234（leader/serving、enabled=0）；回滚快照已存 |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -254,6 +254,19 @@
 - 最大未验证差异：**target 构建**。现役旧 gap target（`urma_p99` 构建）实测每 IO W9 ~255–288µs；同事文档的 yin target 达 **54.7–68µs**（5× 差距，非负载可完全解释：4 线程时我们 W9 仍 ~255µs）。旧 target 带 p99 门控/不同 iobuf/queue 参数，是首要嫌疑。
 - **用户已批准（2026-11-20）**：停旧 gap target/master、重绑 11 盘、用 yin spdk-cpu 构建重启 target；旧 GAP 数据可能受影响，用户同意必要时重灌。
 - 分阶段执行：NOF-016 换 target + 重启 master（不 mount）；NOF-017 mount + reconcile 门禁；NOF-018 writer 重灌；NOF-019 reader 基线对比（看 5× 差距是否闭合）。
+
+### NOF-016 关键事实（target 已换为同事构建，2026-11-20）
+
+- **新 target**：yin `nvmf_tgt`（md5 `736a902ffac8ce608acd22c5459f643d`，2026-11-17 19:20），PID 341038；listener **URMA 192.168.84.149:4457**（fabric 网段，旧地址 141.61.84.149 已拒绝）；NQN `nqn.2026-01.io.spdk:urma-gpu-test`，nsid 1 → `URMA_RAID0`（strip 256 KiB、11 成员、raid uuid `5805fd63-…`）；transport dev_name `udmac0d1e2`、max_io_size 8 MiB、capsule_transport=urma。
+- **旧环境退出**：我方 master 2162056（2 s）、gap master 3673976（1 s）、gap target 3243095（3 s）；4457 释放；无 nvmf_tgt/spdk_tgt 残留。
+- **etcd**：我方 `/cvm/vseg_nofvseg/` 6→0、`/oplog/vseg_nofvseg/` 1228→0；yin 与 mooncake_cluster 键数不变。
+- **我方 master 重启**：PID 2462234（16:31:45），leader/serving，50056/9006，`enabled=0`；`/cvm/vseg_nofvseg/` 3 键、`/oplog/` 1 键；env `udmac0d1e2` 自证。
+- **地址/身份变化**：listener 由管理网改为 fabric；raid uuid 变化；NOF-017 register 必须用 **192.168.84.149:4457**；旧 device_identity 冲突不存在（键已清）。
+- **target 日志路径改为 `/tmp/nvmf_tgt.log`**（gap 的 `~/gap/logs/nvmf_tgt.log` 已停写）。
+- 回滚快照：node3 `~/mooncake-nof-vsegment/run/rollback_gap_target.json`（4,761 B，含 4 类 RPC 全量 + 三进程 cmdline + gap target md5）。
+- 唯一额外动作：wrapper 仅存在于 node1，已原样 scp 到 node3 `/tmp/run_vesegment_target.sh`（md5 一致）。
+- HugePages：Free 347（yin target 占 ~8.4 GiB）。
+- **待验证**：`TARGET_TRACE_ENTRIES=0`（wrapper 本次默认）是否影响 target 侧 per-IO 遥测（URMA_SLOW_IO 的 target 段）；NOF-019 读时观察 `target_valid`。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -966,7 +979,7 @@ V0/V3 的 blocks p50 与 SLOW_IO 条数、target W n；chunk 是否作用于读�
 
 ---
 
-# NOF-016（待执行 · 换 target 为同事构建 · 2026-11-20）· 用户已批准破坏性操作
+# NOF-016（已关闭 · 通过 · 换 target 为同事构建 · 2026-11-20）· 用户已批准破坏性操作
 
 ## 授权与范围
 
@@ -1015,3 +1028,44 @@ V0/V3 的 blocks p50 与 SLOW_IO 条数、target W n；chunk 是否作用于读�
 ## 回执必答（第一行）
 
 yin target 是否在 4457 起来（PID/md5）、listener 地址/NQN/ns/strip/dev_name；我方 master 是否重启正常；旧进程是否全部退出；回滚快照路径。
+
+---
+
+# NOF-017（待执行 · mount 新 target + reconcile 门禁 · 2026-11-20）
+
+## 背景
+
+- NOF-016：yin target 在 **192.168.84.149:4457**（URMA，UDMAC0D1E2，strip 256K，11 成员）；我方 master PID 2462234（leader/serving，`enabled=0`）。
+- 本单用**新地址**重新 mount（100GiB、base 0、nsid 1），验证 1024 分区 reconcile 门禁。**不写数据**；不跑 writer/reader。
+
+## 1. 预检（只读）
+
+1. master：PID 2462234 存活；50056/9006 LISTEN；etcd `/cvm/vseg_nofvseg/` 3 键、无 quota 快照；`/oplog/vseg_nofvseg/` 1 键。
+2. target：node1 → `192.168.84.149:4457` 建连 OK；node3 `ss -lnt` 4457 正常；`nvmf_get_subsystems` 与 NOF-016 D1 一致。
+3. 记录 target 日志 `/tmp/nvmf_tgt.log` 当前 W 块基线（n 应为 0）。
+
+## 2. mount（唯一一次，零额外 env）
+
+- 在 node1 用 `nof_register`（md5 `1655b48a…`），root，输出 `run/register_r3.log`：
+  ```
+  <build>/mooncake-store/src/nof_register \
+    "nqn.2026-01.io.spdk:urma-gpu-test" 1 192.168.84.149 4457 URMA \
+    <node1 192.168.84.*:50056> 107374182400
+  ```
+- **不要** export 额外 env。
+
+## 3. 验证（只读）
+
+1. master 日志（≤40 行）：`SPDK initialization … init_rc=0`、`Attaching to 192.168.84.149`、`Attached`、`Opened NoF segment`、`MountNoFSegment_slow … rc[?]`；任何 attach/URMA ERROR。
+2. **设备映射（mount 时刻）**：`/dev/uburma` 映射数（应 >0）、`/dev/uburma/udmac0d1e2`、两个 URMA provider。
+3. 若 rc[0]：`published vsegment quota generation 1 with 1024 …`、`VSegment pool formed`、`first full reconcile sweep`；`reconcile failures`=0、`Failed to refresh vsegment ownership`=0；`reconcile stats`：`owned_by_me=1024, reconcile_fail=0`；`VSegment Status`：`enabled=1, partitions_installed=1024, vsegments=1024`；etcd quota 快照存在（~181 KB）；60 s 后复查仍 0。
+4. 若失败：贴 register 输出 + master 错误链 + target 日志对应时间窗（≤20 行），**停手**；不换参数重试。
+5. 记录 target 新 W 块（mount 后 n/W9）与日志路径。
+
+## 4. 边界
+
+- 不跑 writer/reader；不写数据；不动 target/master 配置；不重启；不碰 yin 的进程与键。
+
+## 回执必答（第一行）
+
+mount 是否 rc[0]；设备映射数/provider；reconcile failures 与 partitions_installed；etcd quota；失败则错误链与 target 侧日志。
