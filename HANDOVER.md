@@ -12,8 +12,8 @@
 
 - 项目名：**mooncake nof vsegment**（Mooncake NVMe-oF + vsegment），由同事交接，开发侧此前无任何了解。
 - 同事交接资料位于内网 Windows：`C:\Users\l00955908\Desktop\mooncake nof vsegment`（路径含空格，命令中注意引号）。
-- 测试环境为 node1、node3 两台机器，接入方式见：
-  `C:\Users\l00955908\Desktop\mooncake主仓\nds\测试相关资料\node1&3测试\连接node1和node3.md`
+- 测试环境为 node1、node3 两台机器，接入方式见（就在交接资料目录内）：
+  `C:\Users\l00955908\Desktop\mooncake nof vsegment\连接node1和node3.md`
 - 测试环境工作目录（本轮创建）：`/home/l00955908/mooncake-nof-vsegment`（node1、node3 各一份）。
 - 环境为多人轮流使用。**本轮不是独占**，按共用机约束执行；用户明确宣布"独占"后才放宽进程占用处理，重启等高危操作任何情况下都需先经用户确认。
 
@@ -70,7 +70,7 @@
 
 ## A. 环境接入（唯一允许的写操作在此）
 
-1. 读连接说明：`C:\Users\l00955908\Desktop\mooncake主仓\nds\测试相关资料\node1&3测试\连接node1和node3.md`，按其方式非交互 SSH 到 **node1** 和 **node3**。
+1. 读连接说明：`C:\Users\l00955908\Desktop\mooncake nof vsegment\连接node1和node3.md`，按其方式非交互 SSH 到 **node1** 和 **node3**。
 2. 两节点各执行：`mkdir -p /home/l00955908/mooncake-nof-vsegment`，并 `ls -ld` 确认。
 3. 记录：两节点是否接入成功、登录用户、hostname、`sudo -n true` 是否可用（只报可用/不可用）。
 4. **不要**把连接文档里的 IP、密码、密钥写进回执；用 node1/node3 指代。
