@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-028（vsegment 单分区=1，验证"哈希散列布局"假设）**
+- 当前任务：**NOF-029（vsegment-1 数据补齐[T1 writer] + 读侧判决）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -93,7 +93,8 @@
 | NOF-024 | 已关闭 2026-11-20（**旋钮证否**） | T1 下 qpairs 4/8/16 × workers 4/8：P50 中位 551.5/542.7/537.5/537.8µs（差 < 臂内极差）；**target W9 恒 250.5–251.2µs**；最好 537.5µs，距 300 差 1.79×；target 执行占 251µs（46.7%），客户端流水线 ~287µs；12/12 无失败 |
 | NOF-025 | 已关闭 2026-11-20（**判决：VSegment 慢**，含布局混淆） | plain NoF：**T1 P50 258.3µs vs VSegment 537.5µs（plain 快 2.08×）**；16t 打平（718.7 vs 719.0）；写 P50 273.0 vs 738.6（plain 快 2.7×）；target W9 plain 96.9/194–196µs vs VSeg 250.5/259.6µs；但 plain 数据连续堆放 1.6GiB、VSeg 散在 1024 分区 ⇒ **布局是混淆变量**，NOF-027 消除 |
 | NOF-027 | 已关闭 2026-11-20（**分区数证否**） | 1024→64：T1 P50 539.9 vs 537.5（无变化，target W9 仍 250.8）；**16t 变差 854.3 vs 719.0（+18.8%）**；仍未赢 plain（T1 2.09×）。机制指向"读序与物理布局错位"，非分区数量 |
-| NOF-028 | 已下发 | vsegment 单分区（slot=1）：所有 key 顺序写入同一分区，读序=写序，验证能否接近 plain 258.3µs；对比 target W9 |
+| NOF-028 | 已关闭 2026-11-20（**写入受阻，读未测**） | slot=1 被接受（partitions=1、reconcile 0）；writer 16 线程 377/400，**23 个 VSEGMENT_CREATING**（每跨 64MiB 卷边界丢 1 key，不重试）；容量 24×64MiB=1.5GiB 不足 1.6GiB；reader 未跑 |
+| NOF-029 | 已下发 | 用 T1/batch=1 writer 补齐 400 keys（无卷创建竞争）→ T1×3 + 16t×3 读侧判决布局假设 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
@@ -404,6 +405,15 @@
 - 写：vseg-64 400/0、4007.9 MiB/s、P50 916.09µs（比 vseg-1024 的 738.61 更慢）。
 - **容量偏差（重要）**：64 分区时 logical_capacity 只有 **4GiB**（64×64MiB 初始卷），不是任务书预算的 100GiB；auto-plan 每分区只发 initial_vsegment_count=1 个 64MiB 卷。本单不是纯净"只改分区数"实验。
 - **机制结论**：分区多少不改变 target 看到的 IO 形态（W9 恒定）⇒ 差距不在"数据散在 100GiB 的随机范围"，而在 **每 key 的 2MiB child × 16×128KiB 拆分方式与读序/物理布局错位**（plain 的 4MiB 连续读 W9 96.9µs）。分区数杠杆证否。
+
+### NOF-028 关键事实（单分区写入受阻，读未测，2026-11-20）
+
+- `MC_STORE_PARTITION_SLOT_COUNT=1` 被正常接受：`slot_count=1`、quota `partitions=1`、`reconcile_fail=0`、`partitions_installed=1`；初始 `logical_capacity=64MiB`。
+- writer（16 线程、batch 16）：**377 succeeded / 23 failed**，错误码统一 `VSEGMENT_CREATING`；失败 key 严格等间隔（16, 33, 50, …, 步长 17）⇒ **每跨一个 64MiB 卷边界丢 1 个 key**，bench 对该错误码不重试。
+- 容量演进：vsegments 1→24（1.5GiB），`logical_free=28MiB`；400×4MiB=1.6GiB 需要 ~26 个卷 ⇒ 容量+创建速度双不足。
+- reader 未执行（按停止规则）⇒ T1/16t/W9 `[未获取]`，布局假设未判定。
+- **判断**：这是**按需建卷 + 客户端不重试**的机制问题，不是"单分区不可用"；用单线程/batch=1 写入可避免创建竞争（NOF-029 验证）。
+- 环境：vsegment-1 master PID 2667366 运行中；数据为 377/400 混合态。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -1601,7 +1611,7 @@ VSegment-64 的 T1/16t P50/P90/P99/Avg；target W9；与 plain 258.3/718.7 及 V
 
 ---
 
-# NOF-028（待执行 · vsegment 单分区=1，验证布局假设 · 2026-11-20）
+# NOF-028（已关闭 · vsegment 单分区=1，验证布局假设 · 2026-11-20）
 
 ## 背景与假设
 
@@ -1647,3 +1657,50 @@ VSegment-64 的 T1/16t P50/P90/P99/Avg；target W9；与 plain 258.3/718.7 及 V
 ## 回执必答（第一行）
 
 VSegment-1 的 T1/16t P50/P90/P99/Avg；target W9；vsegments 数量；与 plain 258.3 的差；**布局假设是否成立**；有无失败。
+
+---
+
+# NOF-029（待执行 · vsegment-1 数据补齐 + 读侧判决 · 2026-11-20）
+
+## 背景与授权
+
+- NOF-028：单分区被接受，但 16 线程 writer 在卷边界丢 23 key（`VSEGMENT_CREATING` 不重试）。
+- **授权**：仅允许把 **writer 改为单线程、batch=1**（避免创建竞争）重写 400 keys；不改其它参数、不改容量参数。
+- 补齐后跑读，判定"布局假设"（读序=写序 ⇒ 是否接近 plain 258.3µs）。
+
+## A. 预检（只读）
+
+1. master（vseg-1，PID 2667366）存活；`partitions_installed=1`、`vsegments=24`、`logical_used=1,581,252,608`、`logical_free≈28MiB`。
+2. 确认无残留 writer/reader 进程。
+
+## B. T1 writer 补齐（写操作，已授权）
+
+- node1，root，同二进制/env/flags（vsegment 写路径），**唯一改动 `--num_threads=1 --batch_size=1`**；日志 `run/writer_vseg1_r2.log`。
+- 等待 `400 succeeded, 0 failed`（超时 8 min 停手）。
+- 验证：`logical_used=1,677,721,600`；`vsegments` 数量（预期 ~26）；无 `VSEGMENT_CREATING` 或列出残留。
+- 若仍失败（创建竞争/容量不足）→ **停手回报**，不改容量参数、不重试第二次。
+
+## C. Reader（仅当 B 成功）
+
+- T1 × 3 遍 + 16t × 3 遍（verify=true、诊断关；client `MC_STORE_PARTITION_SLOT_COUNT=1`）。
+- 记录 Avg/P50/P90/P99/Max、failed/verify；target W 块按"下一次连接打印上一轮"对齐；`query_rpc` p50。
+
+## D. 对比与回执
+
+| 场景 | T1 P50 | 16t P50 | target W9（T1） |
+|---|---|---|---|
+| plain NoF | 258.3 | 718.7 | 96.9 |
+| VSegment-1024 | 537.5 | 719.0 | 250.5 |
+| VSegment-64 | 539.9 | 854.3 | 250.8 |
+| **VSegment-1（本单）** | ? | ? | ? |
+
+- 明确回答：**T1 是否接近 258.3？target W9 是否降到 ~100µs 量级？** 是 → 布局/读序是主因、vsegment 层开销小；否 → vsegment 读路径自身开销。
+- 保留 vsegment-1 环境。
+
+## E. 边界
+
+- 只动我方 master/cluster；target 不动；不改容量/其它参数；失败停手。
+
+## 回执必答（第一行）
+
+T1 writer 是否 400/0（`logical_used`、vsegments）；VSegment-1 的 T1/16t P50 与 target W9；**布局假设是否成立**；有无失败。
