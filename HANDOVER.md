@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-005（mount node3 现有 target + 验 reconcile 门禁）**
+- 当前任务：**NOF-006（只读诊断：URMA attach 失败根因 + 换 target 前置）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -71,6 +71,7 @@
 | NOF-002 | 已关闭 2026-11-20 | P6=reconcile 门禁；1024 分区全灭且 manager 未安装；首要根因指向"旧 oplog 重放"，NOF-003 验证 |
 | NOF-003 | 已关闭 2026-11-20 | 假设证实：旧 oplog 重放 1024 条 vsegment 快照（9306 条 entry）；清场必须同时删 `/cvm/<cid>/` + `/oplog/<cid>/`；自建环境要素已收集 |
 | NOF-004 | 已关闭 2026-11-20 | 我方 master 在 node1 稳定运行（PID 2091164，50056/9006），全新 cluster 无 oplog 重放、0 reconcile 失败；8086 未启用（见事实） |
+| NOF-005 | 已关闭 2026-11-20（**未通过**） | mount 失败：master attach rc=-19 / URMA qpair err=-5（Operation not permitted）；客户端谎报成功；P6 门禁未获得有效验证；现役旧 gap target 与同事 sysurma 构建不兼容是首要嫌疑 |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -129,10 +130,20 @@
 - 因此"vsegment 841 vs 不开 vsegment 387"是**跨项目、跨版本、跨盘数、跨尺寸、跨客户端位置**的对比，不是受控 A/B，不能据此判定 vsegment 更慢。**受控对比**要用同一环境同时测"带/不带 vsegment"两组（我们的环境具备条件）。
 - 文档内 6 盘 VSegment：Get Avg 662 / P50 669 / P99 913µs；五段 roundtrip 548 / target 519 / bdev 513µs；裸 SPDK 11 盘 Get 236 / exec 68µs；W9 6→11 盘 294→54.68µs。待办：NOF-006 提取文档 §3.1/§3.2/§3.4 原表并建立"同口径臂表"。
 
+### NOF-005 关键事实（mount 失败，2026-11-20）
+
+- **结果**：客户端 `nof_register` 退出码 0 并打印 `NoF registration succeeded`（P4 谎报）；master 侧 `MountNoFSegment_slow ... rc[-101]`；底层 `Failed to attach NoF controller ... rc=-19`；SPDK 日志 `nvme_urma_qpair_defer_error ... err=-5` → `URMA qpair 0: fatal rc=-5` → `Operation not permitted`。target 未受影响。
+- **后果**：mount 未成立 ⇒ quota 0、`enabled=0`、`reconcile stats` 行未出现；此时 `reconcile failures=0` 是**假阴性**，不能作为 P6 已解证据。
+- **现场构成**：现役 target 是旧 gap 项目的 SPDK 构建（`~/gap/spdk`，nvmf_tgt md5 `6668b4905ec3886a38aa3ed5630af19a`，690,992 B 动态，transport 名含 `urma_p99`）；master 的 NoF 客户端来自同事 **sysurma** 构建（be10be2）。两者 URMA 实现很可能不同源 ⇒ 协议/transport 不兼容是首要嫌疑（NOF-006 证实）。
+- **设备名冲突**：交接文档 §一写 `udmac0d1e2`，同事脚本 `VSEG_URMA_DEVICE=udmac1d1e2`；本次 master 用 `udmac1d1e2`。`[冲突]` 未定。
+- **文档拓扑口径（§一/§二）**：node1 = etcd + master + writer + 编排；node3 = target + reader；11×7T + 系统盘；4–8 MiB/单 key；master RPC 50058 / metrics 9008；target 4420；RAID0 strip 256 KiB；100 GiB ns。→ **读测试是"本机 client"口径**，写测试跨节点。
+- **target 打点（D2）**：现役 gap target 的日志在 `~/gap/logs/nvmf_tgt.log`（44.9 MB 持续写），含 `URMA_BDEV_DETAIL` 181,061 行（bdev_us / exec_to_read / read_to_submit / submit_call / submit_to_callback / callback_to_complete）与 W9/W10 行（当前 n=0）；**W1 为 0 行**；`SPDK_URMA_STAGE_TARGET_SINK` 读不到。→ target 侧五段类数据可用（字段名与 yin 的 W1–W10 不完全相同）。
+- **产物**：node1 `~/mooncake-nof-vsegment/run/register_100gib.log`、`run/master_50056.log`（新增失败链 13 行）；master 仍在运行（未停）。
+
 ### 口径与数据安全（2026-11-20 用户补充）
 
 - **数据保留**：GAP 旧数据是盘起始连续的 ~2.47 TB（294,669 keys × 8 MiB）；用户要求尽量保留，**实在不行可清理、后续重新 prefill**。新 vsegment 段为 100GiB @ offset 0，writer 只写 400×4MiB=1.6GiB ⇒ 只覆盖最前 1.6GiB；若要零覆盖，需改造 `nof_register` 传入 `base=5TiB`（mount RPC 支持 `base`，该 CLI 写死 0），暂不做。
-- **拓扑事实（同事脚本）**：master/etcd/writer 在 node1，target/reader 在 node3 ⇒ 写路径跨节点、读路径数据与 target 同机；reader 侧 roundtrip−target≈29µs，属**本机口径**。我们计划 reader 两种位置都测（node3 对齐同事；node1 远端端到端），最终口径以交接文档 §一 为准（NOF-005 附带取证）。
+- **拓扑事实（同事脚本 + 交接文档 §一/§二 已相互印证）**：node1 = etcd + master + writer + 编排，node3 = target + reader ⇒ 写路径跨节点、读路径数据与 target 同机（元数据仍远程）；reader 侧 roundtrip−target≈29µs，属**本机口径**。我们计划 reader 两种位置都测（node3 对齐同事；node1 远端端到端）。
 - **旧 gap 进程**：用户已许可清理 master/client；当前计划暂不清理（我方 master 放 node1，不与其抢端口），需要 node3 资源时再停。
 
 ### NOF-003 关键事实（假设已证实，2026-11-20）
@@ -361,7 +372,7 @@ master 是否启动并监听 50056/9006；有无 ERROR；`/cvm|/oplog/vseg_nofvs
 
 ---
 
-# NOF-005（待执行 · mount + reconcile 门禁 · 2026-11-20）· 把 node3 现有 target 挂到我们的 master，验证 P6 已解
+# NOF-005（已关闭 · 未通过 · mount + reconcile 门禁 · 2026-11-20）· 把 node3 现有 target 挂到我们的 master，验证 P6 已解
 
 ## 背景
 
@@ -411,3 +422,41 @@ master 是否启动并监听 50056/9006；有无 ERROR；`/cvm|/oplog/vseg_nofvs
 ## 回执必答（第一行）
 
 mount 是否 rc[0]；`reconcile failures` 是否 0；`partitions_installed` 是否 1024；失败则给错误码与首个错误行；§一 口径要点；现有 target 是否有 W1–W10 打点。
+
+---
+
+# NOF-006（待执行 · 只读诊断 · 2026-11-20）· URMA attach 失败根因取证 + 换 target 前置
+
+## 背景
+
+- NOF-005：master（同事 sysurma 构建）attach 现役 target（旧 gap 的 `urma_p99` 构建）时 `URMA qpair err=-5`、attach `rc=-19`（Operation not permitted）；无 quota、无 reconcile。
+- 同事的实验用的是 **yin 的 spdk-cpu** 构建的 target，不是旧 gap target。本单先**只读**取证，判断失败属于"协议/transport 不兼容"还是"设备/路径/权限"，并为"换 target 为同事构建"准备准确的前置命令。
+- 全部只读；不重试 mount、不停进程、不绑/解绑盘、不跑 takeover、不改 etcd、不重启 master。
+
+## A. target 侧现场（只读）
+
+1. node3 现役 target 日志 `~/gap/logs/nvmf_tgt.log`：14:41:30–14:41:45 窗口内**除 `URMA_BDEV_DETAIL` 外**的全部行（≤30 行，去重）；重点找 connect capsule 被拒/错误码/未知命令。
+2. `/proc/3243095/cmdline`（已有）与 cwd；`~/gap/run/`、`~/gap/logs/` 里找我们旧项目启动 target 的脚本/环境记录：URMA 设备名、bonding、transport 名（`urma_p99` 的来源）、ns 大小、strip。只给 ≤15 行摘要。
+3. RPC 只读查询（socket `~/gap/run/spdk.sock`）：`nvmf_get_subsystems`、`nvmf_get_transports`（若存在）；确认 transport 注册名（urma / urma_p99）与 listener；`bdev_raid_get_bdevs`（若存在）确认 strip 与成员顺序。
+4. URMA 设备与网络对应：`ls /dev/uburma`、`rdma link show` 或 urma 对应命令；`udmac0d1e2` / `udmac1d1e2` / `bonding_dev_0` 与网卡/平面的对应关系（sysfs 或驱动信息）；说明 target 的 `141.61.84.*:4457` 监听走哪个设备/平面，master 侧 `SPDK_URMA_DEV_NAME=udmac1d1e2` 是否在同一平面。
+
+## B. 版本/协议对照（只读，≤30 行输出）
+
+1. 两棵 SPDK 树在 URMA 传输上的差异：node3 `~/gap/spdk`（HEAD 170cbb9）与 node3 `/home/yin/nof/spdk-cpu`（HEAD e12b7cb，脏）——分别 `git log --oneline -10 -- lib/nvmf/urma.c lib/nvme/nvme_urma.c`，给提交标题即可；指出是否有 capsule/协议/标志位相关改动。
+2. 两个 target 构建对比：gap `build/bin/nvmf_tgt`（md5 `6668b490…`，690,992 B）vs yin `build/bin/nvmf_tgt`（15 MB 级）；`strings` 对比关键 URMA 符号/版本串（各 ≤5 条）。
+3. 结论只报事实：是否存在能解释 `capsule completion err=-5` 的协议/transport 差异。
+
+## C. 换 target 的前置信息（只读）
+
+1. `run_vesegment_target.sh`（node3 `/home/yin/nof/spdk-cpu` 或 vseg_scripts）：它如何调用 `target_nvme_takeover.sh`（完整参数模板：盘、`-R` strip、`-p`/`-N`、mask、SPDK 根、NQN、端口如何注入）、ns 大小如何确定、启动后如何等待端口。给 ≤20 行摘要 + 行号。
+2. `target_nvme_takeover.sh` 在当前状态下的行为（11 盘已 vfio 绑定、旧 nvmf_tgt 在跑）：是否拒绝、是否自动还原；`-r` 还原命令；正向启动命令模板。
+3. node3 HugePages 现状；旧 target 停掉后预计释放多少（`/proc/meminfo` + 目标进程的 hugepage 占用，能取多少报多少）。
+
+## D. 边界
+
+- 只读；不执行 takeover、不启停任何进程、不绑/解绑盘、不删改 etcd、不重启 master。
+- 不贴整文件/大段日志；IP/密码打码。
+
+## 回执必答（第一行）
+
+attach 失败更像"协议/transport 不兼容"还是"设备/路径/权限"？给直接证据；换 target 的准确命令链与前置；旧 target 停止后预计释放的 HugePages。
