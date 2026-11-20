@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**等待用户方向决策：收口出报告 / 再做 batch 预取实验 / 上代码改造放大 IO**
+- 当前任务：**NOF-025（关键 A/B：plain NoF 基线，验证"VSegment 必须更快"）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -91,6 +91,7 @@
 | NOF-022 | 已关闭 2026-11-20（**通过，含 1 次误写**） | Mooncake T1 bdev 425µs、端到端 P50 571.1；**裸 SPDK 128K T1B1：客户端 p50 41.3µs、target W9 30.2µs**；同 target 下 Mooncake W9 259µs（T1/T4/T16 不变）⇒ 8.6× 差在 target 执行层；但裸=顺序、Mooncake=随机 2MiB，**访问模式是混淆变量**，NOF-023 受控验证；urma_perf preflight 在 LBA0 写了一次（已授权修复） |
 | NOF-023 | 已关闭 2026-11-20（**通过**） | **8.6× 主体 = 随机 vs 顺序**：QD1 target exec 30.35→190.58µs（6.3×）；QD 只次要（seq +36%、rand +8%）；**随机下 Mooncake 259 vs 裸 SPDK 190–206µs = 1.26–1.36×**；LBA0 修复完成（writer 400/0、verify 0 错）；yin urma_perf ABI 不兼容（WIRE v6 vs v4） |
 | NOF-024 | 已关闭 2026-11-20（**旋钮证否**） | T1 下 qpairs 4/8/16 × workers 4/8：P50 中位 551.5/542.7/537.5/537.8µs（差 < 臂内极差）；**target W9 恒 250.5–251.2µs**；最好 537.5µs，距 300 差 1.79×；target 执行占 251µs（46.7%），客户端流水线 ~287µs；12/12 无失败 |
+| NOF-025 | 已下发（用户最终目标驱动） | plain NoF 基线：临时关 vsegment、同 target 同负载写 400 keys 并读（16t/T1 各 3 遍），与 VSegment 537.5/719µs 做 A/B；测完保留 plain 环境，按结论决定 vsegment 布局调优 |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -363,11 +364,14 @@
 - 运行间漂移：L4 基线 551.5 vs NOF-022 同配置 571.1（−3.4%）⇒ 2.5% 的"提升"与漂移同量级。
 - **结论**：客户端参数旋钮到头；剩余 ~287µs 需改结构（batch/预取/放大 IO 粒度/改 vsegment 切分），或在现状收口。
 
-### 方向决策（2026-11-20，待用户选择）
+### 最终目标（用户 2026-11-20 明确，最高优先级）
 
-1. **收口出交付报告**（推荐）：以现状（T1 537µs / 16t 719µs）交付，报告含 P6 根因、五段拆分、随机读底板 190–250µs、target 对比、300µs 不可达的论证与所需设计改造。
-2. **再做一轮便宜的 batch/预取实验**：T1 下 batch_size 2/4/8（一次读多个 key），看能否把 ~90µs 元数据与数据流水重叠；预计最好 ~450–500µs，**达不到 300**。
-3. **上代码改造**：改 Mooncake/SPDK 把 128KiB NVMe IO 放大（需自建构建，周期以天计）；理论最好 ~400–450µs，仍未必到 300。
+> **"开了 vsegment 的性能一定要比没开 vsegment 更好，不然 vsegment 就没任何意义。这是我的最终目标，不动摇。"**
+
+- 绝对 300µs 退居其次；**首要交付 = 同环境、同负载下 VSegment vs plain NoF 的对照，且 VSegment 必须更快**。
+- 现有对照缺口：我们只量了 VSegment 绝对值（T1 537.5µs / 16t 719µs），**从未在本环境跑过 plain NoF**。
+- 计划：NOF-025 建 plain NoF 基线（临时拆 vsegment 环境）；随后按结果决定：①若 vsegment 已更快 → 收口；②若 vsegment 更慢 → 做 vsegment 布局调优（首选"减少分区数"，让 key 在分区内连续分配、把随机读变顺序读），直到 vsegment 胜出。
+- plain NoF flag 依据（`stress_cluster_bench.cpp` be10be2）：`--replica_num=0 --nof_replica_num=1 --vsegment_nof_io=false --segment_write_vsegment=false`；`--vsegment_nof_io` 注释明确 "VSegment puts require --nof_replica_num=0"。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -1429,3 +1433,48 @@ S1/S32/R1/R32 的延迟与 target W9（顺序 vs 随机、QD1 vs QD32 各差多�
 ## 回执必答（第一行）
 
 L4/L8/L16/L16W8 中位 P50/P90/P99/Avg；最优组合；target W9/n；T1 端到端距 ~300µs 还差多少；有无失败。
+
+---
+
+# NOF-025（待执行 · 关键 A/B：plain NoF 基线 · 2026-11-20）
+
+## 背景与目标（最高优先级）
+
+- 用户最终目标：**开了 vsegment 必须比不开更快**；绝对 300µs 退居其次。
+- 现有 vsegment：T1 P50 **537.5µs**、16t P50 **719µs**（新 yin target，400×4MiB，verify）。
+- 本单在同一 target、同一客户端、同一负载下建立 **plain NoF（无 vsegment）** 基线，做首次同口径 A/B。
+
+## A. 参数核对（只读）
+
+- 依 `stress_cluster_bench.cpp`（be10be2）flag 语义：
+  - plain NoF：`--replica_num=0 --nof_replica_num=1 --vsegment_nof_io=false --segment_write_vsegment=false`；
+  - master 关闭 vsegment：`--vsegment_auto_plan=false --cvm_segments_vsegment_exclusive=false`，其余 HA/oplog/端口/env 不变。
+- 若实际 binary `--help` 与上述不符：按 binary 实际 flag 执行并在回执记录差异。
+
+## B. 切换环境（只动我方 master/cluster）
+
+1. 记录当前 vsegment 状态（PID 2462234、etcd 键、logical_used、数据）；停 master。
+2. 清**仅我方**键：`/cvm/vseg_nofvseg/` + `/oplog/vseg_nofvseg/`。
+3. 以 plain 参数重启 master（node1，50056/9006，`SPDK_URMA_DEV_NAME=udmac0d1e2`、`VSEG_URMA_DEVICE=udmac0d1e2`，无 vsegment 参数）；确认 leader/serving、无 quota key。
+4. `nof_register` 同命令挂载 target（192.168.84.149:4457、100GiB、base0、nsid1）→ 确认 mount rc[0]。
+
+## C. plain NoF 写 + 读
+
+1. **writer**：400 keys × 4MiB、16 线程、batch 16、verify=false；flags 按 A 段（plain）；其余 env/参数同 NOF-018；确认 `400 succeeded, 0 failed`、master Keys=400。
+2. **reader**：16 线程 × 3 遍 + **T1 × 3 遍**（verify=true、诊断关、batch1）；记录 Avg/P50/P90/P99/Max、failed/verify；target W 块按"下一次新连接打印上一轮"规则对齐。
+3. 记录 plain NoF 的 target W9 / exec% / TOTAL。
+
+## D. 回执与对比
+
+- 对比表（同口径）：plain NoF vs VSegment：**T1** 的 P50/P90/P99/Avg；**16t** 的 P50/P90/P99/Avg；target W9。
+- 明确回答：**VSegment 比 plain NoF 快还是慢？差多少？**（若慢，写明差值与可能的布局原因。）
+- 环境处理：**保留 plain 环境，不恢复 vsegment**（下一单按结论：若 vsegment 慢，先做"减少分区数/布局连续化"调优）。
+
+## E. 边界
+
+- 只动我方 master/cluster；不动 yin/target 配置；target 仅正常读写（覆盖我们自己的 100GiB 段）。
+- 失败停手；回滚信息：vsegment 恢复步骤 = NOF-004/007 参数 + NOF-017 mount + NOF-018 writer（均已记录）。
+
+## 回执必答（第一行）
+
+plain NoF 的 T1 / 16t 中位 P50/P90/P99/Avg；与 VSegment 的差；target W9；**VSegment 是否更快**；有无失败。
