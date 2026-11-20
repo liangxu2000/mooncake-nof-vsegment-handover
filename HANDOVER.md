@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-006（只读诊断：URMA attach 失败根因 + 换 target 前置）**
+- 当前任务：**NOF-007（重启我方 master：SPDK_URMA_DEV_NAME=udmac0d1e2，验证设备映射）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -71,7 +71,8 @@
 | NOF-002 | 已关闭 2026-11-20 | P6=reconcile 门禁；1024 分区全灭且 manager 未安装；首要根因指向"旧 oplog 重放"，NOF-003 验证 |
 | NOF-003 | 已关闭 2026-11-20 | 假设证实：旧 oplog 重放 1024 条 vsegment 快照（9306 条 entry）；清场必须同时删 `/cvm/<cid>/` + `/oplog/<cid>/`；自建环境要素已收集 |
 | NOF-004 | 已关闭 2026-11-20 | 我方 master 在 node1 稳定运行（PID 2091164，50056/9006），全新 cluster 无 oplog 重放、0 reconcile 失败；8086 未启用（见事实） |
-| NOF-005 | 已关闭 2026-11-20（**未通过**） | mount 失败：master attach rc=-19 / URMA qpair err=-5（Operation not permitted）；客户端谎报成功；P6 门禁未获得有效验证；现役旧 gap target 与同事 sysurma 构建不兼容是首要嫌疑 |
+| NOF-005 | 已关闭 2026-11-20（**未通过**） | mount 失败：master attach rc=-19 / URMA qpair err=-5（Operation not permitted）；客户端谎报成功；P6 门禁未获得有效验证 |
+| NOF-006 | 已关闭 2026-11-20 | **不是协议问题**（两树 WIRE v4 一致）；是设备/provider 问题：master 用 udmac1d1e2 导致 0 个 `/dev/uburma` 映射、未加载 URMA provider；同一二进制在 yin master（udmac0d1e2）下正常；现役 target 也是 udmac0d1e2 |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -139,6 +140,16 @@
 - **文档拓扑口径（§一/§二）**：node1 = etcd + master + writer + 编排；node3 = target + reader；11×7T + 系统盘；4–8 MiB/单 key；master RPC 50058 / metrics 9008；target 4420；RAID0 strip 256 KiB；100 GiB ns。→ **读测试是"本机 client"口径**，写测试跨节点。
 - **target 打点（D2）**：现役 gap target 的日志在 `~/gap/logs/nvmf_tgt.log`（44.9 MB 持续写），含 `URMA_BDEV_DETAIL` 181,061 行（bdev_us / exec_to_read / read_to_submit / submit_call / submit_to_callback / callback_to_complete）与 W9/W10 行（当前 n=0）；**W1 为 0 行**；`SPDK_URMA_STAGE_TARGET_SINK` 读不到。→ target 侧五段类数据可用（字段名与 yin 的 W1–W10 不完全相同）。
 - **产物**：node1 `~/mooncake-nof-vsegment/run/register_100gib.log`、`run/master_50056.log`（新增失败链 13 行）；master 仍在运行（未停）。
+
+### NOF-006 关键事实（URMA attach 失败根因，2026-11-20）
+
+- **协议不是原因**：gap 与 yin 两棵 SPDK 的线协议一致（`SPDK_URMA_WIRE_MAGIC=0x41524d55`、`WIRE_VERSION=4`），`nvme_urma.c` 2064 vs 2050 行、`nvmf/urma.c` 2832 vs 2827 行，握手字段集合相同。
+- **设备/provider 是原因**：我方 master（PID 2091164）`/proc/<pid>/maps` 中 `/dev/uburma` 映射 **0 条**，`liburma-udma.so`/`liburma_ubagg.so` **均未加载**；对照：yin master（PID 151060，**同一二进制同 md5**）用 `SPDK_URMA_DEV_NAME=udmac0d1e2`，映射 `/dev/uburma/udmac0d1e2` 且两个 provider 均加载；他人 client 与 node3 target 同样加载。
+- **现役 target 用 udmac0d1e2**：`target_start.log` L99 的 `SPDK_URMA_DEV_NAME=udmac0d1e2`，RPC `nvmf_get_transports` 也显示 `dev_name=udmac0d1e2`；而 yin 脚本默认 `TARGET_URMA_DEVICE=udmac1d1e2`、交接文档写 `udmac0d1e2` —— 三处口径不一，实测以 `udmac0d1e2` 为准。
+- 设备拓扑：两机 `/sys/class/uburma` 各 7 个（`bonding_dev_0` + udmac0d1e2-4 + udmac1d1e2-4，udmac0/udmac1 属两个 UB controller）；`urma_admin show` 两机均只有 `bonding_dev_0` 带 EID。
+- **target 侧无握手记录**：14:41:35 窗口 target 日志无任何行（唯一 14:4x 行为 14:40:57 的 `handshake failed rc=-104 peer=node1`，早于 register 38s）⇒ 失败发生在 initiator 本地，进一步支持设备层。
+- 换 target 前置（备用）：现役 gap target 占 4293 页 2MiB 大页（8.38 GiB）；停 target 可释放至 ~4639/4640 页；takeover 在已有 SPDK 进程时会硬拒绝（L416/L446/L289），必须先停；正向模板 `-N` 设备必须显式选 `udmac0d1e2`，listener 会改用 fabric IP。
+- **结论与对策**：改用 `SPDK_URMA_DEV_NAME=udmac0d1e2`（并按 yin 环境补 `VSEG_URMA_DEVICE=udmac0d1e2`）重启我方 master 即可，**无需换 target**（NOF-007 验证）。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -425,7 +436,7 @@ mount 是否 rc[0]；`reconcile failures` 是否 0；`partitions_installed` 是�
 
 ---
 
-# NOF-006（待执行 · 只读诊断 · 2026-11-20）· URMA attach 失败根因取证 + 换 target 前置
+# NOF-006（已关闭 · 只读诊断 · 2026-11-20）· URMA attach 失败根因取证 + 换 target 前置
 
 ## 背景
 
@@ -460,3 +471,49 @@ mount 是否 rc[0]；`reconcile failures` 是否 0；`partitions_installed` 是�
 ## 回执必答（第一行）
 
 attach 失败更像"协议/transport 不兼容"还是"设备/路径/权限"？给直接证据；换 target 的准确命令链与前置；旧 target 停止后预计释放的 HugePages。
+
+---
+
+# NOF-007（待执行 · 重启我方 master 修正 URMA 设备 · 2026-11-20）· 只换设备名，不 mount、不动 node3
+
+## 背景
+
+- NOF-006 已证实：不是协议问题（两树 WIRE v4 一致）；我方 master 用 `SPDK_URMA_DEV_NAME=udmac1d1e2` 导致**零 `/dev/uburma` 映射、未加载 URMA provider**；同一二进制在 yin master（`udmac0d1e2`）下两者正常；现役 target 也是 `udmac0d1e2`。
+- 本单只做一件事：**按 yin 的设备口径重启我们的 master**，确认设备/provider 映射出现。**不 mount、不动 node3、不写盘**。
+
+## 1. 预检（只读）
+
+1. 记录：master PID 2091164、cmdline、50056/9006 LISTEN。
+2. etcd：`/cvm/vseg_nofvseg/` 3 键、`/oplog/vseg_nofvseg/` 1 键（重启前后应不变）。
+
+## 2. 停止旧进程
+
+- `sudo -n kill -TERM 2091164`；最多等 10 s，未退出再 `sudo -n kill -KILL 2091164`（禁止 pkill/killall）。
+- 确认 50056/9006 已释放；**不得触碰 yin master 151060**。
+
+## 3. 启动（root，nohup，新日志 `run/master_50056_r2.log`）
+
+- 参数集合与 NOF-004 完全一致（cluster_id=vseg_nofvseg、50056/9006、地址、14 项 vsegment/HA、`--http_metadata_server_port=8086`）。
+- **只改 env**：
+  - `SPDK_URMA_DEV_NAME=udmac0d1e2`（原 udmac1d1e2）
+  - 新增 `VSEG_URMA_DEVICE=udmac0d1e2`（对齐 yin 运行环境）
+  - 其余保持：`MC_STORE_PARTITION_SLOT_COUNT=1024`、`MOONCAKE_VSEGMENT_METRICS_REFRESH_INTERVAL_MS=1000000`、`SPDK_URMA_CAPSULE_TRANSPORT=urma`。
+- 记录新 PID。
+
+## 4. 验证（只读）——设备映射是本单核心验收
+
+1. 进程/端口：新 PID 存活；50056/9006 LISTEN。
+2. **设备映射**：`sudo -n grep -c '/dev/uburma' /proc/<新PID>/maps` **必须 > 0**；确认出现 `/dev/uburma/udmac0d1e2`；`sudo -n grep -o 'liburma-udma.so\|liburma_ubagg.so' /proc/<新PID>/maps | sort -u` **必须两者都出现**。
+3. 与 yin master（PID 151060）并排对比上述三项（只读）。
+4. 日志：启动 banner、SPDK init `init_rc=0`、`VSegment auto-plan deferred`（预期，未 mount）、ERROR/WARNING 行；**不应**出现 attach/URMA 错误。
+5. etcd 键数不变（3/1）。
+6. 写清新的停止命令（`sudo -n kill -TERM <新PID>`）。
+
+## 5. 边界
+
+- 只动我们自己的 master 进程；不碰 yin master、etcd 既有键、node3、gap 环境；不 mount、不注册、不起 target、不写盘。
+- 若新进程启动异常或设备映射仍为 0：**停手回报**（日志 ≤30 行），不尝试其它设备名、不改参数重试。
+
+## 回执必答（第一行）
+
+新 PID 是否存活并监听 50056/9006；`/dev/uburma` 映射数与 `udmac0d1e2` 是否出现；两个 URMA provider 是否加载；与 yin master 的对比；有无 ERROR。
