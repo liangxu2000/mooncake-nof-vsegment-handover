@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-018（writer 重灌 400 keys 到新 target）**
+- 当前任务：**NOF-019（新 target 读基线对比：16 线程/4 线程各 3 遍）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -84,6 +84,7 @@
 | NOF-015 | 已关闭 2026-11-20（**通过**） | env 自证 chunk 已进进程（131072/262144/2097152），但读路径 NVMe IO 恒为 **128KiB**（blocks p50=256）⇒ **代码层固定**，env 无法改；vsegment child=2MiB（planned_children=2），128KiB 是更下层 IO 粒度 |
 | NOF-016 | 已关闭 2026-11-20（**通过**） | yin target 已起：PID 341038、md5 736a902f…、listener **192.168.84.149:4457**、strip 256K/11 成员、dev udmac0d1e2；旧三进程全退；我方键清空、yin 键未动；master 重启 PID 2462234（leader/serving、enabled=0）；回滚快照已存 |
 | NOF-017 | 已关闭 2026-11-20（**通过**） | 新 target 上 mount rc[0]（233ms）；1024 分区 reconcile 全通过（60s+ 复查仍 0）；quota 181,399 B；device_identity=5805fd63… 与新 raid 一致；**mount 期 target W9≈70µs（n=10，旧 target 255–288µs）** |
+| NOF-018 | 已关闭 2026-11-20（**通过**） | writer 400/0，1.5625 GiB，0.39s，4091.95 MiB/s；写时延 Avg 977.53 / P50 901.03 / P99 2775.35；**写窗口 target W9 23,550 ns（旧 24,840，−5.2%）** ⇒ 换 target 不影响写路径，5× 差异在读路径 |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -277,6 +278,14 @@
 - **quota 发布延迟 +18 s**（mount 16:34:52 → 发布 16:35:11）：后续门禁检查必须等 ≥20 s，否则易误判。
 - **target W9 在 mount 期 ≈ 70,210 ns（n=10，仅控制面/探测 IO）**——与旧 gap target 的 255–288µs 形成量级差异，也与同事文档 54.7–68µs 同档。样本很小，**仅作线索**，待读流量验证。
 - 唯一 target ERROR 是预检 TCP 探测造成的 `handshake failed rc=-104`（16:34:43），非 mount 失败；`/tmp/nvmf_tgt.log` 已增长至 43 KB。
+
+### NOF-018 关键事实（新 target 写路径与旧 target 同档，2026-11-20）
+
+- writer 400 succeeded / 0 failed：1.56 GB，0.39 s，**4091.95 MiB/s**；写时延 Min 739.48 / Avg 977.53 / P50 901.03 / P90 1131.46 / P99 2775.35 / Max 5443.41 µs（与 NOF-009 旧 target：Avg 1007.38 / P50 931.45 / P99 3103.38 相比略优）。
+- master：`logical_used=1,677,721,600`（=400×4MiB）；NVMe-oF SSD 1.56 GB / 100 GB；Keys=400；E=1（启动期）；1 条 `PutEnd_slow 3076µs rc[0]` 长尾。
+- etcd：`/cvm/` 8 键不变；`/oplog/` 32→1232。
+- **target 写窗口 W9 avg 23,550 ns（n=12,801）vs 旧 gap target 24,840 ns（−5.2%）**；TOTAL 67µs；exec 34.9%、jfc 63.8%。
+- **结论（事实层）**：换 target 构建对**写路径** target 侧执行几乎无影响；旧 target 的 5× 差距出现在**读路径**（旧读 W9 255–288µs vs 新 mount 控制 IO 70µs），待 NOF-019 读基线确认。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -1082,7 +1091,7 @@ mount 是否 rc[0]；设备映射数/provider；reconcile failures 与 partition
 
 ---
 
-# NOF-018（待执行 · writer 重灌 · 2026-11-20）· 新 target 上写入 400 keys
+# NOF-018（已关闭 · 通过 · writer 重灌 · 2026-11-20）· 新 target 上写入 400 keys
 
 ## 背景
 
@@ -1118,3 +1127,39 @@ mount 是否 rc[0]；设备映射数/provider；reconcile failures 与 partition
 ## 回执必答（第一行）
 
 writer 是否 400/0；`logical_used`；**target 侧写窗口 W9 avg / n / exec%**（与旧值 24,840 ns 对比）；master/target 有无错误。
+
+---
+
+# NOF-019（待执行 · 新 target 读基线对比 · 2026-11-20）
+
+## 目的
+
+在**新 yin target** 上重测读时延，与旧 gap target 的**同配置**数字直接对比，验证"换 target 后 5× W9 差距是否闭合、端到端是否跟着下降"。
+
+对照基线（旧 target，已关闭 NOF-010/014 数据）：
+
+| 臂 | 线程 | 旧 target p50 | 旧 target avg | 旧 target p99 |
+|---|---|---|---|---|
+| 16 线程 | 16 | 714.9 µs | 754.9 µs | 1672.3 µs |
+| 4 线程 | 4 | 591.1 µs | 597.9 µs | 845.4 µs |
+
+## 臂定义（node3 reader，400 keys × 4 MiB，batch 1，warmup 5，order=seq，verify=true，诊断关，chunk 128KiB，inflight 32MiB，qpairs 4）
+
+- **R16**：`--num_threads=16`，3 遍；
+- **R4**：`--num_threads=4`，3 遍；
+- env 与 NOF-014 相同（`MC_NOF_SUBMIT_CHUNK_BYTES=131072`、`MC_NOF_INFLIGHT_BYTES_LIMIT=33554432`、`MC_NOF_WORKERS=4`、`SPDK_URMA_DEV_NAME=udmac0d1e2`、`SPDK_URMA_CAPSULE_TRANSPORT=urma`、诊断三项=0）。
+
+## 采集
+
+1. 每遍：Min/Avg/P50/P90/P99/Max、failed、verify 错误、`query_rpc_breakdown` 的 `total_us` p50；日志 `run/newtarget_R16_p<m>.log` / `run/newtarget_R4_p<m>.log`。
+2. 每遍跑完立即采 target W 块（`/tmp/nvmf_tgt.log` 最新块）：**W9 avg、n、exec%、TOTAL**（与旧读 W9 283–288µs 对比）。
+3. 汇总：臂 × 遍次 + 中位；与上表旧值并排对比（只报数字与差）。
+4. 停止规则：任一遍 failed>0 或 verify 错误>0 → 停手回报。
+
+## 边界
+
+- 只读；不写盘；不动 target/master；不重启；不增删臂；不自行加诊断 env。
+
+## 回执必答（第一行）
+
+R16/R4 中位 P50/P90/P99/Avg；与旧 target 同臂的差；target 读窗口 W9 avg/n；5× W9 差距是否闭合；有无失败。
