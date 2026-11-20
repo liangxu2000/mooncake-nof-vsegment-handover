@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-004（启动我方 master：node1、50056/9006、全新 cluster_id）**
+- 当前任务：**NOF-005（mount node3 现有 target + 验 reconcile 门禁）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -70,6 +70,7 @@
 | NOF-001 | 已关闭 2026-11-20 | 项目/资料/环境已摸清；P6 reconcile INVALID_PARAMS 是当前阻塞；node3 资源被旧 gap 环境占用 |
 | NOF-002 | 已关闭 2026-11-20 | P6=reconcile 门禁；1024 分区全灭且 manager 未安装；首要根因指向"旧 oplog 重放"，NOF-003 验证 |
 | NOF-003 | 已关闭 2026-11-20 | 假设证实：旧 oplog 重放 1024 条 vsegment 快照（9306 条 entry）；清场必须同时删 `/cvm/<cid>/` + `/oplog/<cid>/`；自建环境要素已收集 |
+| NOF-004 | 已关闭 2026-11-20 | 我方 master 在 node1 稳定运行（PID 2091164，50056/9006），全新 cluster 无 oplog 重放、0 reconcile 失败；8086 未启用（见事实） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -108,6 +109,17 @@
 - 远端分支最新为 `4c0ea28`（2026-11-19，领先 20+ 提交，含其他协作者合并）；**不是**同事实验所用版本。
 - SPDK：node1 `/home/yin/nof/spdk-cpu` 干净（HEAD d98b48e）；node3 同路径脏（HEAD e12b7cb，12 个改动）；origin `[未获取]`；target 二进制为本地构建，未推送。
 - 测试脚本（`vsegment_cluster.sh` 等）仅在 yin 本地，未推送。
+
+### NOF-004 关键事实（2026-11-20）
+
+- 我方 master：PID 2091164（root），node1，2026-11-20 14:37:22 启动；`--cluster_id=vseg_nofvseg`；`rpc_address=192.168.84.*`、`rpc_port=50056`、`metrics_port=9006`。
+- 状态：`role=leader, state=serving, service_ready=true`；`VSegment Status: enabled=0`；auto-plan deferred（等 mount）；`reconcile failures` 0 次；`Failed to refresh vsegment ownership` 0 次。
+- **无 oplog replay / self oplog replay / Restored from standby** 三行 ⇒ 全新 cluster 无旧状态（与 yin 的 1024 条重放形成对照）。
+- **8086 未监听**：传了 `--http_metadata_server_port=8086`，但 `--enable_http_metadata_server` 默认 false 未开启。开发侧决定暂不开启（同事环境也未启用；客户端用 `--metadata-server=etcd://` + master RPC，不依赖它）。
+- 保留 env：`MC_STORE_PARTITION_SLOT_COUNT=1024`、`MOONCAKE_VSEGMENT_METRICS_REFRESH_INTERVAL_MS=1000000`、`SPDK_URMA_DEV_NAME=udmac1d1e2`、`SPDK_URMA_CAPSULE_TRANSPORT=urma`；VSegment/HA 共 14 项参数与同事一致。
+- etcd：`/cvm/vseg_nofvseg/` 3 键（cluster_meta、masters/…、ring_slots/00000）；`/oplog/vseg_nofvseg/` 1 键（durable_prefix）。
+- 启动 1 s 后出现 1 条 `etcd_helper.cpp:352 lease keep alive ... timeout` ERROR，之后未复现（yin master 同期同形态，判为启动期瞬时）。
+- 产物：`/home/l00955908/mooncake-nof-vsegment/run/master_50056.log`（root）；停止命令 `sudo -n kill -TERM 2091164`（10s 不退再 KILL）。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -289,7 +301,7 @@ P6 具体做什么（带出处）、失败发生在哪一步、输入是什么�
 
 ---
 
-# NOF-004（待执行 · 启动我方 master · 2026-11-20）· 全新 cluster_id + 我方端口，验证干净环境
+# NOF-004（已关闭 · 启动我方 master · 2026-11-20）· 全新 cluster_id + 我方端口，验证干净环境
 
 ## 背景与范围
 
@@ -338,3 +350,56 @@ P6 具体做什么（带出处）、失败发生在哪一步、输入是什么�
 ## 回执必答（第一行）
 
 master 是否启动并监听 50056/9006；有无 ERROR；`/cvm|/oplog/vseg_nofvseg/` key 数；PID 与停止命令。
+
+---
+
+# NOF-005（待执行 · mount + reconcile 门禁 · 2026-11-20）· 把 node3 现有 target 挂到我们的 master，验证 P6 已解
+
+## 背景
+
+- NOF-004：我们的 master（`vseg_nofvseg`，PID 2091164，50056/9006）在 node1 稳定运行，`enabled=0`、auto-plan deferred（等 mount）、reconcile 失败 0 次、无旧 oplog 重放。
+- 本单：用同事的 `nof_register` 把 node3 **现有** target（URMA_RAID0 76.85 TiB，NQN `nqn.2026-01.io.spdk:urma-gpu-test`，4457，nsid 1）以 **100 GiB（107374182400 B）、base=0** 挂到我们的 master，验证 auto-plan 发布 1024 分区 quota 且 **reconcile 门禁 = 0**——这是"P6 已解"的第一直接证据。
+- **不写数据**：mount 只做控制面登记（写我方 etcd + master 内存），不写盘；writer 留到下一单。
+- **不动 target**：node3 的 `nvmf_tgt` 保持原样，不重启、不改参数、不碰盘。
+
+## A. 预检（只读）
+
+1. master：PID 2091164 存活；50056/9006 仍 LISTEN。
+2. target 可达：node1 → target 的 `141.61.84.*:4457` 建连测试（`timeout 5 bash -c '</dev/tcp/…/4457' && echo OK`）；在 node3 上 `ss -lnt | grep 4457` 确认监听。
+3. 取 register 的准确命令与环境：`sudo -n sed -n '560,600p' /home/yin/Vsegment/vseg_scripts/vsegment_cluster.sh`（register 函数及客户端 env）；回执只给 ≤15 行摘要（变量=值），不贴全文。
+4. etcd：`/cvm/vseg_nofvseg/` 仍 3 键、无 `snapshot/vsegment_partition_quota`。
+
+## B. mount（本单唯一写操作：我方 cluster 的 etcd 键 + master 内存）
+
+1. 使用同事构建目录的 `nof_register`（md5 `1655b48aa849297b96249c1aa132a0f3`），root 执行；按 A3 探明的 env；输出到 `run/register_100gib.log`：
+   ```
+   <build>/mooncake-store/src/nof_register \
+     "nqn.2026-01.io.spdk:urma-gpu-test" 1 <node3 的 141.61.84.*> 4457 URMA \
+     <node1 的 192.168.84.*:50056> 107374182400
+   ```
+   - base 固定 0（CLI 写死，**不要改参数**）。
+2. 命令返回后等待 ≤30 s，再进入验证；**失败不做任何修改性重试**。
+
+## C. 验证（只读）
+
+1. register 输出：`rc[0]` / `NoF registration succeeded`。
+2. master 日志关键行（≤30 行）：`MountNoFSegment_slow … rc[0]`、`published vsegment quota generation 1 with 1024 partition/profile quotas`、`VSegment pool formed`、`vsegment service published … running first full reconcile sweep`。
+3. **P6 门禁**：`grep -c "reconcile failures"` = **0**、`grep -c "Failed to refresh vsegment ownership"` = **0**；`reconcile stats` 中 `owned_by_me=1024`、`reconcile_fail=0`（若 stats 行未出现，等 10 s 再查）。
+4. `VSegment Status`：`enabled=1, generation=1, profiles=1, partitions_installed=1024, vsegments=1024`。
+5. etcd：`/cvm/vseg_nofvseg/snapshot/vsegment_partition_quota` 存在（~181 KB 量级）；`/cvm/vseg_nofvseg/` 键清单。
+6. 60 s 观察窗后再核一次门禁（防止首轮假通过）。
+
+## D. 顺带只读取证（≤20 行输出）
+
+1. 交接文档 §一（L8–18）+ §二拓扑表（L20–27）原文摘录——用于敲定测试口径（远端 vs 本机）。
+2. 现有 gap target 是否带 target 侧 W1–W10 打点：`sudo -n strings /home/l00955908/gap/spdk/build/bin/nvmf_tgt | grep -c 'URMA_BDEV_DETAIL\|W9'`；`sudo -n grep -c 'W9\|URMA_BDEV_DETAIL' /tmp/nvmf_tgt.log`（node3）。决定五段拆分的 target 段能否直接用现有 target 采。
+
+## E. 边界
+
+- 不跑 writer/reader；不写盘；不动 node3 的任何进程/盘；不重启 master；不改参数重试。
+- 若 register 失败（URMA 协议/身份不匹配等）：贴 register 输出 + master 日志尾部 ≤30 行，**停手回报**，不换 target/不换端口。
+- 不碰 yin 的 `vseg_yin_bonding` / `mooncake_cluster` 键与进程。
+
+## 回执必答（第一行）
+
+mount 是否 rc[0]；`reconcile failures` 是否 0；`partitions_installed` 是否 1024；失败则给错误码与首个错误行；§一 口径要点；现有 target 是否有 W1–W10 打点。
