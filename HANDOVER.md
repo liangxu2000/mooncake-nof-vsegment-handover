@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-010（reader 读 + 五段拆分采集，node3 口径）**
+- 当前任务：**NOF-011（诊断口径重跑 reader：打开打点 + 阈值 400µs，采五段/七字段）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -76,6 +76,7 @@
 | NOF-007 | 已关闭 2026-11-20 | master 已按 `udmac0d1e2` 重启（PID 2162056，端口正常、无新 ERROR）；**设备映射验收口径有误**——SPDK 惰性初始化，未 mount 不产生映射；映射验证并入 NOF-008 |
 | NOF-008 | 已关闭 2026-11-20（**通过**） | mount rc[0]；**P6 首次有效验证通过**：scanned=1024/owned_by_me=1024/reconcile_fail=0，partitions_installed=1024，60s 复查仍 0；设备映射 mount 时刻 0→20 条；quota 快照 181,399 B |
 | NOF-009 | 已关闭 2026-11-20（**通过**） | writer 400/0，1.5625 GiB，0.40 s，3970.7 MiB/s；master logical_used 精确 +1,677,721,600 B；无 ERROR；target 仅周期 W 汇总（per-IO detail 未开） |
+| NOF-010 | 已关闭 2026-11-20（**通过**） | 我们的读：400/400、verify 0 错；**Avg 801.29 / P50 791.06 / P90 1017.98 / P99 1709.42 / Max 1886.75µs**；URMA_SLOW_IO=0（打点默认关、阈值 100ms）；控制面逐 key RPC 158–386µs；target 读窗口 W9 285.87µs/exec 94.3% |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -181,6 +182,17 @@
 - **etcd**：`/cvm/vseg_nofvseg/` 8 键不变；`/oplog/vseg_nofvseg/` 28 → 1228（+1200）；yin 与 mooncake_cluster 前缀键数不变（无跨集群污染）。
 - **参数映射无冲突**：bench 的 64 个 flag 中无 cluster/namespace，集群路由只由 `--master-server` 决定；7 处替换：master 50056、admin 9006、URMA 设备 udmac0d1e2、其余照脚本（400/4MiB/16 线程/batch16/verify=false；chunk 128KiB/inflight 32MiB/workers 4/qpairs 4）。
 - **target 侧**：W 汇总块 n=12,807（理论 12,800）；W8 JFC wait 62.7%、W9 exec 36.4%、W9 avg 24,840 ns、TOTAL 68 µs（写路径口径）。**per-IO `URMA_BDEV_DETAIL` 未新增**（当前 target 运行态未开；最后样本仍是 11-19）——五段拆分的 target 逐 IO 明细需另想办法（优先用 initiator 侧 `URMA_SLOW_IO`，target 遥测随完成回传）。
+
+### NOF-010 关键事实（首份我们自己的读数据，2026-11-20）
+
+- **reader（node3，400 keys × 4MiB，16 线程，order=seq，verify=true）**：400/400 成功、校验 0 错误。
+- **端到端读时延（per-query, n=400）**：Min 462.64 / **Avg 801.29** / **P50 791.06** / P90 1017.98 / **P99 1709.42** / P999 1883.61 / Max 1886.75 µs。→ 与同事基线（~750–841µs）同量级，问题在我们环境**复现成功**。
+- **吞吐不可用**：bench 打印 Total time 0.07 s，但日志墙钟约 5.99 s（读阶段）；21341 MiB/s 是按 0.07 s 算的，**不得当端到端带宽**。
+- **控制面逐 key 分段（query_rpc_breakdown，815 行）**：字段 switch_us / rpc_first_us / route_refresh_us / retry_switch_us / rpc_retry_us / backoff_us / total_us；样本 total=386µs、158µs；全部 retry=0、status=ok；master 侧 `GetReplicaList latency_us=4` ⇒ **每 key 客户端 RPC 往返 150–400µs**，是端到端 801µs 的主要组成之一。
+- **target 读窗口 W 汇总**：n=25,763（≈2×12,800，verify 二次读）；**W9 avg 285.87µs、exec 94.3%**、push 5.4%、TOTAL 303µs；per-IO URMA_BDEV_DETAIL 未开。
+- **打点为何为空**：脚本默认 `VSEG_DIAGNOSTIC=0` ⇒ 三个阈值全 0；即使设 1，默认 `VSEG_SLOW_IO_US=100000`（100ms）远高于本次 Max 1.89ms ⇒ 仍无记录。需开诊断并把阈值降到 <1ms。
+- **二进制差异（需记录）**：node3 reader 用 `stress_cluster_bench` md5 `59662a266baf5e462e86ce6a0b3f89af`（11-17 19:48），node1 则是 `575d2151ed39d256dbfa6269e4221abb`（11-17 20:13）；本轮按同事拓扑用 node3 的。
+- node3→node1 fabric（50056/9006/2379）连通；管理网 50056 不可达（master 绑 fabric，符合预期）。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -644,7 +656,7 @@ writer 是否 `400 succeeded, 0 failed`；`logical_used` 实际值；master/targ
 
 ---
 
-# NOF-010（待执行 · reader 读 + 五段拆分采集 · 2026-11-20）· node3 口径，拿我们自己的端到端数据
+# NOF-010（已关闭 · 通过 · reader 读 + 五段拆分采集 · 2026-11-20）· node3 口径，拿我们自己的端到端数据
 
 ## 背景
 
@@ -684,3 +696,49 @@ writer 是否 `400 succeeded, 0 failed`；`logical_used` 实际值；master/targ
 ## 回执必答（第一行）
 
 reader 读成功多少、失败多少；Avg/P50/P90/P99/Max；`URMA_SLOW_IO` 条数与 3 条样本；target W9 本窗口均值；node3 二进制是否存在。
+
+---
+
+# NOF-011（待执行 · 诊断口径重跑 reader · 2026-11-20）· 打开打点 + 阈值 400µs，采五段/七字段
+
+## 背景与授权
+
+- NOF-010：端到端读 Avg 801.29µs；但 `URMA_SLOW_IO` 为 0，原因是诊断默认关闭（`VSEG_DIAGNOSTIC=0`），且默认阈值 100ms ≫ 实测 1.9ms。
+- 开发侧授权本单**仅修改测量口径环境变量**（不改系统/服务/参数文件）：
+  - `VSEG_DIAGNOSTIC=1`
+  - `VSEG_SLOW_IO_US=400`（把慢 IO 阈值从 100000µs 降到 400µs，覆盖本次全部读 IO 462–1887µs）
+  - 另按交接文档 L43 补 `MC_STORE_TRANSFER_DIAG=1`（文档口径；脚本无此变量，若无效不影响）
+  - 其余 env/参数与 NOF-010 **完全一致**。
+- 只跑一次；不写盘、不改 target/master、不重启。
+
+## A. 预检（只读，任一不满足即停手回报）
+
+1. master：PID 2162056、`enabled=1`、Keys=400、`logical_used=1,677,721,600 B`。
+2. **二进制打点存在性**：
+   - node3：`sudo -n strings <node3 build>/mooncake-store/benchmarks/stress_cluster_bench | grep -c 'URMA_SLOW_IO'`；
+   - node1：同命令对 `575d2151…` 那个二进制。
+   - 若 node3 为 0 → **停手回报**（不换到 node1 跑，由开发侧决定）。
+3. 确认 node3 上无残留 reader 进程。
+
+## B. 运行（node3，root，日志 `node3:~/mooncake-nof-vsegment/run/reader_r2.log`）
+
+- 参数与 NOF-010 完全相同（400 keys × 4 MiB、16 线程、batch 1、warmup 5、order=seq、verify=true、master 50056、admin 9006、URMA 设备 udmac0d1e2、metadata-server 脚本值）。
+- 只加上述 3 个诊断 env；记录最终生效的 env 与完整命令。
+- 等待 `Read complete`/`Verification complete`，超时 10 min 停手。
+
+## C. 采集（只读）
+
+1. 端到端统计：Avg/P50/P90/P99/Max、成功/失败、verify 错误数（应与上一轮一致）。
+2. `URMA_SLOW_IO`：总条数；**字段名全清单**；**3 条原始样本（原样）**；按时间戳区分"读阶段"与"verify 阶段"各多少条。
+3. 若仍为 0：如实回报（不自行再加 env 重跑），并给 `grep -c MC_STORE_TRANSFER_DIAG` 等诊断行。
+4. target W 汇总块（本窗口 n、W9 avg、breakdown）。
+5. master：ERROR 计数（应无新增）。
+6. reader 日志保存路径与大小。
+
+## D. 边界
+
+- 只读数据；仅新增 3 个诊断 env；不改负载参数；不动 target/master；不重启；失败停手不重试。
+
+## 回执必答（第一行）
+
+`URMA_SLOW_IO` 条数（读阶段/verify 阶段）；字段清单与 3 条样本；端到端 Avg/P50/P99；verify 错误数；node3 二进制是否含 `URMA_SLOW_IO`。
