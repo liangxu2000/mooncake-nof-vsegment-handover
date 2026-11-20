@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-022（裸 SPDK 底板 vs Mooncake 单线程：定位 4× 路径差）**
+- 当前任务：**NOF-023（受控对照：裸 SPDK 顺序 vs 随机 × QD1/QD32 + 修复 LBA0 + yin urma_perf 256K/8M）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -88,6 +88,7 @@
 | NOF-019 | 已关闭 2026-11-20（**通过**） | **端到端基本不变**：R16 p50 719.0（旧 714.9，+0.58%）、R4 602.5（旧 591.1，+1.93%，均在臂内离散内）；**target 读 W9 254.8µs（旧 283–288，−11%）** ⇒ target 变快未传导到端到端 |
 | NOF-020 | 已关闭 2026-11-20（**通过**） | **文档 54.68µs = 11 盘写路径样本**（非读！"5× 差距"系读/写跨口径，撤回）；新 target 读五段 p50：roundtrip 514 / target 424 / **bdev 387（与旧 target 完全相同）** / data 13 / outside 59 / residual 60；`target_valid=98.9%`（TRACE=0 不影响遥测）；端到端诊断 P50 779，控制面+应用约 265µs |
 | NOF-021 | 已关闭 2026-11-20（**通过**） | 4 线程 vs 16 线程：**bdev 418 vs 380µs（+10%，不降反升）** ⇒ 不是客户端排队；盘 = 11× 华为 HWE7AP457T6L005N（7.68TB）；target W9 259.8µs（exec 96.3%）；4 线程端到端诊断 P50 656.5µs |
+| NOF-022 | 已关闭 2026-11-20（**通过，含 1 次误写**） | Mooncake T1 bdev 425µs、端到端 P50 571.1；**裸 SPDK 128K T1B1：客户端 p50 41.3µs、target W9 30.2µs**；同 target 下 Mooncake W9 259µs（T1/T4/T16 不变）⇒ 8.6× 差在 target 执行层；但裸=顺序、Mooncake=随机 2MiB，**访问模式是混淆变量**，NOF-023 受控验证；urma_perf preflight 在 LBA0 写了一次（已授权修复） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -319,6 +320,17 @@
 - target W9：259,780 ns（n=25,777）、TOTAL 269µs、exec 96.3%、push 3.2%。
 - 诊断采样：4 线程读阶段 opcode=2 800 条，target_valid {1:767, 0:33}。
 - **与文档裸 SPDK 的对比线索**：文档 §3.1 裸 SPDK 11 盘基线 exec avg **68µs**（8MiB、非 vsegment）；我们 Mooncake 路径 target W9 平均 ~260µs、慢 IO bdev p50 ~380–418µs ⇒ 路径层差 ~4×，需裸 SPDK 实测确认（NOF-022）。
+
+### NOF-022 关键事实（裸 SPDK 30µs vs Mooncake 259µs，2026-11-20）
+
+- **Mooncake T1（诊断）**：roundtrip 452 / target 432 / **bdev 425** µs；端到端 Min 477.30 / Avg 582.71 / **P50 571.10** / P99 737.93；400/400、verify 0。
+- **裸 SPDK urma_perf 128KiB（-T1 -b1，6s，root）**：completed 130,577、errors 0、21,762 IOPS、2720 MiB/s；**客户端 p50 41.28µs / avg 45.87**；客户端 URMA submit 70ns、completion 90ns（send/compl 各 0.2%）。
+- **同一 target 的 target 侧对照**：裸 SPDK W9 **30,170 ns**（n=130,580，exec 79.6%、push 18.7%、TOTAL 37µs）vs Mooncake W9 **259,080 ns**（n=24,898，exec 96.9%、TOTAL 267µs）⇒ **8.6× 差在 target 盘执行段**；Mooncake W9 在 T1/T4/T16 几乎不变（259.1/259.8/259.9）。
+- **混淆变量**：裸 SPDK 是**顺序** LBA 扫描；Mooncake 是 **1024 分区内的随机 2MiB 块**（每 key 2 child × 16×128KiB）。8.6× 可能来自"随机 vs 顺序"或"QD/IO 形态"，尚不能归因（NOF-023 受控）。
+- `urma_perf`（gap 构建 md5 `c653c0a6…`）单 IO 上限 **128KiB**：256K/8M 探针被拒（`I/O size ... no greater than 131072`）。
+- 运行条件：必须 **root**（非 root 报 EAL IOVA `init_rc=-22`）；裸 SPDK 需 `SPDK_URMA_CAPSULE_TRANSPORT=urma` 才能握手（否则 `rc=-93` capsule mode mismatch）。
+- **安全事件（如实记录）**：urma_perf 内置 preflight 在 nsid1 **LBA 0 写入一次**（≈128–256KiB），落在我们 vsegment 段 base 0 的最前面；17:00:37 的 verify 在写之前（0 错）。开发侧决定：NOF-023 末尾重跑 writer 修复 + verify 复检。
+- 文件：node1 `~/nof022_perf_131072.log`（成功）、`nof022_perf_262144.log`/`_8388608.log`（被拒）；node3 `run/diag_r3_t1.log`。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -1262,7 +1274,7 @@ R16/R4 中位 P50/P90/P99/Avg；与旧 target 同臂的差；target 读窗口 W9
 
 ---
 
-# NOF-022（待执行 · 裸 SPDK 底板 vs Mooncake 单线程 · 2026-11-20）
+# NOF-022（已关闭 · 通过 · 裸 SPDK 底板 vs Mooncake 单线程 · 2026-11-20）
 
 ## 目的
 
@@ -1302,3 +1314,45 @@ R16/R4 中位 P50/P90/P99/Avg；与旧 target 同臂的差；target 读窗口 W9
 ## 回执必答（第一行）
 
 Mooncake 1t 五段 p50（尤 bdev）；裸 SPDK 128K/256K/8M 的延迟与 target W9；4× 差落在哪一层（给判断依据）。
+
+---
+
+# NOF-023（待执行 · 受控对照 + 修复 LBA0 · 2026-11-20）
+
+## 开发侧三项决定（已授权）
+
+1. **允许重跑 writer 修复** NOF-022 preflight 在 LBA 0 的误写（末尾执行，见 C）。
+2. **授权裸 SPDK 队列深度梯度**（`-b 8/16/32`）与**随机模式**（`URMA_PERF_ADDR_MODE=rand` + seed；该 env 是 GAP 补丁项，不会出现在 `--help`，二进制 md5 `c653c0a6…` 含该补丁）。
+3. **授权使用 yin 树的 `urma_perf`**（`/home/yin/nof/spdk-cpu/build/examples/urma_perf`，root）做 256KiB/8MiB 探针；记录 md5 与 `--help`。
+
+## A. 裸 SPDK 受控 2×2（node1，root，gap urma_perf，128KiB IO，每支 6 s）
+
+| 支 | 模式 | 批大小 |
+|---|---|---|
+| S1 | seq | `-b 1` |
+| S32 | seq | `-b 32` |
+| R1 | rand | `-b 1` |
+| R32 | rand | `-b 32` |
+
+- 连接：traddr `192.168.84.149`、trsvcid `4457`、NQN `nqn.2026-01.io.spdk:urma-gpu-test`、nsid 1；env：`SPDK_URMA_DEV_NAME=udmac0d1e2`、`SPDK_URMA_CAPSULE_TRANSPORT=urma`、随机支加 `URMA_PERF_ADDR_MODE=rand URMA_PERF_RANDOM_SEED=20261115`，`--range-bytes=107374182400`（随机范围=我们的 100GiB 段）。
+- 每支记录：avg/p50/p99 延迟、IOPS；**运行结束后立即采 target W 块**（W9/n/exec%）。
+- 注意：每支 preflight 都会写 LBA 0（已知）；全部探针结束后再修复（C）。
+
+## B. yin urma_perf 的 256K/8M（若兼容）
+
+- 先 `md5sum` + `--help` + `ldd`；跑 256KiB 与 8MiB 各一支（seq，`-T1 -b1`，6 s，root，同连接/env）。
+- 若 ABI/参数不兼容：记录错误并停此段，不影响 A。
+- 目的：复现文档裸基线 8MiB（Get 236µs / exec 68µs）。
+
+## C. 修复 LBA0（写操作，已授权）
+
+- A/B 全部结束后：按 NOF-018 同命令重跑 writer（400 keys × 4 MiB），确认 400/0；随后跑 1 遍 reader `verify=true`（16 线程，诊断关），确认 `0 errors out of 400 keys`。
+- 记录 writer/reader 结果与 `logical_used`（应仍为 1,677,721,600）。
+
+## D. 边界
+
+- A/B 只读（除 urma_perf preflight）；C 仅 writer 重写 + verify；不动 target/master；不重启；不改负载参数。
+
+## 回执必答（第一行）
+
+S1/S32/R1/R32 的延迟与 target W9（顺序 vs 随机、QD1 vs QD32 各差多少）；yin urma_perf 256K/8M 结果（若成）；8.6× 差是"随机 vs 顺序"还是"QD/IO 形态"（给判断依据）；修复 writer/verify 是否 0 错。
