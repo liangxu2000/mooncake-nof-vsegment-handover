@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-029（vsegment-1 数据补齐[T1 writer] + 读侧判决）**
+- 当前任务：**NOF-030（vsegment stripe=4MiB：每 key 单 child，验证 child 拆分开销）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -94,7 +94,8 @@
 | NOF-025 | 已关闭 2026-11-20（**判决：VSegment 慢**，含布局混淆） | plain NoF：**T1 P50 258.3µs vs VSegment 537.5µs（plain 快 2.08×）**；16t 打平（718.7 vs 719.0）；写 P50 273.0 vs 738.6（plain 快 2.7×）；target W9 plain 96.9/194–196µs vs VSeg 250.5/259.6µs；但 plain 数据连续堆放 1.6GiB、VSeg 散在 1024 分区 ⇒ **布局是混淆变量**，NOF-027 消除 |
 | NOF-027 | 已关闭 2026-11-20（**分区数证否**） | 1024→64：T1 P50 539.9 vs 537.5（无变化，target W9 仍 250.8）；**16t 变差 854.3 vs 719.0（+18.8%）**；仍未赢 plain（T1 2.09×）。机制指向"读序与物理布局错位"，非分区数量 |
 | NOF-028 | 已关闭 2026-11-20（**写入受阻，读未测**） | slot=1 被接受（partitions=1、reconcile 0）；writer 16 线程 377/400，**23 个 VSEGMENT_CREATING**（每跨 64MiB 卷边界丢 1 key，不重试）；容量 24×64MiB=1.5GiB 不足 1.6GiB；reader 未跑 |
-| NOF-029 | 已下发 | 用 T1/batch=1 writer 补齐 400 keys（无卷创建竞争）→ T1×3 + 16t×3 读侧判决布局假设 |
+| NOF-029 | 已关闭 2026-11-20（**布局假设否**） | vseg-1：T1 P50 543.0 vs plain 258.3（2.10×），W9 263.6–276.8（更高）；分区数 1/64/1024 的 T1 全在 537.5–543.0 窄带 ⇒ **布局无关**；差距在 vsegment 读路径（2MiB child×16×128KiB）。数据 400/400 verify 0 错 |
+| NOF-030 | 已下发 | vsegment **stripe=4MiB**（每 key 1 个 4MiB child，同构 plain）+ slot=1024；对比 plain 258.3/718.7（W9 96.9）与 vseg-2MiB 537.5/719（W9 250.5） |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
@@ -414,6 +415,16 @@
 - reader 未执行（按停止规则）⇒ T1/16t/W9 `[未获取]`，布局假设未判定。
 - **判断**：这是**按需建卷 + 客户端不重试**的机制问题，不是"单分区不可用"；用单线程/batch=1 写入可避免创建竞争（NOF-029 验证）。
 - 环境：vsegment-1 master PID 2667366 运行中；数据为 377/400 混合态。
+
+### NOF-029 关键事实（布局假设否定，2026-11-20）
+
+- 数据实质齐备：writer T1/batch1 报 398/2，但 2 个"失败"key 在 r1 已 PutStart/PutEnd ok（r2 撞创建窗口误返回）；`logical_used=1,677,721,600`、`committed_allocations=400`、`vsegments=26`；6 遍 reader verify **0 errors out of 400**。
+- **vseg-1 读侧**：T1 P50 **543.0µs**（vs plain 258.3，慢 **2.10×**；vs vseg-1024 537.5，+1.0%）；16t **739.5**（vs plain 718.7，+2.9%；vs vseg-64 854.3，−13.4%）；target W9 T1 **263.6–276.8µs**（中位 271.2，比 vseg-1024 的 250.5 更高）。
+- **分区数 1 / 64 / 1024 的 T1 P50 = 543.0 / 539.9 / 537.5（5.5µs 窄带）⇒ 布局/分区数对读时延几乎无影响**；plain W9 96.9 vs vsegment 250–271 ⇒ 差距稳定存在于 **vsegment 分层读路径（每 key 2 child × 16×128KiB）**。
+- 控制面：`rpc_first_us` p50 91µs（T1）/90µs（16t）。
+- 推算（非实测）：vseg-1 T1 543 ≈ 控制 91 + target W9 271 + 客户端流水线 ~181µs；W9 一项比 plain 多 174µs（占差距 285µs 的 61%）。
+- 遗留缺陷：`VSEGMENT_CREATING` 在单线程重写时仍复现 2 次（卷创建窗口）；属 vsegment 侧机制问题。
+- 环境：vseg-1 master PID 2667366 运行中（partitions=1、vsegments=26、logical_used=1.6GiB）。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -1660,7 +1671,7 @@ VSegment-1 的 T1/16t P50/P90/P99/Avg；target W9；vsegments 数量；与 plain
 
 ---
 
-# NOF-029（待执行 · vsegment-1 数据补齐 + 读侧判决 · 2026-11-20）
+# NOF-029（已关闭 · vsegment-1 数据补齐 + 读侧判决 · 2026-11-20）
 
 ## 背景与授权
 
@@ -1704,3 +1715,50 @@ VSegment-1 的 T1/16t P50/P90/P99/Avg；target W9；vsegments 数量；与 plain
 ## 回执必答（第一行）
 
 T1 writer 是否 400/0（`logical_used`、vsegments）；VSegment-1 的 T1/16t P50 与 target W9；**布局假设是否成立**；有无失败。
+
+---
+
+# NOF-030（待执行 · vsegment stripe=4MiB：每 key 单 child · 2026-11-20）
+
+## 背景与假设
+
+- NOF-029：分区数 1/64/1024 的 T1 全在 537.5–543.0µs ⇒ **布局无关**；plain W9 96.9µs vs vsegment 250–271µs ⇒ 差距在 **vsegment 读路径的 2MiB child × 16×128KiB 拆分**。
+- 假设：把 `--vsegment_stripe_size` 从 **2MiB 改为 4MiB**，每个 4MiB key 只产生 **1 个 4MiB child**（与 plain 的单次 4MiB 传输同构），target W9 应朝 ~97µs 回落、T1 朝 ~258µs 靠拢。
+- 注：`MC_NOF_SUBMIT_CHUNK_BYTES` 已被 NOF-015 证明对读路径无效，本单**不**再试；只改 stripe_size。
+
+## A. 预检（只读）
+
+1. 确认 master 支持 `--vsegment_stripe_size=4194304`；`member_extent_size=67108864` 是 4MiB 的整数倍（64/4=16）；io_alignment 4096 可整除。
+2. 记录当前 vseg-1 环境（PID 2667366、logical_used=1.6GiB）。
+
+## B. 切换 vsegment-stripe4（只动我方 master/cluster）
+
+1. 停 vseg-1 master（PID）；清**仅我方**键 `/cvm/vseg_nofvseg/` + `/oplog/vseg_nofvseg/`。
+2. 启动 master：NOF-004/007 同参数 + **`--vsegment_stripe_size=4194304`** + `MC_STORE_PARTITION_SLOT_COUNT=1024`（恢复 1024 分区，避免单分区容量问题）。
+3. `nof_register` 同命令（192.168.84.149:4457、100GiB、base0、nsid1）；等 quota ≥20s。
+4. 验证：quota 的 `stripe_size=4194304`；partitions=1024；reconcile 0；`partitions_installed=1024`。
+
+## C. 写 + 读（同口径）
+
+1. writer 400 keys × 4MiB（vsegment flags 同 NOF-018，16 线程；client slot env=1024）；确认 400/0、`logical_used=1,677,721,600`。
+2. reader：**T1 × 3 遍 + 16t × 3 遍**（verify=true、诊断关；client slot env=1024）；记录 Avg/P50/P90/P99/Max、failed/verify；target W 块按"下一次连接打印上一轮"对齐；`rpc_first_us` p50。
+
+## D. 对比与回执
+
+| 场景 | stripe | T1 P50 | 16t P50 | target W9（T1） |
+|---|---|---|---|---|
+| plain NoF | — | 258.3 | 718.7 | 96.9 |
+| VSegment（NOF-024） | 2MiB | 537.5 | 719.0 | 250.5 |
+| **VSegment（本单）** | **4MiB** | ? | ? | ? |
+
+- 明确回答：**改成 4MiB stripe（每 key 单 child）后，W9 是否降到 ~100µs？T1 是否接近 258µs？** 是 → child 拆分是主因、vsegment 可追平 plain；否 → vsegment 层还有其它开销（给证据）。
+- 保留 vsegment-stripe4 环境；失败停手。
+
+## E. 边界
+
+- 只动我方 master/cluster；不动 yin/target 配置；target 仅正常读写；不重启 target；不改其它参数。
+- 回滚：vsegment 标准配置 = NOF-004/007 参数 + NOF-017 mount + NOF-018 writer。
+
+## 回执必答（第一行）
+
+quota stripe_size 是否 4194304、partitions=1024、reconcile 0；writer 400/0；VSegment-4MiB 的 T1/16t P50 与 target W9；**是否追平 plain（258.3/96.9）**；有无失败。
