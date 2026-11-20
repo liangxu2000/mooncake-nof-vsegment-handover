@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-011（诊断口径重跑 reader：打开打点 + 阈值 400µs，采五段/七字段）**
+- 当前任务：**NOF-012（读路径旋钮矩阵：chunk 128K→4M × qpairs，诊断关闭，每臂 3 遍）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -77,6 +77,7 @@
 | NOF-008 | 已关闭 2026-11-20（**通过**） | mount rc[0]；**P6 首次有效验证通过**：scanned=1024/owned_by_me=1024/reconcile_fail=0，partitions_installed=1024，60s 复查仍 0；设备映射 mount 时刻 0→20 条；quota 快照 181,399 B |
 | NOF-009 | 已关闭 2026-11-20（**通过**） | writer 400/0，1.5625 GiB，0.40 s，3970.7 MiB/s；master logical_used 精确 +1,677,721,600 B；无 ERROR；target 仅周期 W 汇总（per-IO detail 未开） |
 | NOF-010 | 已关闭 2026-11-20（**通过**） | 我们的读：400/400、verify 0 错；**Avg 801.29 / P50 791.06 / P90 1017.98 / P99 1709.42 / Max 1886.75µs**；URMA_SLOW_IO=0（打点默认关、阈值 100ms）；控制面逐 key RPC 158–386µs；target 读窗口 W9 285.87µs/exec 94.3% |
+| NOF-011 | 已关闭 2026-11-20（**通过**） | 采到 5,044 条 `URMA_SLOW_IO`（读阶段 4,675）；**p50 五段：roundtrip 528 / target 430 / bdev 387 / data 32 / outside 81 / residual 82µs**；bdev 占 target 90%、占 roundtrip 73%；诊断开销 +17.7%（Avg 801→943）；阈值 400µs 覆盖 36.5% child IO |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -193,6 +194,18 @@
 - **打点为何为空**：脚本默认 `VSEG_DIAGNOSTIC=0` ⇒ 三个阈值全 0；即使设 1，默认 `VSEG_SLOW_IO_US=100000`（100ms）远高于本次 Max 1.89ms ⇒ 仍无记录。需开诊断并把阈值降到 <1ms。
 - **二进制差异（需记录）**：node3 reader 用 `stress_cluster_bench` md5 `59662a266baf5e462e86ce6a0b3f89af`（11-17 19:48），node1 则是 `575d2151ed39d256dbfa6269e4221abb`（11-17 20:13）；本轮按同事拓扑用 node3 的。
 - node3→node1 fabric（50056/9006/2379）连通；管理网 50056 不可达（master 绑 fabric，符合预期）。
+
+### NOF-011 关键事实（五段/七字段首采成功，2026-11-20）
+
+- 采集：`URMA_SLOW_IO` 共 **5,044 条**（读阶段 4,675 / verify 364 / warmup 5）；报文含 **29 字段**（其中 11 个计时项）；读阶段 opcode=2 占 4,641/4,675。
+- **读阶段 p50 五段链**：`roundtrip 528 → target 430 → bdev 387` µs；`data 32 / outside 81 / residual 82`；bdev/target=90.0%、bdev/roundtrip=73.3%。
+- p90：roundtrip 777 / target 585 / bdev 537 / data 96 / outside 127 / residual 81 µs；p99：roundtrip 1,225 / target 775 / bdev 758 / data 168 / outside 553 / residual 158 µs。
+- **诊断开销可测**：开诊断后端到端 Min 523.72 / Avg 942.89 / P50 910.47 / P90 1171.22 / P99 2212.68 / Max 2646.88 µs（对比 NOF-010：Avg +17.7%、P99 +29.4%）⇒ 诊断轮只用于**相对拆分**，绝对值以 NOF-010 为准。
+- **阈值口径**：`VSEG_SLOW_IO_US=400` 只打印 ≥400µs 的 IO，读阶段 4,675/12,800=36.5%；全量分布需更低阈值（后续可选）。
+- warmup 样本（opcode 127/6）pre_send 8.3–8.8 ms，已按行号剔除，避免污染。
+- 二进制确认含 `URMA_SLOW_IO` 格式串（node3/node1 各 1 处）；`MC_STORE_TRANSFER_DIAG` 在二进制中无符号（无效，已记录）。
+- target 窗口：W9 avg 283,010 ns、exec 93.9%、push 5.8%；per-IO `URMA_BDEV_DETAIL` 仍 0 增长。
+- 结论（事实层）：**盘上执行 bdev 是读路径最大单项**（p50 387µs，占 73%）；控制面每 key RPC（NOF-010 的 150–400µs）与 bdev 是两个独立大头。是否由"128KiB < 256KiB strip 导致单盘定向"解释，待 NOF-012 矩阵验证。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -699,7 +712,7 @@ reader 读成功多少、失败多少；Avg/P50/P90/P99/Max；`URMA_SLOW_IO` 条
 
 ---
 
-# NOF-011（待执行 · 诊断口径重跑 reader · 2026-11-20）· 打开打点 + 阈值 400µs，采五段/七字段
+# NOF-011（已关闭 · 通过 · 诊断口径重跑 reader · 2026-11-20）· 打开打点 + 阈值 400µs，采五段/七字段
 
 ## 背景与授权
 
@@ -742,3 +755,49 @@ reader 读成功多少、失败多少；Avg/P50/P90/P99/Max；`URMA_SLOW_IO` 条
 ## 回执必答（第一行）
 
 `URMA_SLOW_IO` 条数（读阶段/verify 阶段）；字段清单与 3 条样本；端到端 Avg/P50/P99；verify 错误数；node3 二进制是否含 `URMA_SLOW_IO`。
+
+---
+
+# NOF-012（待执行 · 读路径旋钮矩阵 · 2026-11-20）· chunk 128K→4M × qpairs，诊断关闭
+
+## 背景与问题
+
+- NOF-011：读阶段 p50 `roundtrip 528 / target 430 / bdev 387µs`，**bdev 占 roundtrip 73%**；控制面每 key RPC 另计 150–400µs（NOF-010）。
+- 假设（待验证）：当前 child IO = 128 KiB **小于 RAID0 strip 256 KiB**，每个 IO 可能只落单盘；把 IO 粒度放大到跨条带，bdev 段可能下降。
+- 本单是**受控旋钮矩阵**：只改客户端 env，诊断关闭（避免 +17% 开销），每臂 3 遍同一 400-key 读。
+- **口径说明（重要）**：该 bench 的 `--duration` 仅支持 local_memory / segment_read 场景，我们的 `remote_memory` 不支持；单遍 = 400 keys ≈ 6 s，故采用"每臂 3 遍取中位"而非 120 s。若要 120 s 口径，需先扩充数据集（另议）。
+
+## 臂定义（全部：node3 reader，400 keys × 4 MiB，16 线程，batch 1，warmup 5，order=seq，verify=true，诊断关闭）
+
+| 臂 | `MC_NOF_SUBMIT_CHUNK_BYTES` | `--nof_qpairs_per_segment` |
+|---|---|---|
+| V0 | 131072（128 KiB，基线） | 4 |
+| V1 | 262144（256 KiB） | 4 |
+| V2 | 1048576（1 MiB） | 4 |
+| V3 | 4194304（4 MiB） | 4 |
+| V4 | 262144（256 KiB） | 16 |
+
+- 其余 env 保持：`MC_NOF_INFLIGHT_BYTES_LIMIT=33554432`、`MC_NOF_WORKERS=4`、`MC_URMA_TRANS_MODE=RM`、`SPDK_URMA_DEV_NAME=udmac0d1e2`、`SPDK_URMA_CAPSULE_TRANSPORT=urma` 等（与 NOF-010 相同）。
+- 注意：V3 在 16 线程下 4 MiB×16=64 MiB > inflight 32 MiB，可能被限流——如实记录，作为该臂的解释变量。
+
+## 执行
+
+1. 预检（只读）：master 2162056 存活、enabled=1、Keys=400；node3 无残留 reader；记录当前 target W 块基线。
+2. 按 V0→V4 顺序执行；每臂 **3 遍**（独立进程，每遍跑完等退出、确认 procs=0 再开下一遍）。
+3. 每遍记录：开始/结束时间、FINAL 的 Min/Avg/P50/P90/P99/Max、failed、verify 错误；日志按 `run/matrix_V<n>_p<m>.log` 保存。
+4. 每遍从日志聚合 `query_rpc_breakdown`：`total_us` 与 `rpc_first_us` 的 p50。
+5. 汇总表：臂 × 遍次 + 每臂中位数。
+
+## 停止规则
+
+- 任一遍 `failed>0` 或 verify 错误 >0 → **立即停手回报**，不继续后续臂。
+- 任一遍 reader 进程异常退出/超时（>60 s）→ 停手回报。
+
+## 边界
+
+- 只读；只改上述客户端 env/参数；不写盘；不动 target/master；不重启；不开诊断。
+- 不自行增加/删除臂；不改线程数/verify/order。
+
+## 回执必答（第一行）
+
+各臂中位 P50/P99/Avg（列出 V0–V4）；哪一臂最好、差距多少；有无 failed/verify 错误；V3 是否受 inflight 限流（如实）；chunk 与读时延的关系（只报事实）。
