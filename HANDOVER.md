@@ -364,13 +364,12 @@
 - 运行间漂移：L4 基线 551.5 vs NOF-022 同配置 571.1（−3.4%）⇒ 2.5% 的"提升"与漂移同量级。
 - **结论**：客户端参数旋钮到头；剩余 ~287µs 需改结构（batch/预取/放大 IO 粒度/改 vsegment 切分），或在现状收口。
 
-### 最终目标（用户 2026-11-20 明确，最高优先级）
+### 目标与硬约束（2026-11-20 用户澄清）
 
-> **"开了 vsegment 的性能一定要比没开 vsegment 更好，不然 vsegment 就没任何意义。这是我的最终目标，不动摇。"**
-
-- 绝对 300µs 退居其次；**首要交付 = 同环境、同负载下 VSegment vs plain NoF 的对照，且 VSegment 必须更快**。
-- 现有对照缺口：我们只量了 VSegment 绝对值（T1 537.5µs / 16t 719µs），**从未在本环境跑过 plain NoF**。
-- 计划：NOF-025 建 plain NoF 基线（临时拆 vsegment 环境）；随后按结果决定：①若 vsegment 已更快 → 收口；②若 vsegment 更慢 → 做 vsegment 布局调优（首选"减少分区数"，让 key 在分区内连续分配、把随机读变顺序读），直到 vsegment 胜出。
+- **原目标（不变）**：单 key 4–8MiB 读时延 **750µs → 300µs**（交接文档 L5）。所有调优实验都朝它去。
+- **用户的硬约束（叠加，不替代）**："开了 vsegment 的性能一定要比没开 vsegment 更好，不然 vsegment 就没任何意义。" ⇒ 就算达到 300µs，若 plain NoF 同样/更快，则 vsegment 无价值；最终交付必须同时满足"接近 300µs"与"vsegment 优于 plain NoF"两条。
+- 现有缺口：只量了 VSegment 绝对值（T1 537.5µs / 16t 719µs），**从未在本环境跑过 plain NoF**，无法判断进步/退步。
+- 计划：NOF-025 建 plain NoF 基准线（临时拆 vsegment 环境）；随后按结果：①vsegment 已更快 → 继续压绝对时延向 300µs；②vsegment 更慢 → 先做 vsegment 布局调优（首选"减少分区数"，让 key 连续分配、把随机读变顺序读），直到 vsegment 胜出后再压 300。
 - plain NoF flag 依据（`stress_cluster_bench.cpp` be10be2）：`--replica_num=0 --nof_replica_num=1 --vsegment_nof_io=false --segment_write_vsegment=false`；`--vsegment_nof_io` 注释明确 "VSegment puts require --nof_replica_num=0"。
 
 ### 口径与数据安全（2026-11-20 用户补充）
@@ -1438,11 +1437,11 @@ L4/L8/L16/L16W8 中位 P50/P90/P99/Avg；最优组合；target W9/n；T1 端到�
 
 # NOF-025（待执行 · 关键 A/B：plain NoF 基线 · 2026-11-20）
 
-## 背景与目标（最高优先级）
+## 背景与目标
 
-- 用户最终目标：**开了 vsegment 必须比不开更快**；绝对 300µs 退居其次。
+- 项目目标不变：单 key 4–8MiB 读 **750µs → 300µs**；用户硬约束：**vsegment 必须优于 plain NoF**（否则 vsegment 无意义）。
 - 现有 vsegment：T1 P50 **537.5µs**、16t P50 **719µs**（新 yin target，400×4MiB，verify）。
-- 本单在同一 target、同一客户端、同一负载下建立 **plain NoF（无 vsegment）** 基线，做首次同口径 A/B。
+- 本单在同一 target、同一客户端、同一负载下建立 **plain NoF（无 vsegment）** 基线，做首次同口径 A/B；它决定的是"vsegment 是否合格"，不是更换项目目标。
 
 ## A. 参数核对（只读）
 
