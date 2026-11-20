@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-009（writer 预填 400 keys × 4MiB，写入我们的 100GiB 段）**
+- 当前任务：**NOF-010（reader 读 + 五段拆分采集，node3 口径）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -75,6 +75,7 @@
 | NOF-006 | 已关闭 2026-11-20 | **不是协议问题**（两树 WIRE v4 一致）；是设备/provider 问题：master 用 udmac1d1e2 导致 0 个 `/dev/uburma` 映射、未加载 URMA provider；同一二进制在 yin master（udmac0d1e2）下正常；现役 target 也是 udmac0d1e2 |
 | NOF-007 | 已关闭 2026-11-20 | master 已按 `udmac0d1e2` 重启（PID 2162056，端口正常、无新 ERROR）；**设备映射验收口径有误**——SPDK 惰性初始化，未 mount 不产生映射；映射验证并入 NOF-008 |
 | NOF-008 | 已关闭 2026-11-20（**通过**） | mount rc[0]；**P6 首次有效验证通过**：scanned=1024/owned_by_me=1024/reconcile_fail=0，partitions_installed=1024，60s 复查仍 0；设备映射 mount 时刻 0→20 条；quota 快照 181,399 B |
+| NOF-009 | 已关闭 2026-11-20（**通过**） | writer 400/0，1.5625 GiB，0.40 s，3970.7 MiB/s；master logical_used 精确 +1,677,721,600 B；无 ERROR；target 仅周期 W 汇总（per-IO detail 未开） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -172,6 +173,14 @@
 - **P6 结论**：全新 cluster（无旧 `/oplog` 重放）+ 正确 URMA 设备 ⇒ 首轮 reconcile 即通过；yin 的 1024×28,505 次失败来自旧 oplog，诊断闭环。
 - 备注：`logical_capacity=64 GiB = 1024 × 64 MiB`，物理段 100 GiB；planner 容量折算规则 `[未获取]`，不影响本轮目标。
 - target 侧 15:04–15:05 唯一错误是 15:04:51 `handshake failed rc=-104`（预检 TCP 探测造成，早于 register 8 s），真实 mount 无错误记录。
+
+### NOF-009 关键事实（writer 预填成功，2026-11-20）
+
+- **writer 400 succeeded / 0 failed**：400 keys × 4 MiB，Total 1.56 GB，0.40 s，3970.70 MiB/s；写入路径时延（非读）Min 764.79 / Avg 1007.38 / P50 931.45 / P90 1148.68 / P99 3103.38 / Max 4725.84 µs。
+- **master 对账精确**：`logical_used` 0 → **1,677,721,600 B**（=400×4 MiB）；`logical_free` 减同额；NVMe-oF SSD 1.56 GB / 100.00 GB (1.6%)；Keys 400；vsegments 仍 1024（写入填既有 vsegment）；无新增 E。
+- **etcd**：`/cvm/vseg_nofvseg/` 8 键不变；`/oplog/vseg_nofvseg/` 28 → 1228（+1200）；yin 与 mooncake_cluster 前缀键数不变（无跨集群污染）。
+- **参数映射无冲突**：bench 的 64 个 flag 中无 cluster/namespace，集群路由只由 `--master-server` 决定；7 处替换：master 50056、admin 9006、URMA 设备 udmac0d1e2、其余照脚本（400/4MiB/16 线程/batch16/verify=false；chunk 128KiB/inflight 32MiB/workers 4/qpairs 4）。
+- **target 侧**：W 汇总块 n=12,807（理论 12,800）；W8 JFC wait 62.7%、W9 exec 36.4%、W9 avg 24,840 ns、TOTAL 68 µs（写路径口径）。**per-IO `URMA_BDEV_DETAIL` 未新增**（当前 target 运行态未开；最后样本仍是 11-19）——五段拆分的 target 逐 IO 明细需另想办法（优先用 initiator 侧 `URMA_SLOW_IO`，target 遥测随完成回传）。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -591,7 +600,7 @@ mount 是否 rc[0]；设备映射数（mount 时刻）与 udmac0d1e2/provider �
 
 ---
 
-# NOF-009（待执行 · writer 预填 · 2026-11-20）· 400 keys × 4MiB 写入我们的 100GiB 段
+# NOF-009（已关闭 · 通过 · writer 预填 · 2026-11-20）· 400 keys × 4MiB 写入我们的 100GiB 段
 
 ## 背景
 
@@ -632,3 +641,46 @@ mount 是否 rc[0]；设备映射数（mount 时刻）与 udmac0d1e2/provider �
 ## 回执必答（第一行）
 
 writer 是否 `400 succeeded, 0 failed`；`logical_used` 实际值；master/target 有无错误；参数映射有无绕不过的冲突。
+
+---
+
+# NOF-010（待执行 · reader 读 + 五段拆分采集 · 2026-11-20）· node3 口径，拿我们自己的端到端数据
+
+## 背景
+
+- NOF-009：400 keys 已写入，master `logical_used=1,677,721,600 B`，无错误。
+- 本单用同事的 reader 口径读取同一批 400 keys（4 MiB），**reader 放 node3**（与 target 同机，对齐同事口径），采集：
+  1. reader 的端到端统计（Avg/P50/P90/P99/Max）；
+  2. initiator 侧 `URMA_SLOW_IO` 五段/七字段逐 IO 记录（target 遥测随完成回传）；
+  3. target 侧 W 汇总块（per-IO detail 当前未开，已知）。
+- 只读数据，不写盘；不动 target/master 配置；不重启。
+
+## A. 预检（只读，任何一条不满足即停手回报）
+
+1. master：PID 2162056、`enabled=1`、Keys=400、`logical_used=1,677,721,600 B`。
+2. **node3 是否有可用二进制**：`sudo -n ls -l <VSEG_BUILD_DIR>/mooncake-store/benchmarks/stress_cluster_bench`（按 run_vesegment_reader.sh 里的实际路径）。**若 node3 无该二进制 → 停手回报**，不要自行拷贝或改在 node1 跑。
+3. 读取 `run_vesegment_reader.sh`（root 700）全文：列出 reader 的全部 env 与参数模板（≤25 行）；特别确认 `MC_STORE_TRANSFER_DIAG`、`MC_HIFREQ_LOG_SAMPLE_RATE`、`MC_NOF_SLOW_TRACE_THRESHOLD_US`、`SPDK_URMA_STAGE_TRACE_US` 等打点开关的取值。
+4. 建立"同事值 → 我方值"映射：master `192.168.84.*:50056`、admin `9006`、URMA 设备 `udmac0d1e2`、metadata-server 保持脚本值；负载 400 keys × 4 MiB、16 线程、order=seq、verify=true（与脚本一致）。若出现无法映射的 cluster/namespace 参数 → 停手回报。
+
+## B. 运行 reader（node3，root，日志写 node3 `~/mooncake-nof-vsegment/run/reader_r1.log`）
+
+1. 记录 reader 启动前 target W 块基线（node3 `~/gap/logs/nvmf_tgt.log` 末尾 W8/W9/W10/TOTAL 行）。
+2. 按 A4 映射执行一次 reader；等待 `Read complete` 或等价 FINAL 行；超时 10 min → 停手回报。
+3. 记录完整命令、env、起止时间。
+
+## C. 采集与验证（只读）
+
+1. reader 输出：成功/失败数、Avg/P50/P90/P99/Max、吞吐、总耗时。
+2. `URMA_SLOW_IO` 行：总条数；字段名清单；**给 3 条原始样本**（≤3 行）；若为 0 条，检查 env 是否按脚本设置并如实回报（不要自行加 env 重跑）。
+3. master：`VSegment Status` 前后对比（logical_used 不变）；ERROR 计数。
+4. target：本窗口 W 汇总块（n、W8/W9/W10 avg、TOTAL、breakdown 百分比）。
+5. 读正确性：verify=true 的校验失败计数（应为 0）。
+
+## D. 边界
+
+- 只读；不写盘；不动 target/master 配置；不重启；不自行加/改 env 重跑；不拷贝二进制。
+- 失败/缺前置：停手回报，不扩大范围。
+
+## 回执必答（第一行）
+
+reader 读成功多少、失败多少；Avg/P50/P90/P99/Max；`URMA_SLOW_IO` 条数与 3 条样本；target W9 本窗口均值；node3 二进制是否存在。
