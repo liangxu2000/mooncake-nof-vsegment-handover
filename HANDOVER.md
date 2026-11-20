@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-008（重新 mount + reconcile 门禁；设备映射在 mount 时验证）**
+- 当前任务：**NOF-009（writer 预填 400 keys × 4MiB，写入我们的 100GiB 段）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -74,6 +74,7 @@
 | NOF-005 | 已关闭 2026-11-20（**未通过**） | mount 失败：master attach rc=-19 / URMA qpair err=-5（Operation not permitted）；客户端谎报成功；P6 门禁未获得有效验证 |
 | NOF-006 | 已关闭 2026-11-20 | **不是协议问题**（两树 WIRE v4 一致）；是设备/provider 问题：master 用 udmac1d1e2 导致 0 个 `/dev/uburma` 映射、未加载 URMA provider；同一二进制在 yin master（udmac0d1e2）下正常；现役 target 也是 udmac0d1e2 |
 | NOF-007 | 已关闭 2026-11-20 | master 已按 `udmac0d1e2` 重启（PID 2162056，端口正常、无新 ERROR）；**设备映射验收口径有误**——SPDK 惰性初始化，未 mount 不产生映射；映射验证并入 NOF-008 |
+| NOF-008 | 已关闭 2026-11-20（**通过**） | mount rc[0]；**P6 首次有效验证通过**：scanned=1024/owned_by_me=1024/reconcile_fail=0，partitions_installed=1024，60s 复查仍 0；设备映射 mount 时刻 0→20 条；quota 快照 181,399 B |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -159,6 +160,18 @@
 - **重要机制**：SPDK/URMA 初始化是**惰性**的——只在收到 mount 请求时才发生。证据：r2 日志 `spdk_wrapper` 行数 0；r1 日志的 4 条 SPDK 行全部出现在 14:41:35（NOF-005 的 mount 时刻）；yin master 日志同样是 SPDK init 与 MountNoFSegment 同一时刻。
 - 因此"启动后 `/dev/uburma` 映射=0"不是故障；yin master 现有 18 条映射是因为它曾经 mount 成功、设备打开后常驻。
 - **验收口径修正**：设备/provider 映射必须在 mount 请求时验证，不能作为"未 mount"阶段的验收项。
+
+### NOF-008 关键事实（mount 成功、P6 首次有效通过，2026-11-20）
+
+- **mount rc[0]**（`MountNoFSegment_slow elapsed_us[189995] rc[0]`）；SPDK init `init_rc=0`；`Attached`；`Opened NoF segment ns=1 io_qpairs=4`。
+- **设备映射（mount 时刻）**：`/dev/uburma` 0 → **20 条**；出现 `/dev/uburma/udmac0d1e2`；`liburma-udma.so`、`liburma_ubagg.so` 均加载。
+- **P6 门禁通过**：`reconcile stats: scanned=1024, owned_by_me=1024, foreign=0, no_route=0, load_fail=0, reconcile_fail=0, stale_cas=0`；`reconcile failures` 0；60 s 复查仍 0（非假通过）。
+- **VSegment Status**：`enabled=1, generation=1, profiles=1, partitions_installed=1024, vsegments=1024, logical_capacity=68719476736 (64 GiB), logical_free=64 GiB, logical_used=0`；pool `default: members=1, medium=nof`；首卷 `partition=0, capacity=67108864`。
+- **etcd**：`/cvm/vseg_nofvseg/` 3→8 键（含 quota 快照 181,399 B、segment 描述符、nof_identities 等）；`/oplog/vseg_nofvseg/` 1→28 键。segment：capacity=107374182400（100 GiB）、base_offset=0、io_alignment=512、supports_unaligned_io=false、vsegment_exclusive=true。
+- **设备名是关键变量**：NOF-005（udmac1d1e2）rc[-101] vs NOF-008（udmac0d1e2）rc[0]，强相关（NOF-005 未在 mount 时刻采集映射，非严格单变量实验）。
+- **P6 结论**：全新 cluster（无旧 `/oplog` 重放）+ 正确 URMA 设备 ⇒ 首轮 reconcile 即通过；yin 的 1024×28,505 次失败来自旧 oplog，诊断闭环。
+- 备注：`logical_capacity=64 GiB = 1024 × 64 MiB`，物理段 100 GiB；planner 容量折算规则 `[未获取]`，不影响本轮目标。
+- target 侧 15:04–15:05 唯一错误是 15:04:51 `handshake failed rc=-104`（预检 TCP 探测造成，早于 register 8 s），真实 mount 无错误记录。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -529,7 +542,7 @@ attach 失败更像"协议/transport 不兼容"还是"设备/路径/权限"？�
 
 ---
 
-# NOF-008（待执行 · 重新 mount + reconcile 门禁 · 2026-11-20）· 设备映射改为 mount 时验证
+# NOF-008（已关闭 · 通过 · 重新 mount + reconcile 门禁 · 2026-11-20）· 设备映射改为 mount 时验证
 
 ## 背景与口径修正
 
@@ -575,3 +588,47 @@ attach 失败更像"协议/transport 不兼容"还是"设备/路径/权限"？�
 ## 回执必答（第一行）
 
 mount 是否 rc[0]；设备映射数（mount 时刻）与 udmac0d1e2/provider 状态；reconcile failures 与 partitions_installed；若失败，错误链与 target 侧对应日志；P6 是否首次得到有效验证。
+
+---
+
+# NOF-009（待执行 · writer 预填 · 2026-11-20）· 400 keys × 4MiB 写入我们的 100GiB 段
+
+## 背景
+
+- NOF-008 已通过：mount rc[0]，1024 分区 reconcile 全对（reconcile_fail=0），`enabled=1`、`partitions_installed=1024`、`logical_capacity=64 GiB`、`logical_used=0`。
+- 本单用同事的 writer 口径写入 **400 keys × 4MiB = 1.6GiB**。
+- **数据影响**：写入落在我们 100GiB 段（base 0）内、各分区 100MiB 窗口中的分散 4MiB 块，最多 ~1.6GiB。会覆盖旧 GAP 数据最前 100GiB 内的部分区域（用户已授权；必要时可重灌）。**不要**做其它写操作。
+- 不跑 reader；不动 target/master 配置；不重启 master。
+
+## A. 参数核对（先做，输出 ≤25 行）
+
+1. 读 `run_vesegment_write.sh`（root 700，40 行级）全文：列出 writer 的全部 env（URMA 设备、chunk/inflight/workers、cluster/namespace 相关）与 `stress_cluster_bench` 的完整参数模板。
+2. 建立"同事值 → 我方值"映射表：
+   - master：`192.168.84.*:50056`；admin/metrics：`9006`；
+   - `--metadata-server`：保持脚本原值；**若其中包含 cluster/namespace 名，必须改为 `vseg_nofvseg`**；
+   - URMA 设备：`udmac0d1e2`；
+   - 负载：400 keys × 4MiB、16 线程、batch 16、verify=false（与脚本一致）。
+3. 若存在无法映射到我们集群的参数（写死 cluster/namespace 且无覆盖开关）→ **停手回报**，不要带错集群跑。
+
+## B. 运行 writer（node1，root，日志 `run/writer_r1.log`）
+
+1. 前置只读：master PID 2162056 存活、`enabled=1`；无同名 writer 在跑。
+2. 按 A2 映射执行一次 writer；等待 `400 succeeded, 0 failed`（或等价 FINAL 行）；超时 10 min → 停手回报。
+3. 记录完整命令、env、起止时间。
+
+## C. 验证（只读）
+
+1. writer 输出：成功/失败计数、耗时。
+2. master：`VSegment Status` 的 `logical_used` 从 0 增至 ≈1.6GiB（给实际值）；`vsegments` 数量变化；无 ERROR。
+3. etcd：`/oplog/vseg_nofvseg/` 键数增长；`/cvm/vseg_nofvseg/` 键数不变（8）。
+4. node3 target：`~/gap/logs/nvmf_tgt.log` 中 `URMA_BDEV_DETAIL` 行计数增长；无新的真实写入错误（区分预检 TCP 探测造成的 `handshake failed rc=-104`）。
+5. 写入量粗核：writer 输出与 target 侧 bdev 统计至少一项。
+
+## D. 边界
+
+- 只写本实验 400 keys；不跑 reader；不动 target 配置；不重启 master；不删任何 etcd key。
+- 失败停手，不重试、不自行改参数。
+
+## 回执必答（第一行）
+
+writer 是否 `400 succeeded, 0 failed`；`logical_used` 实际值；master/target 有无错误；参数映射有无绕不过的冲突。
