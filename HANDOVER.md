@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-023（受控对照：裸 SPDK 顺序 vs 随机 × QD1/QD32 + 修复 LBA0 + yin urma_perf 256K/8M）**
+- 当前任务：**NOF-024（T1 下 qpairs/workers 扫描：把 32×128KiB 压成一波）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -89,6 +89,7 @@
 | NOF-020 | 已关闭 2026-11-20（**通过**） | **文档 54.68µs = 11 盘写路径样本**（非读！"5× 差距"系读/写跨口径，撤回）；新 target 读五段 p50：roundtrip 514 / target 424 / **bdev 387（与旧 target 完全相同）** / data 13 / outside 59 / residual 60；`target_valid=98.9%`（TRACE=0 不影响遥测）；端到端诊断 P50 779，控制面+应用约 265µs |
 | NOF-021 | 已关闭 2026-11-20（**通过**） | 4 线程 vs 16 线程：**bdev 418 vs 380µs（+10%，不降反升）** ⇒ 不是客户端排队；盘 = 11× 华为 HWE7AP457T6L005N（7.68TB）；target W9 259.8µs（exec 96.3%）；4 线程端到端诊断 P50 656.5µs |
 | NOF-022 | 已关闭 2026-11-20（**通过，含 1 次误写**） | Mooncake T1 bdev 425µs、端到端 P50 571.1；**裸 SPDK 128K T1B1：客户端 p50 41.3µs、target W9 30.2µs**；同 target 下 Mooncake W9 259µs（T1/T4/T16 不变）⇒ 8.6× 差在 target 执行层；但裸=顺序、Mooncake=随机 2MiB，**访问模式是混淆变量**，NOF-023 受控验证；urma_perf preflight 在 LBA0 写了一次（已授权修复） |
+| NOF-023 | 已关闭 2026-11-20（**通过**） | **8.6× 主体 = 随机 vs 顺序**：QD1 target exec 30.35→190.58µs（6.3×）；QD 只次要（seq +36%、rand +8%）；**随机下 Mooncake 259 vs 裸 SPDK 190–206µs = 1.26–1.36×**；LBA0 修复完成（writer 400/0、verify 0 错）；yin urma_perf ABI 不兼容（WIRE v6 vs v4） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
 
@@ -331,6 +332,25 @@
 - 运行条件：必须 **root**（非 root 报 EAL IOVA `init_rc=-22`）；裸 SPDK 需 `SPDK_URMA_CAPSULE_TRANSPORT=urma` 才能握手（否则 `rc=-93` capsule mode mismatch）。
 - **安全事件（如实记录）**：urma_perf 内置 preflight 在 nsid1 **LBA 0 写入一次**（≈128–256KiB），落在我们 vsegment 段 base 0 的最前面；17:00:37 的 verify 在写之前（0 错）。开发侧决定：NOF-023 末尾重跑 writer 修复 + verify 复检。
 - 文件：node1 `~/nof022_perf_131072.log`（成功）、`nof022_perf_262144.log`/`_8388608.log`（被拒）；node3 `run/diag_r3_t1.log`。
+
+### NOF-023 关键事实（8.6× 归因：随机 vs 顺序，2026-11-20）
+
+- 裸 SPDK 受控 2×2（gap urma_perf，128KiB，6s，-T1，root）：
+
+| 支 | 模式/-b | 客户端 p50 | target W9 | target TOTAL | exec% |
+|---|---|---|---|---|---|
+| S1 | seq / 1 | 40.00 µs | 30,350 ns | 37 µs | 80.7% |
+| S32 | seq / 32 | 114.56 | 41,430 | 77 | 53.2% |
+| **R1** | **rand / 1** | **220.16** | **190,580** | **198** | 96.1% |
+| **R32** | **rand / 32** | **225.28** | **206,300** | **215** | 95.7% |
+
+- **随机化解释 6.3×**（QD1 30.35→190.58µs）；QD 影响小（seq +36.5%、rand +8.2%）。
+- **随机下 Mooncake 259.1µs vs 裸 SPDK 190.6–206.3µs = 1.26–1.36×**，剩余差在 Mooncake/vsegment 路径（2MiB child 内部的 16×128KiB 流水线）。
+- `yin urma_perf` 256K/8M 未取得：node1 树 WIRE v6 vs target v4，HELLO 长度不符 → `rc=-71 EPROTO`。node3 有同批构建的 urma_perf（5,869,272 B，11-17 19:20，WIRE v4），可用但未授权拷贝（开发侧决定：需要时在 node3 本机跑，不拷）。
+- **LBA0 修复完成**：writer 400/0（1.56 GB，0.33 s，4910.71 MiB/s）+ 16 线程 verify reader（0 errors out of 400；P50 703.12 / P99 1710.81）；`logical_used=1,677,721,600` 未变。
+- W 块采样口径：target 的 W 块是"下一个新连接进入时打印上一轮累计"，本次已按 `n` 对齐改正（NOF-022 的"跑完立即采"会取到陈旧块）。
+- S32 的 33 GB/s 异常（可能顺序重复读同一小 LBA 区间）`[未验证]`，不影响随机结论。
+- 结论：**随机 128KiB 的盘执行底板 ≈190–206µs**（target）；要接近 300µs 端到端，需把每 key 的 32 个小 IO 压成一波（lanes/workers），并把控制面/流水线开销压到最低。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -1317,7 +1337,7 @@ Mooncake 1t 五段 p50（尤 bdev）；裸 SPDK 128K/256K/8M 的延迟与 target
 
 ---
 
-# NOF-023（待执行 · 受控对照 + 修复 LBA0 · 2026-11-20）
+# NOF-023（已关闭 · 通过 · 受控对照 + 修复 LBA0 · 2026-11-20）
 
 ## 开发侧三项决定（已授权）
 
@@ -1356,3 +1376,39 @@ Mooncake 1t 五段 p50（尤 bdev）；裸 SPDK 128K/256K/8M 的延迟与 target
 ## 回执必答（第一行）
 
 S1/S32/R1/R32 的延迟与 target W9（顺序 vs 随机、QD1 vs QD32 各差多少）；yin urma_perf 256K/8M 结果（若成）；8.6× 差是"随机 vs 顺序"还是"QD/IO 形态"（给判断依据）；修复 writer/verify 是否 0 错。
+
+---
+
+# NOF-024（待执行 · T1 下 qpairs/workers 扫描 · 2026-11-20）
+
+## 背景与授权
+
+- NOF-023：随机 128KiB 的 target 执行底板 ≈190–206µs（裸 SPDK）；Mooncake 259µs（1.26–1.36×）；T1 端到端 P50 571µs，远高于"单波 IO ~220µs + 控制 ~90µs"的粗算。
+- 假设：每 key 的 32×128KiB 受 **lanes（qpairs=4）+ 每 lane 信用**限制，需要多波才能发完；提高 lanes/workers 可能把 key 压到 1–2 波。
+- **授权只改客户端参数**：`--nof_qpairs_per_segment`（4→8/16）与 `MC_NOF_WORKERS`（4→8）；不动 target/master。
+- 对测试 Agent 两个提问的答复：① 8MiB 探针暂不做；若后续需要，用 **node3 本机同批 urma_perf**（WIRE v4）本地跑，**不拷贝到 node1**（已预授权，但不在本单）。② R1/R32 已覆盖随机 100GiB 范围，剩余 1.26× 先由本单 qpairs 解释，暂不做条带专项。
+
+## 臂定义（node3 reader，**T1**，400 keys × 4 MiB，batch 1，warmup 5，seq，verify=true，诊断关，chunk 128KiB，inflight 32MiB）
+
+| 臂 | `--nof_qpairs_per_segment` | `MC_NOF_WORKERS` |
+|---|---|---|
+| L4 | 4 | 4（基线） |
+| L8 | 8 | 4 |
+| L16 | 16 | 4 |
+| L16W8 | 16 | 8 |
+
+- 每臂 3 遍；其余 env 与 NOF-019/021 相同（`SPDK_URMA_DEV_NAME=udmac0d1e2` 等；诊断三项=0）。
+- 每遍：Min/Avg/P50/P90/P99/Max、failed、verify 错误；运行后按 target 的"**下一次新连接打印上一轮**"规则取 W 块并按 n 对齐（照 NOF-023 §4.2 的方法）。
+- 可选：若某臂明显优于基线（超臂内极差），再用该配置在 T4 跑 3 遍补充；不影响本单主结论。
+
+## 停止规则
+
+- 任一遍 failed>0 或 verify 错误>0 → 立即停手回报。
+
+## 边界
+
+- 只读；仅改上述客户端参数；不写盘；不动 target/master；不重启；不增删臂。
+
+## 回执必答（第一行）
+
+L4/L8/L16/L16W8 中位 P50/P90/P99/Avg；最优组合；target W9/n；T1 端到端距 ~300µs 还差多少；有无失败。
