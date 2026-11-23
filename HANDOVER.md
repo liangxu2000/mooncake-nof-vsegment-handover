@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**无（NOF-043 已关闭 2026-11-23；等待用户决定：零成本查 target 逐 IO 明细可用性 / 批准重启 target / 按现状收口）**
+- 当前任务：**NOF-044（零成本检查 target 逐 IO 明细；若无则按用户授权重启 target 开启）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -116,6 +116,7 @@
 | NOF-041 | 已关闭 2026-11-23（**全部落在 bdev 段**） | vseg T1（排除 0–96）**bdev_us p50 250 / p90 306** vs plain **46 / 58**（+204）；data_us **5 vs 14（更小）**、outside_us 16 vs 23（更小）；vseg bdev **单峰**（200–300 占 76.2%、<100µs 占 0.0%），plain 干净区**双簇**（<50 占 60.0%、50–100 占 39.9%）；**vseg 的 bdev 分布与 plain 盘首慢区（keys 0–96）逐桶吻合** ⇒ vseg 全部 400 keys 都处于同一"慢状态" |
 | NOF-042 | 已关闭 2026-11-23（**时序/落核无差异**） | 每条 lane 内严格 LBA 递增（(key,qid) 逆序对 p50=0）；q1 全局单调；四核四 qpair 与 plain 相同且均匀（lcore3/4/5/6）；**四核 bdev 全线 218–261µs vs plain 47–48µs**（慢不集中某核）；大 IO 与下一 key 小 IO 基本不重叠（0.61% vs 0.08%）；**纠正日志事实**：此前"每 key 一条大 IO"是 `nof_slow_task` 行拼接所致，URMA_SLOW_IO 全为 128KiB（任务级：vseg 2×2MiB、plain 1×4MiB） |
 | NOF-043 | 已关闭 2026-11-23（**写 lane 排除**） | q1 串行写 400 新 key（自证 io_qpairs=1；Keys=800、logical_used 精确、写 W9 27.73µs）；读回三桶 bdev p50 **252 / 252 / 253µs**（慢窗口 / q4 写 / q1 写），慢占比 91.6/91.0/91.2% ⇒ **写侧 lane 交织不是主因**；六个维度全部排除，只剩 target/盘内部逐 IO 细节 |
+| NOF-044 | 已下发（2026-11-23，用户已批准条件重启） | 先零成本检查 `/tmp/nvmf_tgt.log` 与 SPDK 源码（逐 IO 明细是否已有、需要哪些 env、含哪些字段）；若无，则按用户授权重启 target 开启逐 IO 明细并验收（不启 master、不读写） |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
@@ -566,10 +567,10 @@
 ### 决策点（2026-11-23，NOF-043 后更新）
 
 - 已排除：测量伪影、写线程数/写模式、布局/分区/stripe/child/写序、连接预热、qpair/lane（读+写）、提交顺序/落核/大 IO 重叠、传输/客户端（data/outside 更小）；慢窗口是固定 LBA 段，与 vseg 无关。
-- **两个候选动作（需用户选择）**：
-  1. **零成本先查**：在 node3 上只读检查 `/tmp/nvmf_tgt.log` 是否已有逐 IO 明细行（如 `URMA_BDEV_DETAIL`）以及 `TARGET_TRACE_ENTRIES` 是否为 0；若有，直接按 vseg/plain 两段分析（无需重启）；若没有，停手回报。
-  2. **重启 target 开逐 IO 明细**（高危，需用户明确批准；target 重启后需重新 register/mount，盘上数据不丢；预计 1.5–2 h）：`TARGET_TRACE_ENTRIES>0` 采 `URMA_BDEV_DETAIL`，看 bdev 段内部到底在等什么（raid0 队列 vs NVMe 完成）。
-- 若用户不批准/不继续：按现状收口（报告已含六维度排除与逐 IO 五段定位，遗留机制问题）。
+- **用户已决策（2026-11-23）**："先查，无则重启"——先零成本检查现有 target 日志/源码是否已有逐 IO 明细；若没有，**授权重启 target 加打点**。
+- **NOF-044（本单）**：Stage A 零成本检查（`/tmp/nvmf_tgt.log` 是否已有 `URMA_BDEV_DETAIL`、源码确认所需 env 与字段）；Stage A 无明细则按用户授权执行 Stage B（重启 target 开逐 IO 明细并验收；**不启 master、不读写**）。
+- 随后 NOF-045 再在带打点的 target 上做 vseg/plain 两段读并把逐 IO 明细采下来对比（届时再下发）。
+- 若明细不可得/不提供新信息：按现状收口（报告已含六维度排除与逐 IO 五段定位，遗留机制问题）。
 - 其余备选（暂缓）：
 1. **按现状交付**：报告已按 NOF-035 更正；遗留一个明确开放问题（每命令 2.5× 的机制）。
 2. **重启 target 开逐 IO 明细**（需用户批准；target 重启后需重新 register/mount，盘上数据不丢；预计 1.5–2 h）：用 `TARGET_TRACE_ENTRIES>0` 采 `URMA_BDEV_DETAIL`，对比 plain/vseg 的逐条 exec 时间、到达顺序与尺寸分桶。
@@ -2617,3 +2618,50 @@ vseg/plain 的提交顺序（逆序对/断点）、每 key 提交总时长、tar
 ## 回执必答（第一行）
 
 q1 写是否落盘（master Keys/logical_used + target 写 n）；三桶的 bdev/roundtrip p50/p90 与慢占比；**q1 写的新数据是否回到快档**；布局是否连续；有无失败。
+
+---
+
+# NOF-044（待执行 · 零成本检查 target 逐 IO 明细；若无则按用户授权重启开启 · 2026-11-23）
+
+## 背景与授权
+
+- 用户已明确选择："**先查，无则重启**"——先零成本检查现有 target 日志与 SPDK 源码；若没有逐 IO 明细，**授权本单重启 target** 加打点。
+- 目的：让 target 具备逐 IO 明细（`URMA_BDEV_DETAIL` 或等价），供 NOF-045 对比 vseg/plain 的 bdev 段内部（raid0 队列 vs NVMe 完成）。
+- 本单**只做**"检查 + 让明细可用"；**不启动 master、不写不读**（读写留给 NOF-045）。
+
+## A. 零成本检查（只读，先做）
+
+1. 记录 target 现状：PID 341038 的 `/proc/341038/cmdline`（启动参数全文，IP 打码）、启动时间；`/tmp/nvmf_tgt.log` 字节数；4457 LISTEN。
+2. `grep -c "URMA_BDEV_DETAIL" /tmp/nvmf_tgt.log`；若 >0，取 ≤5 条样例并列出字段名（`key=value` 名）。
+3. 只读查源码确认开关与字段（`sudo -n grep -rn`，≤20 行输出）：
+   - `URMA_BDEV_DETAIL` 在 `/home/yin/nof/spdk-cpu/lib/` 下的打印位置与字段列表（是否有 NVMe 层/队列层时间，或只是 lba/blocks/exec/cpl）；
+   - `SPDK_URMA_TRACE_ENTRIES`、`SPDK_URMA_STAGE_TARGET_SINK` 的取值语义（尤其 "quiet" 是否抑制逐 IO 打印、非 quiet 的正确取值）。
+4. **判决**：
+   - 若现有日志已有逐 IO 明细且字段可用 ⇒ **不重启**；回执样例/字段，停手等 NOF-045。
+   - 若没有（或源码显示必须 TRACE_ENTRIES>0 才有）⇒ 进入 B。
+
+## B. 重启 target 开启逐 IO 明细（用户已授权）
+
+1. 记录现状快照：target cmdline（上一步）、`nvmf_get_subsystems` 的 ns→URMA_RAID0、4457、`/tmp/nvmf_tgt.log` 当前字节数（后续只解析该 offset 之后的行）；记录 rollback 命令（同参数**不带** trace）。
+2. 停我方 vseg master：按 PID 2077841 `kill -TERM`，等退出（**不要**清 etcd 键）；不动 node1 同事进程。
+3. 停 target：按 PID 341038 `kill -TERM`，等退出（30s 不退再考虑更强信号，动作前记录）；确认 4457 释放。
+4. 用**与 341038 相同的启动路径/参数**重启 target（NOF-016 路径：yin `run_vesegment_target.sh` / patched takeover；同 disks `nvme0n1..nvme10n1`、`-R 256`、`-m [2-7]`、`-C 64`、`-L /usr/lib64`、`-i <fabric_ip>`、`-p urma`、`-N udmac0d1e2`），并加：
+   - `SPDK_URMA_TRACE_ENTRIES=2097152`
+   - **sink 按源码确认设为非 quiet**（确保 `URMA_BDEV_DETAIL` 逐 IO 行真的打印；若脚本会强制 `SPDK_URMA_STAGE_TARGET_SINK=quiet`，需绕过/改写该行并在回执说明）
+   - 保留原有 `SPDK_URMA_DEV_NAME=udmac0d1e2` 等 env。
+5. 验收（缺一不可，否则按 rollback 恢复并停手）：
+   1. 4457 LISTEN；`nvmf_get_subsystems` 仍为 nsid1 → URMA_RAID0；
+   2. 启动日志出现 trace 相关行（记录原文 ≤5 行）；
+   3. 新日志中出现**逐 IO 明细样例**（`URMA_BDEV_DETAIL` 或源码对应格式；若无 IO 则不打印，可用一次只读的极小探测——**不要**跑 bench、不要写数据）；
+   4. 记录新 target PID、二进制 md5、日志路径、启动命令全文（IP 打码）。
+6. **停手**：不启动 master、不 register、不写不读；环境保持在"target 带 trace 运行、master 已停"。
+
+## C. 边界
+
+- target 重启是本单唯一高危动作，**已获用户明确授权**；失败（端口不起/RAID 不齐）→ 按 rollback（同参数无 trace）恢复后回报，不反复尝试。
+- 不动 node1 同事进程；node3 独占；不删日志；所有命令非交互。
+- 不触碰 etcd（NOF-045 再决定 remount 还是 fresh cluster）。
+
+## 回执必答（第一行）
+
+现有日志是否已有逐 IO 明细及字段清单；如无，target 是否已带 trace 重启成功（新 PID/4457/明细样例/rollback 命令）；有无失败。
