@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-042（纯日志分析：提交时序/落核/顺序性对比，零环境操作）**
+- 当前任务：**NOF-043（写路径 lane 对照：qpairs=1 写新 key 再读，检验写侧交织是否决定读慢）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -114,7 +114,8 @@
 | NOF-039 | 已关闭 2026-11-23（**warmup 不能跳过慢窗口**） | warmup 与测量两阶段读 keys 0–96 均 ~245µs（慢占比 90.9%/91.0%）⇒ 慢区是固定 LBA 段，非连接预热；干净的**排除 0–96**基线：**T1 p50 86 / p90 109 / W9 68；16t p50 359 / p90 570 / W9 161** ⇒ 并发 1→16 抬高 per-IO **4.2×** |
 | NOF-040 | 已关闭 2026-11-23（**qpair 排除；vseg 全程均匀慢**） | vseg T1 干净（排除 0–96）p50 **274**/p90 332、W9 **255.25**（plain 86/109/68 ⇒ 3.2×/3.0×/3.75×）；**qpairs 4→1 仅 −2.6%（274→267，W9 255→248）**；keys 97–399 慢占比 **90.7%**（与 0–96 的 91.2% 相同；plain 同段 0%）⇒ 全程均匀慢；16t 差距收窄（p50 414 vs plain 359，1.15×） |
 | NOF-041 | 已关闭 2026-11-23（**全部落在 bdev 段**） | vseg T1（排除 0–96）**bdev_us p50 250 / p90 306** vs plain **46 / 58**（+204）；data_us **5 vs 14（更小）**、outside_us 16 vs 23（更小）；vseg bdev **单峰**（200–300 占 76.2%、<100µs 占 0.0%），plain 干净区**双簇**（<50 占 60.0%、50–100 占 39.9%）；**vseg 的 bdev 分布与 plain 盘首慢区（keys 0–96）逐桶吻合** ⇒ vseg 全部 400 keys 都处于同一"慢状态" |
-| NOF-042 | 已下发（2026-11-23） | 纯日志分析：用 `initiator_submit_tick`/`target_lcore`/`qid` 重建每 key 的提交时序，检查提交顺序是否严格递增、child 边界是否有断点、大 IO 是否与下一 key 重叠、慢是否集中在某些 lcore/qpair |
+| NOF-042 | 已关闭 2026-11-23（**时序/落核无差异**） | 每条 lane 内严格 LBA 递增（(key,qid) 逆序对 p50=0）；q1 全局单调；四核四 qpair 与 plain 相同且均匀（lcore3/4/5/6）；**四核 bdev 全线 218–261µs vs plain 47–48µs**（慢不集中某核）；大 IO 与下一 key 小 IO 基本不重叠（0.61% vs 0.08%）；**纠正日志事实**：此前"每 key 一条大 IO"是 `nof_slow_task` 行拼接所致，URMA_SLOW_IO 全为 128KiB（任务级：vseg 2×2MiB、plain 1×4MiB） |
+| NOF-043 | 已下发（2026-11-23） | 写路径 lane 对照：用 `--nof_qpairs_per_segment=1` 写 400 个新 key（vseg 写严格串行）后读回，按 key 桶比较 bdev_us——检验"写侧双 child 跨 lane 交织"是否是读慢的来源 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
@@ -546,16 +547,21 @@
 - **16t 对照**：vseg bdev 281 vs plain 266（+15），差距转为 outside_us +29、data_us +5；16t 下两者 bdev 分布已接近（plain 16t 也 0.0% <100µs），无法区分 vseg 特有与并发效应。
 - 日志偏差：16t 两份有 3.4–4.6% 行被并发日志打断（torn），已剔除；T1 两份 0 条打断，结论完全可靠。
 
-### 决策点（2026-11-23，NOF-041 后更新）
+### NOF-042 关键事实（时序/落核/重叠均无差异；日志事实纠正，2026-11-23）
 
-- 已排除：测量伪影、写线程数/写模式、布局/分区/stripe/child/写序、连接预热、qpair/lane；慢窗口是固定 LBA 段，与 vseg 无关。
-- 现在的事实：vseg 的每 IO 多出的 188µs **全部在盘执行段（bdev_us）**，且 bdev 分布与 plain 盘首慢区逐桶一致、单峰 —— 不是排队/背压/传输，不是双峰，像是**数据在盘上的执行状态**或**到达盘的方式**不同。
-- **开发侧决定（2026-11-23）**：继续做**零环境操作的 NOF-042**——用日志里的 `initiator_submit_tick` / `target_lcore` / `qid` 重建时序：
-  1. 每 key 的 32 条 128KiB 是否按 LBA 严格递增提交、child 边界是否有断点/空档；
-  2. 是否所有 IO 落在同一/少数 target lcore，且慢是否集中在某些 lcore/qpair；
-  3. verify 大 IO 是否与下一 key 的小 IO 重叠（若重叠，小 IO 可能在盘里排在 2MiB/4MiB 大命令之后）。
-  - 若时序/落核有差异 ⇒ 直接指向客户端提交或 target 调度，给出可改的旋钮；
-  - 若无差异 ⇒ 差异只能在"数据落在盘上的物理状态"，需转向写路径取证（给 writer 开诊断采写 LBA/时序）或重启 target 做逐 IO 明细（另行申请）。
+- **提交顺序**：vseg 每条 lane 内严格按 LBA 递增（`(key,qid)` 逆序对 p50=0，800 组仅 1 组异常）；q1 臂全局完全单调；q4 臂"每 key 整体"~47 个逆序对，纯粹是 2 个 child 落在不同 lane 交错提交所致。每 key 32 条提交总时长 p50 = 32.0µs（plain 23.6µs）；>50µs 断点仅 1/12,277（异常行）。
+- **落核/qpair**：两边都用 lcore 3/4/5/6、qid 2/3/4/5，一一对应且均匀；**但 vseg 四核 bdev 全线 218–261µs，plain 四核 47–48µs**；q1 单 lane 为 248µs ⇒ 慢不集中于某个核，lane 数不改结论。
+- **大 IO 重叠**：T1 下一 key 小 IO 落在上一 key 任务执行期内的比例 0.61%（plain 0.08%）⇒ 无实质重叠；16t 7.38% vs 1.95%，但 16t 两边 bdev 已重合。
+- **重要事实纠正**：此前"每 key 一条 2MiB/4MiB 大 IO（URMA_SLOW_IO）"是**日志行拼接**所致（`nof_slow_task` 任务级日志插入 URMA_SLOW_IO 行、换行丢失）；测量段真正的 URMA_SLOW_IO（opcode=2）**全部是 blocks=256（128KiB）**。任务级记录：vseg 每 key 2×2MiB（child_count=2）、plain 每 key 1×4MiB；任务 drain p50 vseg 349µs vs plain 108µs。此前各单只取 blocks=256，结论不受影响。
+- **判决**：时序/落核/重叠均无可辨识差异 ⇒ 188µs 增量不在"提交方式/target 调度/排队"，只能在**数据在盘上的物理状态**或设备对该数据的执行时间。
+
+### 决策点（2026-11-23，NOF-042 后更新）
+
+- 已排除：测量伪影、写线程数/写模式、布局/分区/stripe/child/写序、连接预热、qpair/lane、提交顺序/落核/大 IO 重叠；慢窗口是固定 LBA 段，与 vseg 无关。
+- 剩下唯一未控制过的变量：**vseg 写路径的 lane 交织**。源码确认 lane 按 task 轮转（`transfer_task.cpp:895` `next_lane++ % lane_count`）：vseg 一个 key 的 2 个 2MiB child 落在**两条 lane**上、写入到达交错；plain 一个 key 只有 1 个 4MiB task、只走**一条 lane**。若写侧交织导致盘上 FTL 物理落点不同，就能解释"读侧时序全同、盘执行却慢"。
+- **开发侧决定（2026-11-23）**：下发 **NOF-043（零 target 改动）**——用 `--nof_qpairs_per_segment=1` 写 400 个新 key（vseg 写入严格串行），再读回，按 key 桶比较 bdev_us：
+  - 新桶（q1 写）若回到 ~46–100µs ⇒ **写侧 lane 交织是主因**，下一步是配置/代码层把 vseg 写 children 串行化；
+  - 新桶仍 ~250µs ⇒ 写 lane 无关，只剩 target 逐 IO 明细（需重启 target，另行申请）或接受现状。
 - 其余备选（暂缓）：
 1. **按现状交付**：报告已按 NOF-035 更正；遗留一个明确开放问题（每命令 2.5× 的机制）。
 2. **重启 target 开逐 IO 明细**（需用户批准；target 重启后需重新 register/mount，盘上数据不丢；预计 1.5–2 h）：用 `TARGET_TRACE_ENTRIES>0` 采 `URMA_BDEV_DETAIL`，对比 plain/vseg 的逐条 exec 时间、到达顺序与尺寸分桶。
@@ -2485,7 +2491,9 @@ vseg/plain 的 `bdev_us` 与 `data_us` p50/p90 及直方图（均匀还是双峰
 
 ---
 
-# NOF-042（待执行 · 纯日志时序分析：提交顺序/落核/大 IO 重叠，零环境操作 · 2026-11-23）
+# NOF-042（已关闭 · 纯日志时序分析：提交顺序/落核/大 IO 重叠，零环境操作 · 2026-11-23）
+
+> 结果：时序/落核/重叠均无可辨识差异；vseg 四核 bdev 全线 218–261µs vs plain 47–48µs；并纠正"每 key 一条大 IO"为日志拼接假象（URMA_SLOW_IO 全为 128KiB）。详见"NOF-042 关键事实"。
 
 ## 背景与目的
 
@@ -2537,3 +2545,65 @@ vseg/plain 的 `bdev_us` 与 `data_us` p50/p90 及直方图（均匀还是双峰
 ## 回执必答（第一行）
 
 vseg/plain 的提交顺序（逆序对/断点）、每 key 提交总时长、target_lcore 与 qid 分布及对应 bdev_us、大 IO 与小 IO 重叠计数；**时序/落核是否有可辨识差异**；有无失败。
+
+---
+
+# NOF-043（待执行 · 写路径 lane 对照：qpairs=1 写新 key 再读 · 2026-11-23）
+
+## 背景与假设
+
+- NOF-041/042：vseg 的 188µs 增量全部在 **bdev（盘执行）**；提交顺序、落核、qpair、大 IO 重叠全部无差异；vseg 全部 key 处于与 plain 盘首慢区相同的"慢状态"。
+- 源码事实（`transfer_task.cpp:895`）：lane 按 **task 轮转**（`next_lane++ % lane_count`）。vseg 一个 key 的 **2 个 2MiB child 落在两条 lane** 上、写入到达交错；plain 一个 key 只有 1 个 4MiB task、只走一条 lane。**这是唯一还没控制过的差异**（此前只换过 writer 线程数，没换过 writer lane 数）。
+- 本单在**现有 vseg 环境**（master 2077841、stripe=2MiB、slot=1）写 400 个新 key，**writer 用 `--nof_qpairs_per_segment=1`**（写入严格串行），再读回按 key 桶对比。**不动 target**。
+
+## A. 预检（只读）
+
+1. vseg master 2077841 leader/serving、50056/9006；`Keys=400`、`logical_used=1,677,721,600`；target 341038 未动、4457。
+2. `--help 2>&1 | grep -E "nof_qpairs_per_segment|num_keys"` 确认旗标存在。
+3. 记录起点 target W 快照；node3 run 目录空间充足（不删既有日志）。
+
+## B. 写新 key（writer qpairs=1）
+
+- writer：`--num_keys=800 --num_threads=1 --batch_size=1 --nof_qpairs_per_segment=1`、vsegment flags、verify=false。
+- 预期：keys 0–399 被拒（`OBJECT_ALREADY_EXISTS` 约 400 条，属预期）；keys 400–799 真正写入。
+- **验收（必须全部满足，否则停手）**：
+  1. master `Keys=800`、`logical_used=3,355,443,200`；
+  2. target 写窗口 **n ≥ 12,000**（对照全新写 12,802），记录 W9 avg；
+  3. `VSEGMENT_CREATING` 允许**最多 2 次尝试**补齐（总尝试 ≤2），超过即停手。
+- 日志 `run/nof043_write_q1.log`；写窗口快照 `nof043_W_write.txt`。
+- 记录 writer 进程的 qpairs 证据（启动日志/`nof_qseg` 相关行或 `/proc/<pid>/environ` 只读确认）。
+
+## C. 读回（T1 q4，同口径）
+
+- reader：`--num_keys=800 --num_threads=1 --batch_size=1 --nof_qpairs_per_segment=4 --warmup_keys=128 --verify=true`、vsegment flags、诊断开（`VSEG_DIAGNOSTIC=1`、`MC_HIFREQ_LOG_SAMPLE_RATE=1`、`VSEG_SLOW_IO_US=1`）。
+- 日志 `run/nof043_read_800.log`（约 45MB）。
+- 记录：端到端 Min/Avg/P50/P90/P99/Max、failed/verify、target W9（n≈51,524）/exec%/TOTAL。
+- 解析（沿用 NOF-037/040 脚本）按 key 桶：
+  - **桶 1**：keys 0–96（盘首慢窗口，对照）
+  - **桶 2**：keys 97–399（**q4 写**的旧数据，对照）
+  - **桶 3**：keys 400–799（**q1 写**的新数据，处置）
+  - 每桶：128KiB roundtrip p50/p90、`bdev_us` p50/p90（若日志含五段字段）、≥200µs 慢占比、布局是否连续（LBA 边界与步长）。
+- 若日志含 `bdev_us` 等五段字段，**以 bdev_us 为主判据**（与 NOF-041 一致）；否则用 roundtrip。
+
+## D. 回答与判决
+
+| 桶 | key | 写入 | bdev_us p50/p90（或 roundtrip） | ≥200µs 占比 |
+|---|---|---|---|---|
+| 1 | 0–96 | —（盘首慢区） | ? | ? |
+| 2 | 97–399 | q4 写（2 child 跨 lane） | ? | ? |
+| 3 | 400–799 | **q1 写（串行）** | ? | ? |
+
+- 明确回答：**同一 vseg 环境里，q1 写的新数据读回后，bdev/roundtrip 是否从 ~250µs 回到 ~46–100µs？**
+  - 是 ⇒ **写侧 lane 交织是主因**；下一单把 vseg 写 children 串行化（配置或代码层）并复测原 400 keys；
+  - 否（仍 ~250）⇒ 写 lane 无关；剩余只有 target 逐 IO 明细（需重启 target，另行申请）或按现状分析收口。
+- 副回答：桶 2/3 的布局是否都连续（LBA 步长 1、>1MiB 跳变 0）；写窗口 W9 是否仍 ~24–28µs。
+
+## E. 边界
+
+- 只动我方 writer/reader；**不动 target**、不改 master 参数、不删 key/日志；共享机规则；失败停手。
+- 写入量 +1.6GiB（段 100GiB 充足）；`VSEGMENT_CREATING` 超过 2 次尝试即停手。
+- 所有臂写明 warmup；读写都记录 W 快照。
+
+## 回执必答（第一行）
+
+q1 写是否落盘（master Keys/logical_used + target 写 n）；三桶的 bdev/roundtrip p50/p90 与慢占比；**q1 写的新数据是否回到快档**；布局是否连续；有无失败。
