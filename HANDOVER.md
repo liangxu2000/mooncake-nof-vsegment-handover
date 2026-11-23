@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-050（第二阶段 M1a：客户端 NoF 参数插桩构建 + vseg 参数采集）**
+- 当前任务：**NOF-051（第二阶段 M1a-1：构建 e12b7cb 客户端并重试参数采集；A 路线，不动 target）**
 
 ## 第二阶段（2026-11-23 起）
 
@@ -18,7 +18,9 @@
 - **2026-11-23 复盘纠偏**：发现两处高价值线索——①构建基线 **be10be2 已落后远端 tip 4c0ea28**（含 `ff3e853` 诊断 opt-in/低时延默认、`13b7c19` 去重复校验等读路径修复）；②旧构建 `MC_HIFREQ_LOG_SAMPLE_RATE` **默认 1.0**，per-task 计时/breakdown 日志默认全开（tip 的提交明确说这会抬高读时延），而我们**从未测过"诊断全关"的 vseg**。
 - **S0 结果（NOF-049，已完成）**：诊断全关 W9 仅 **258.85→251.75µs（−2.7%）** ⇒ 默认诊断/客户端背压排除。
 - **S2 复核（2026-11-23）**：be10be2→4c0ea28 的 `transfer_task.cpp` 仅 40 行改动（诊断 gating/UB poll 默认），**NoF 读提交/QoS/分块未变**；其余为客户端/写路径 ⇒ 构建 tip 对 210µs 的预期收益低，暂缓。S1（本机裸读）降为可选参照（vseg/plain 对比都在本机，宿主混淆不改变结论）。
-- **当前进入 M1a（NOF-050）**：客户端 NoF 参数插桩（补丁在 `第二阶段/patches/nof050_client_io_params.patch`），65s 构建 + vseg 采集；随后 NOF-051 做 plain 对照；NOF-052 视结果做 target 侧插桩（需重启 target，另行批准）。详见 `第二阶段/README.md` 第 0 节与 `第二阶段/patches/README.md`。
+- **M1a（NOF-050）已构建成功但被版本阻塞**：补丁/编译/链接全部成功（`bench-io-params` md5 fc2b5129…），但新 bench 的客户端 SPDK 是 **9a413a44**，运行中 target 是 **e12b7cb**，握手失败（rc=-71/-104）；同事原 bench（匹配 e12b7cb）同参数正常（P50 473.52 / W9 259.77，**reader 在 node1 远端**，与 NOF-040 本机 274 不可比）。
+- **关键事实**：target 现跑的是 **deleted 旧二进制 736a902f**；磁盘上的 `nvmf_tgt` = **d6c39465（9a413a44）**。任何 target 重启都会永久切到 9a413a44（旧 e12b7cb 二进制不可恢复）。
+- **开发侧决策（2026-11-23）：先走 A**——在我们副本里构建 **e12b7cb** 客户端 SPDK（与运行中 target 同源、wire 兼容），重链已插桩的 bench 后重试；**不动 target、保留第一阶段基线**。B（node1 `/usr/local`=6fae46095，第三版本）成功概率低，暂不试。**若干净 e12b7cb 客户端仍握手失败**（旧 target 可能带本地改动）→ 再向用户申请 C（重启 target 到磁盘 9a413a44；一步对齐但**不可回退**，且需重测基线）。
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -134,7 +136,8 @@
 | NOF-047 | 已关闭 2026-11-23（第二阶段 M0） | 复制 8.82GiB（Mooncake 源/build、SPDK 源/build），HEAD/status/关键二进制与静态库 md5 全部 MATCH；配置：Release、USE_NOF/NOF_URMA/UB/ETCD=ON、SPDK 指 /usr/local（**纯静态 74 个 .a、0 .so**）；**正在跑的 target 是 deleted 旧二进制（736a902f），磁盘为 d6c39465**；补丁点：target `ctrlr_bdev.c:466-467`、client `nvme_urma.c:995-1056`、Mooncake `transfer_task.cpp:3047/1080-1106` |
 | NOF-048 | 已关闭 2026-11-23（**通过**；基线仍待升级） | 最小重建成功：编译 61s、链接 4s，新 bench 530,148,040B / md5 43ba518d…，`--help` 与原版仅差第 1 行程序名；配方 = 编译 `transfer_task.cpp` → 复制 `libmooncake_store.a` 并用 `ar r` 替换成员 → 按 link.txt 重链；无 `_deps`、`/home/yin` 全可读。**注意：编译 -I 指向同事树（改头文件需前置我们的 include）、SPDK 用 /usr/local 静态库（target 插桩需换 `$D/spdk-build/lib` 重链）、新 bench RPATH 依赖同事 common/etcd**。构建基线仍建议 S2 升级到 tip 4c0ea28 |
 | NOF-049 | 已关闭 2026-11-23（**诊断排除**） | 同环境同 key T1 两臂：ON W9 **258.85** / OFF **251.75µs（−2.7%）**、端到端 P50 504.11→494.56（−1.9%）；OFF 日志 167KB 且 `URMA_SLOW_IO`/`nof_slow_task`/`nof_vsegment_operation`/`transfer_data_breakdown` 全 0（env 生效）；两臂 exec 占比 96.2–96.3% ⇒ **默认诊断/客户端背压不是 210µs 来源**。注意绝对 P50 494–504 与 NOF-040 274 不一致（疑 slot env/集群变化），后续固定口径 |
-| NOF-050 | 已下发（2026-11-23，第二阶段 M1a） | 用 `第二阶段/patches/nof050_client_io_params.patch`（仅 transfer_task.cpp，+56 行，`MC_NOF_IO_PARAMS_LOG=1` 触发）构建 `bench-io-params`，跑一遍 vseg T1 读，采集每 task 的 ptr/seg_lba/blocks/child/lane/buf_type/domain 与 `[register_buffer]` 区间，检查 ptr 是否在注册域内 |
+| NOF-051 | 已下发（2026-11-23，M1a-1/A 路线） | 在 `$D/spdk-src` checkout **e12b7cb** 并构建到我们自己的 prefix；用 e12b7cb 静态库重链已插桩 bench（`bench-io-params-e12`）；在 **node3 本机**重试 vseg 参数采集；不动 target/master；若仍握手失败则停手等 C 的授权 |
+| NOF-050 | 已关闭 2026-11-23（**阻塞：SPDK 版本不兼容**） | 补丁/编译/链接成功（`bench-io-params` 530,162,656B / md5 fc2b5129…，strings 命中 3 条）；但新 bench 连 target 失败：客户端 SPDK **9a413a44** vs target 运行中 **e12b7cb**，握手 rc=-71/-104；同事原 bench（59662a26，匹配 e12b7cb）同 env/参数 rc=0、P50 473.52 / target W9 259.77。**口径修正**：该 P50 为 **node1 远端 reader**，与 NOF-040 本机 274 不可比（SLOT=1 未改变 P50）；target 现跑的是 **deleted 旧二进制 736a902f**，磁盘 d6c39465=9a413a44 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
@@ -2986,7 +2989,9 @@ ON/OFF 两臂的 target W9、端到端 P50、日志大小与关键日志行数�
 
 ---
 
-# NOF-050（待执行 · 第二阶段 M1a：客户端 NoF 参数插桩构建 + vseg 参数采集 · 2026-11-23）
+# NOF-050（已关闭 · 阻塞：客户端/target SPDK 版本不兼容 · 2026-11-23）
+
+> 结果：补丁/编译/链接成功（`bench-io-params` md5 fc2b5129…），但新 bench 的客户端 SPDK **9a413a44** 与运行中 target **e12b7cb** 握手失败（rc=-71/-104）；同事原 bench（匹配 e12b7cb）同参数正常。target 现跑 deleted 旧二进制 736a902f，磁盘 d6c39465=9a413a44。等待用户决定 A/B/C（见"第二阶段（2026-11-23 起）"上方的决策说明）。
 
 ## 背景
 
@@ -3036,3 +3041,49 @@ ON/OFF 两臂的 target W9、端到端 P50、日志大小与关键日志行数�
 ## 回执必答（第一行）
 
 补丁/编译/链接是否成功与新 bench md5；vseg 参数日志行数、前 20 条样例、ptr 注册域命中率、child/lane/buf_type/domain 统计；target W9；有无失败。
+
+---
+
+# NOF-051（待执行 · 第二阶段 M1a-1：构建 e12b7cb 客户端并重试参数采集 · 2026-11-23）
+
+## 背景与决策
+
+- NOF-050：我们的 bench（客户端 SPDK **9a413a44**）与运行中 target（**e12b7cb**）握手失败（rc=-71/-104）；同事原 bench（59662a26，匹配 e12b7cb）同参数正常。
+- **开发侧决策：走 A 路线**——在我们副本里构建 **e12b7cb** 客户端 SPDK，重链已插桩的 bench 后重试；**不动 target、保留第一阶段基线**。若干净 e12b7cb 客户端仍失败（旧 target 可能带本地改动），再申请 C（重启 target，需用户批准且不可回退）。
+
+## A. 源码与配置（只动我们的副本）
+
+1. `$D=/home/l00955908/mooncake-nof-vsegment/build`；`cd $D/spdk-src`；确认 `git cat-file -e e12b7cb^{commit}` 存在；`git checkout e12b7cb`；记录 HEAD/status（现有 9a413a44 的 `spdk-build/` 保留作参照，不覆盖）。
+2. 读取参考配置：9a413a44 构建的 `build/config.log`（configure 原始命令）与 `mk/config.mk`/`CONFIG` 的 URMA 相关项（`CONFIG_URMA`/`URMA_RJETTY`/`URMA_SEG_CTX`/`URMA_PEERMEM`）。核对 e12b7cb 树的同名文件：
+   - 若 e12b7cb 干净树**缺少 URMA 开关/支持**（可能是同事本地改动才有）→ **停手回报**，不要猜/不要改配置硬编；
+   - 若具备 → 按参考命令配置到我们自己的 prefix：`./configure --with-dpdk=$D/spdk-src/dpdk/build --prefix=$D/spdk-e12b7cb` + 参考中的 URMA 选项。
+3. 构建：`gmake -j64`（node3 独占；若 nproc<64 用 nproc）；记录耗时/日志；每 ~15 min 一行进度。
+4. 验收：
+   - 关键静态库存在（`libspdk_nvme.a`/`libspdk_nvmf.a`/`libspdk_env_dpdk.a`/`libspdk_bdev.a`/`libspdk_event.a`/`libspdk_sock_posix.a` 等）；
+   - `strings <libspdk_nvme.a> | grep -i urma` 非空、`grep -R "SPDK_URMA_WIRE_VERSION" include lib | head` 记录版本；
+   - 记录构建产物的版本串（应显示 e12b7cb）。
+5. 构建失败 → 报第一个错误（≤20 行）+ 缺失项，停手；**不动 target**。
+
+## B. 重链已插桩的 bench
+
+1. 复制 `/tmp/nof050/link.sh` → `/tmp/nof051/link.sh`；把所有 `/usr/local/lib/libspdk_*.a` 路径替换为 `$D/spdk-e12b7cb/lib/...`（rte 库按需指向 e12b7cb 构建的 dpdk）；输出 `$D/bench-io-params-e12`。
+2. 复用 `/tmp/nof050/libmooncake_store_io_params.a`（已含插桩成员）。
+3. 验收：`$D/bench-io-params-e12 --help`（gflags rc=1、206 行）；`strings | grep -i "e12b7cb"`（版本串）；记录 md5/大小。
+4. 若链接失败（未定义符号/ABI 不匹配）→ 报错误并停手；**未经指示不要重编整个 Mooncake**。
+
+## C. 在 node3 本机重试参数采集（与 target 同机，对齐 NOF-040 口径）
+
+- env：`MC_NOF_IO_PARAMS_LOG=1`；**诊断全关**（`MC_HIFREQ_LOG_SAMPLE_RATE=0`、`MC_NOF_SLOW_TRACE_THRESHOLD_US=0`、`SPDK_URMA_STAGE_TRACE_US=0`、无 `VSEG_DIAGNOSTIC`）；`MC_STORE_PARTITION_SLOT_COUNT=1`；必需 SPDK/URMA env + vsegment flags 同 NOF-040。
+- reader：`--num_keys=400 --num_threads=1 --batch_size=1 --nof_qpairs_per_segment=4 --warmup_keys=128 --verify=false`；**在 node3 本机运行**（不要 scp 到 node1）；日志 `run/nof051_vseg_params.log`。
+- 若握手仍失败（rc=-71/-104）→ 停手，回报完整错误链与 target 日志对应行；**不要重启 target**（C 路线需用户批准）。
+- 成功则采集：`NOF_IO_PARAMS_SUBMIT`/`WORKER` 行数与前 20 条样例；`[register_buffer]` 区间与 **ptr 命中率**；child 0/2 与 1/2 的 `seg_lba` 差（应 4096 blocks）；lane 分布；`buf_type`/`buf_device`/`domain`；target W9（n/avg/exec%）；端到端 Min/Avg/P50/P90/P99/Max；**明确记录 reader 在 node3**。
+
+## D. 边界
+
+- 只动我们的副本/prefix；不动同事原树、原 bench、原库；不覆盖 9a413a44 的 `spdk-build/`。
+- **不改 target/master、不重启 target**；reader 只读；不写盘数据（verify=false）；失败停手。
+- 本单不跑 plain（plain 对照放 NOF-052）。
+
+## 回执必答（第一行）
+
+e12b7cb 构建是否成功与新 bench md5/版本串；握手是否成功；参数日志行数/前 20 条样例/ptr 注册域命中率/child/lane/buf_type/domain 统计；target W9；reader 是否在 node3；有无失败。

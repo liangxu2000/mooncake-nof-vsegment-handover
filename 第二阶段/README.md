@@ -5,7 +5,7 @@
 - 目录约定：**第二阶段所有内容（文档、代码补丁、测量数据）统一放在 `第二阶段/` 目录下**；本文件为总文档/索引
 - 数据来源：`../HANDOVER.md` 各单回执 + 第一阶段最终报告 `../工作汇总.md`
 - 相关文件：`../HANDOVER.md`（任务通道）、`../工作汇总.md`（第一阶段最终报告）
-- **当前状态（2026-11-23）**：M0 已完成、NOF-048 最小重建已验证（65s/轮）；**S0 已完成（诊断排除：关诊断 W9 仅 −2.7%）**；核对 tip diff 后 **S2（构建 tip）暂缓**（NoF 读提交未变）；当前进入 **M1a 客户端插桩（NOF-050，补丁在 `patches/`）**。详见下方第 0 节、「最小重建配方」与 `patches/README.md`。
+- **当前状态（2026-11-23）**：M0 已完成、NOF-048 最小重建已验证（65s/轮）；**S0 已完成（诊断排除）**；**S2（构建 tip）暂缓**（NoF 读提交未变）；M1a 插桩已构建成功（`bench-io-params` md5 fc2b5129…），但**被客户端/target SPDK 版本不兼容阻塞**（客户端 9a413a44 vs target e12b7cb）。已选 **A 路线（NOF-051：构建 e12b7cb 客户端，不动 target）**；失败再申请 C（重启 target）。详见下方第 0 节（含 0.6 阻塞说明）、「最小重建配方」与 `patches/README.md`。
 - 一句话：**数据/盘无罪、target 看到的命令与顺序也与 plain 完全相同，但 vseg 每条 128KiB 读在 target 的 bdev 执行段多花 ~210µs。第二阶段的目标就是把这 210µs 找出来并消掉。**
 
 ---
@@ -52,11 +52,23 @@
 | **S0** | 同环境、同 key、T1、verify=false，诊断开 vs 诊断全关，比较 target W9 | **已完成 2026-11-23**（NOF-049） | ON **258.85** / OFF **251.75µs（−2.7%）**，exec 96.2–96.3% 不变 ⇒ **诊断/客户端背压排除** |
 | **S1** | node3 本机裸 urma_perf 定点读同一区 | 可选参照，~10 min | vseg/plain 对比都在本机，宿主混淆不改变结论；暂缓 |
 | **S2** | 构建 tip 4c0ea28 重测 | **暂缓** | diff 复核：be10be2→4c0ea28 的 `transfer_task.cpp` 仅 40 行诊断/UB 默认改动，**NoF 读提交/QoS/分块未变** ⇒ 对 210µs 预期收益低 |
-| **M1a** | 客户端 NoF 参数插桩（`patches/nof050_client_io_params.patch`）+ vseg 采集 | **进行中（NOF-050）** | ptr/seg_lba/child/lane/buf_type/domain 是否与 plain 一致、ptr 是否在注册域内 |
+| **M1a** | 客户端 NoF 参数插桩（`patches/nof050_client_io_params.patch`）+ vseg 采集 | 构建成功，**被版本阻塞**（NOF-050） | 新 bench（SPDK 9a413a44）与 target（e12b7cb）握手失败；同事原 bench 正常 |
+| **M1a-1** | 构建 e12b7cb 客户端 SPDK（A 路线），重链插桩 bench，node3 本机重试 | **进行中（NOF-051）** | 握手成功 → 采参数；仍失败 → 申请 C（重启 target，不可回退） |
 | **M1b** | 切换 plain，同口径采集与对比 | 下一单（NOF-051） | 找出客户端侧差异；若无差异 ⇒ target 插桩 |
 | **M1c** | target 侧插桩（SGL/bdev 提交参数/分段 tick） | 需重编 target + 重启（用户批准） | 定位 210µs 在 raid0 队列/NVMe/回调哪一段 |
 
-- NOF-048（最小重建验证）保留为 S2 的构建工具准备，但**构建基线改为 tip**，不再以 be10be2 为最终目标。
+- NOF-048（最小重建验证）已完成，配方已用于 M1a；构建基线是否升级 tip 视后续需要（S2 暂缓）。
+
+### 0.6 NOF-050 阻塞（2026-11-23）：客户端/target SPDK 版本不兼容
+
+- **现象**：插桩 bench（客户端 SPDK **9a413a44**）连 target 失败，客户端 `Ctrlr operation failed -104` → `Connection reset by peer` → `rc=-19`，target 侧 `accept: handshake failed rc=-71`；同事原 bench（md5 59662a26，客户端匹配 **e12b7cb**）同 env/参数 rc=0。
+- **版本事实**：target 日志首行 `SPDK v26.09-pre git sha1 e12b7cb21`；target 进程是 **deleted 旧二进制 736a902f**，磁盘 `nvmf_tgt`=d6c39465（=9a413a44）；两者之间 **10 个 commit**（含 `exchange full bonding contexts`、`patch exported rjetty copy`、`correct wire version`）。
+- **口径修正**：NOF-050 的对照 P50 473.52 / W9 259.77 是 **node1 远端 reader**；NOF-040 的 274µs 是 **node3 本机 reader**，两者不可直接比。`MC_STORE_PARTITION_SLOT_COUNT=1` 未把 P50 拉回 274 ⇒ 之前的"SLOT 解释"不成立，宿主位置更可能是原因。后续 plain/vseg 对比必须在**同一台机器**上跑。
+- **三条路线**：
+  - **A（已选，NOF-051）**：在我们副本里构建 e12b7cb 客户端 SPDK（与 target 同源、wire 兼容），重链插桩 bench，node3 本机重试。不动 target、保留第一阶段基线；风险：旧 target 可能带本地改动（干净 e12b7cb 仍可能不匹配）、SPDK 全量构建耗时。
+  - **B（暂不）**：试 node1 `/usr/local`（6fae46095，第三个版本），成功概率低、relink 也麻烦。
+  - **C（备选，需用户批准）**：重启 target 到磁盘 d6c39465（9a413a44），一步对齐、现有 bench 可用；但 **旧 e12b7cb 二进制已删除、不可回退**，会改变第一阶段基线，需要重新 register/mount 并重测。
+- **环境提醒**：target 当前跑 deleted 旧二进制，任何意外重启都会切到 9a413a44（e12b7cb 不可恢复）；node1 在 15:02 有第三方 root `cmake --build ... -j308`，做时延测量时需记录/避开。
 
 ---
 
