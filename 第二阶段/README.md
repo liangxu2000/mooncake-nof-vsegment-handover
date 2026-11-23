@@ -5,7 +5,7 @@
 - 目录约定：**第二阶段所有内容（文档、代码补丁、测量数据）统一放在 `第二阶段/` 目录下**；本文件为总文档/索引
 - 数据来源：`../HANDOVER.md` 各单回执 + 第一阶段最终报告 `../工作汇总.md`
 - 相关文件：`../HANDOVER.md`（任务通道）、`../工作汇总.md`（第一阶段最终报告）
-- **当前状态（2026-11-23）**：M0 已完成；复盘后发现两个更便宜的假设（旧构建/默认诊断），执行顺序已修正为 **S0（NOF-049 诊断开/关对照，已下发）→ S1 本机裸读 → S2 构建 tip → S3 插桩**；NOF-048（最小重建验证）推迟并入 S2。详见下方第 0 节。
+- **当前状态（2026-11-23）**：M0 已完成、NOF-048 最小重建已验证（65s/轮）；复盘后发现两个更便宜的假设（旧构建/默认诊断），执行顺序已修正为 **S0（NOF-049 诊断开/关对照，已下发）→ S1 本机裸读 → S2 构建 tip → S3 插桩**。详见下方第 0 节与「最小重建配方」。
 - 一句话：**数据/盘无罪、target 看到的命令与顺序也与 plain 完全相同，但 vseg 每条 128KiB 读在 target 的 bdev 执行段多花 ~210µs。第二阶段的目标就是把这 210µs 找出来并消掉。**
 
 ---
@@ -193,7 +193,19 @@ bench 的线程 buffer 由 `numa_alloc_onnode` 分配后 `client_->register_buff
 - 客户端 capsule/SGL 构造：`spdk-src/lib/nvme/nvme_urma.c:995-1056`；
 - Mooncake：`submitSpdkNofOperation` 在 `mooncake-src/mooncake-store/src/transfer_task.cpp:3047`，`ResolveBuffer` 在 `1080-1106`。
 
-**M0 下一步（NOF-048，M1a-0）**：只读取证 compile/link 命令，做一次**最小重建**（只重编一个未改文件 + 重链新 bench），验证构建路径；不跑 bench、不动 target/master。
+**最小重建已验证（NOF-048，2026-11-23）**：
+
+- 编译 `transfer_task.cpp` **61s**（rc=0）、链接 **4s**（rc=0）；新 bench 530,148,040B / md5 `43ba518d…`；`--help` 与原版仅差第 1 行程序名。
+- 配方（`D=/home/l00955908/mooncake-nof-vsegment/build`，`B=$D/mooncake-build-colleague`，`W=/tmp/nof048`）：
+  1. `cd $B/mooncake-store/src && bash $W/compile.sh`（取自 `compile_commands.json`，仅改输入/输出路径）；
+  2. `cp` 原 `libmooncake_store.a` 到副本 → `ar r` 用新 `transfer_task.cpp.o` 替换同名成员 → `ranlib`；
+  3. `cd $B/mooncake-store/benchmarks && bash $W/link.sh`（取自 `link.txt`，把 `../src/libmooncake_store.a` 换成副本、输出改名）。
+- **三个坑**：
+  1. 编译命令的 `-I` 全部指向**同事树** ⇒ 改 `transfer_task.cpp` 生效，但若改**头文件**，必须前置 `-I$D/mooncake-src/.../include`；
+  2. 链接仍用 `/usr/local/lib/libspdk_*.a`（静态）⇒ 客户端/`target` 插桩若需换 SPDK 实现，必须改用 `$D/spdk-build/lib` 的 `.a` 重链；
+  3. 新 bench 的 RPATH 指向同事 `mooncake-common/etcd` 构建目录 ⇒ 依赖同事树存在（如需独立，M1 一并改指副本）。
+
+**M0 之后的当前步骤 = 复盘后的 S0（NOF-049）**：诊断开/关对照（零构建），判定 210µs 是否来自默认诊断/客户端背压；NOF-048 的配方留给 S2/M1 的代码迭代。
 
 ### M1：插桩（只加日志，不改行为）
 

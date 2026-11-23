@@ -14,6 +14,7 @@
 - **第二阶段目标**：消除这 210µs，让 vseg 的 target bdev 接近 plain（~70–100µs）、端到端不劣于 plain；之后再谈 300µs 与多 target 结构性优势。
 - **计划与假设（H1–H4）、里程碑（M0–M4）、验收与回退**：见 `第二阶段/README.md`（第二阶段所有内容统一放在 `第二阶段/`）。
 - **M0（NOF-047）已完成**：复制并校验 Mooncake/SPDK 源码与 build（8.82GiB，md5 全 MATCH）。
+- **最小重建（NOF-048）已验证**：改一个 .cpp → 编译 61s → `ar r` 换库成员 → 重链 4s，产物 `--help` 正常；M1/S2 的代码迭代成本约 65s/轮。
 - **2026-11-23 复盘纠偏**：发现两处高价值线索——①构建基线 **be10be2 已落后远端 tip 4c0ea28**（含 `ff3e853` 诊断 opt-in/低时延默认、`13b7c19` 去重复校验等读路径修复）；②旧构建 `MC_HIFREQ_LOG_SAMPLE_RATE` **默认 1.0**，per-task 计时/breakdown 日志默认全开（tip 的提交明确说这会抬高读时延），而我们**从未测过"诊断全关"的 vseg**。
 - **修正后的顺序**：**S0 诊断开/关对照（NOF-049，零构建）** → S1 node3 本机裸 SPDK 定点读 → S2 构建 tip 4c0ea28 重测 → S3 仍无法解释才做代码插桩。详见 `第二阶段/README.md` 第 0 节（含源码证据与判据）。
 
@@ -129,7 +130,7 @@
 | NOF-045 | 已关闭 2026-11-23（**vseg 区数据无罪，慢在 vseg 路径**） | 裸 SPDK 顺序 QD1：A（vseg 区 1.6G）p50 **40.96**/W9 **91.57**；B（plain 区 3.2G）**41.28/91.28**；C（0.5G）**215.04/155.79**；D（0–0.5G）**212.48/153.92**；E（同 A 区随机）**220.16/188.90** ⇒ 高 LBA 的 vseg 数据裸读快（41µs）而 Mooncake-vseg 253µs ⇒ **慢在 vseg 路径（+~210µs）**；低 LBA [0,~1GiB) 盘本身慢；盘对顺序/随机极敏感（41 vs 220µs，vseg 253 正在"随机档"） |
 | NOF-046 | 已关闭 2026-11-23（**顺序假设证否**） | **q1 单 lane：rx/exec/submit 顺序逆序对全 0、位移 0、单 lcore、submit=exec 100%**，但 bdev 仍 **223–265µs**（plain 同 lcore 43–52）；q4 逆序 61/496 仅来自 4 lane×2 child 的 8 条顺序流交错，且 q4≈q1 ⇒ 顺序不是差异来源；bdev 随执行次序仅 +19–24%（三种读法一致，通用排队）⇒ **"盘看成随机档"解释不成立**，剩余只有 target bdev 提交侧参数（buffer/描述符/flags/stride）需代码插桩 |
 | NOF-047 | 已关闭 2026-11-23（第二阶段 M0） | 复制 8.82GiB（Mooncake 源/build、SPDK 源/build），HEAD/status/关键二进制与静态库 md5 全部 MATCH；配置：Release、USE_NOF/NOF_URMA/UB/ETCD=ON、SPDK 指 /usr/local（**纯静态 74 个 .a、0 .so**）；**正在跑的 target 是 deleted 旧二进制（736a902f），磁盘为 d6c39465**；补丁点：target `ctrlr_bdev.c:466-467`、client `nvme_urma.c:995-1056`、Mooncake `transfer_task.cpp:3047/1080-1106` |
-| NOF-048 | **推迟（未执行；改为 S2 构建准备）** | 复盘发现构建基线应为 tip 4c0ea28（含 `ff3e853` 诊断 opt-in/低时延默认等读路径修复），be10be2 已过时；最小重建验证保留，等 S0/S1 结果后与 tip 构建合并 |
+| NOF-048 | 已关闭 2026-11-23（**通过**；基线仍待升级） | 最小重建成功：编译 61s、链接 4s，新 bench 530,148,040B / md5 43ba518d…，`--help` 与原版仅差第 1 行程序名；配方 = 编译 `transfer_task.cpp` → 复制 `libmooncake_store.a` 并用 `ar r` 替换成员 → 按 link.txt 重链；无 `_deps`、`/home/yin` 全可读。**注意：编译 -I 指向同事树（改头文件需前置我们的 include）、SPDK 用 /usr/local 静态库（target 插桩需换 `$D/spdk-build/lib` 重链）、新 bench RPATH 依赖同事 common/etcd**。构建基线仍建议 S2 升级到 tip 4c0ea28 |
 | NOF-049 | 已下发（2026-11-23，第二阶段 S0） | 零构建对照：同环境同 key，vseg T1 读两臂（诊断开 vs **诊断全关**：`MC_HIFREQ_LOG_SAMPLE_RATE=0`/`VSEG_SLOW_IO_US=0`/`MC_NOF_SLOW_TRACE_THRESHOLD_US=0`/无 `VSEG_DIAGNOSTIC`），比较 target 读窗口 W9——判定 210µs 是否来自默认诊断/客户端背压 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
