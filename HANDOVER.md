@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-046（纯日志分析：target 侧到达/执行顺序 vs bdev，检验 vseg 流是否被盘视为"随机"）**
+- 当前任务：**无（NOF-046 已关闭 2026-11-23；等待用户决定：收口交付 / 客户端或 target 代码级插桩）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -118,7 +118,7 @@
 | NOF-043 | 已关闭 2026-11-23（**写 lane 排除**） | q1 串行写 400 新 key（自证 io_qpairs=1；Keys=800、logical_used 精确、写 W9 27.73µs）；读回三桶 bdev p50 **252 / 252 / 253µs**（慢窗口 / q4 写 / q1 写），慢占比 91.6/91.0/91.2% ⇒ **写侧 lane 交织不是主因**；六个维度全部排除，只剩 target/盘内部逐 IO 细节 |
 | NOF-044 | 已关闭 2026-11-23（**明细已有但退化，不重启**） | 现有 13,767 条 `URMA_BDEV_DETAIL`（8 计时字段），但 `submit_to_callback_us ≡ bdev_us`（全量）、其余子段≈0 ⇒ 拆不开 raid0/NVMe；无时间戳、trace_seq 每会话重置、LEGACY 只采 ≥40µs（plain 偏斜）；cmdline 仅 `-m [2-7] --wait-for-rpc`，重启需 RPC 重放 ⇒ 按 A4 不重启 |
 | NOF-045 | 已关闭 2026-11-23（**vseg 区数据无罪，慢在 vseg 路径**） | 裸 SPDK 顺序 QD1：A（vseg 区 1.6G）p50 **40.96**/W9 **91.57**；B（plain 区 3.2G）**41.28/91.28**；C（0.5G）**215.04/155.79**；D（0–0.5G）**212.48/153.92**；E（同 A 区随机）**220.16/188.90** ⇒ 高 LBA 的 vseg 数据裸读快（41µs）而 Mooncake-vseg 253µs ⇒ **慢在 vseg 路径（+~210µs）**；低 LBA [0,~1GiB) 盘本身慢；盘对顺序/随机极敏感（41 vs 220µs，vseg 253 正在"随机档"） |
-| NOF-046 | 已下发（2026-11-23） | 纯日志分析：用 `target_rx_tick`/`target_exec_tick` 重建 target 侧到达/执行顺序，检查 vseg（q4/q1）的 LBA 在 target 看来是否仍严格顺序、与 bdev_us 是否相关；对照 plain |
+| NOF-046 | 已关闭 2026-11-23（**顺序假设证否**） | **q1 单 lane：rx/exec/submit 顺序逆序对全 0、位移 0、单 lcore、submit=exec 100%**，但 bdev 仍 **223–265µs**（plain 同 lcore 43–52）；q4 逆序 61/496 仅来自 4 lane×2 child 的 8 条顺序流交错，且 q4≈q1 ⇒ 顺序不是差异来源；bdev 随执行次序仅 +19–24%（三种读法一致，通用排队）⇒ **"盘看成随机档"解释不成立**，剩余只有 target bdev 提交侧参数（buffer/描述符/flags/stride）需代码插桩 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
@@ -595,12 +595,21 @@
 - **preflight 偏差（重要）**：`urma_perf` 的 preflight 写在**每支的 `-l` 起始 LBA**（非固定 LBA0），已覆盖 keys **0 / 128 / 400 / 800** 各 128KiB ⇒ 这些 key 的 Mooncake verify 会失败；后续 Mooncake 测试需新集群/新 key。
 - 环境未变：target 341038 未重启、vseg master 2077841 在。
 
-### 决策点（2026-11-23，NOF-045 后更新）
+### NOF-046 关键事实（顺序假设证否；矛盾收窄到 bdev 提交侧，2026-11-23）
 
-- 数据/盘（高 LBA）无罪已证实；vseg 路径 +210µs 是主因；盘对顺序/随机极敏感，vseg 落"随机档"。
-- **开发侧决定**：先做**零成本 NOF-046**——用现有日志里的 `target_rx_tick` / `target_exec_tick` 重建 **target 侧到达/执行顺序**：
-  - 若 vseg 的 LBA 在 target 执行顺序上已非严格顺序（或与 bdev_us 相关）⇒ 盘把它看成随机，机制找到，方向是让 target 看到顺序流；
-  - 若 target 执行顺序严格顺序 ⇒ "随机档"解释不成立，需 QD/并发或更深层打点。
+- **target 侧顺序**：q1 单 lane（12,401 条）rx/exec/submit 逆序对全 **0**、LBA 位移 0、只用 lcore3、submit 与 exec **100% 一致**；plain 同样严格（0 逆序，p50；少量异常 key 不计）；q4 逆序 p50 61/496（12.3%）、最大位移 12–13，成因是 **4 lane × 2 child 的 8 条各自严格递增的流交错**（全局逆序仅 0.19%），不是乱序。
+- **q1 严格顺序仍慢**：q1 bdev **223–265µs** vs plain 同 lcore **43–52µs**（NOF-042 已证同核差异）⇒ **"盘把 vseg 看成随机档"的解释不成立**（q1 与 plain 的 target 顺序完全一致）。
+- **bdev 与执行次序**：每 key 内按执行次序 1–8/9–16/17–24/25–32，bdev 从 218/223 升到 271/265/52；三种读法相对增幅一致（+19–24%），属通用排队/缓存累积，不区分 vseg/plain。
+- **当前唯一未解矛盾**：target 侧看到的 vseg q1 流与 plain **完全相同**（顺序、IO 大小 128KiB、数量、盘区；该区裸 SPDK 顺序仅 41µs），但 bdev 执行时间 5×。剩余可疑面只有 **target bdev 提交时携带的其他参数**（数据 buffer/描述符、raid0 stride 对齐、submit flags、iobuf 类型）——现有遥测不含这些字段，需代码级插桩。
+- 环境未变：target 341038、vseg master 2077841；零环境操作。
+
+### 决策点（2026-11-23，NOF-046 后更新）
+
+- 已证否：IO 尺寸/数量、LBA 布局、写线程数、盘首慢区（仅低 LBA 部分）、qpair/lane、写侧 lane、提交顺序、target 到达/执行顺序、"盘看成随机档"、传输/客户端、测量伪影。
+- 剩余矛盾需要一个**当前遥测看不到的 target bdev 提交侧参数**才能解释。可选：
+  1. **收口交付**（推荐）：以"vseg 路径 +210µs、数据无罪、单 target 无读时延优势"更新最终报告，不再改代码；
+  2. **客户端代码插桩**：改 Mooncake vseg 提交路径，记录每 child 的客户端 buffer 地址/MR、target LBA、提交时刻与 lane（自建构建，天级）；
+  3. **target 代码插桩**：改 SPDK `lib/nvmf/urma.c`，记录 bdev 提交的 buffer/描述符/flags/stride（重编 target + 重启，需用户批准，天级）。
 - 其余备选（暂缓）：
 1. **按现状交付**：报告已按 NOF-035 更正；遗留一个明确开放问题（每命令 2.5× 的机制）。
 2. **重启 target 开逐 IO 明细**（需用户批准；target 重启后需重新 register/mount，盘上数据不丢；预计 1.5–2 h）：用 `TARGET_TRACE_ENTRIES>0` 采 `URMA_BDEV_DETAIL`，对比 plain/vseg 的逐条 exec 时间、到达顺序与尺寸分桶。
@@ -2770,7 +2779,9 @@ q1 写是否落盘（master Keys/logical_used + target 写 n）；三桶的 bdev
 
 ---
 
-# NOF-046（待执行 · 纯日志分析：target 侧到达/执行顺序 vs bdev · 2026-11-23）
+# NOF-046（已关闭 · 纯日志分析：target 侧到达/执行顺序 vs bdev · 2026-11-23）
+
+> 结果：q1 单 lane 的 target 侧顺序与 plain 完全一致（0 逆序/0 位移/100% submit=exec），bdev 仍 223–265µs ⇒ **"盘看成随机档"解释不成立**；顺序假设证否，矛盾收窄到 bdev 提交侧参数（需代码插桩）。详见"NOF-046 关键事实"。
 
 ## 背景与目的
 
