@@ -5,7 +5,7 @@
 - 目录约定：**第二阶段所有内容（文档、代码补丁、测量数据）统一放在 `第二阶段/` 目录下**；本文件为总文档/索引
 - 数据来源：`../HANDOVER.md` 各单回执 + 第一阶段最终报告 `../工作汇总.md`
 - 相关文件：`../HANDOVER.md`（任务通道）、`../工作汇总.md`（第一阶段最终报告）
-- **当前状态（2026-11-23）**：M1b 完成（公平对照 1.95×）；**M1c 完成（NOF-053）：客户端 QoS/调度排除；master 元数据 RPC ≈110µs/key 是两臂共有的大头；vseg 的 2× 在子 IO drain 段（350 vs 110µs）**。**下一步必须换 target 进程**（当前 target 是 deleted e12b7cb）才能拿 target 侧逐 IO 解释：待用户在 **A（自编带打点 bd5ee124d v4）** 与 **B（磁盘 9a413a44 v6 + 已有 v6 bench）** 之间批准；两者均不可回退 e12b7cb。详见下方第 0 节（0.6–0.9）、「最小重建配方」与 `patches/README.md`。
+- **当前状态（2026-11-23）**：M1b 完成（公平对照 1.95×）；M1c 完成（客户端 QoS/调度排除；master 元数据 RPC ≈110µs/key 共有；vseg 2× 在子 IO drain 段）。**用户已批准 A 路线**：自编**带打点的 bd5ee124d（v4）** target 并重启；**M2-0（NOF-054）先只读取证** target 源码上下文与构建/RPC 重启预案，之后写补丁、构建、重启、采集。**重启不可回退 e12b7cb**（当前 target 是 deleted 旧二进制）。详见下方第 0 节（0.6–0.9）、「最小重建配方」与 `patches/README.md`。
 - 一句话：**数据/盘无罪、target 看到的命令与顺序也与 plain 完全相同，但 vseg 每条 128KiB 读在 target 的 bdev 执行段多花 ~210µs。第二阶段的目标就是把这 210µs 找出来并消掉。**
 
 ---
@@ -56,7 +56,7 @@
 | **M1a-1** | 构建 e12b7cb 客户端 SPDK，重链插桩 bench，node3 本机重试 | **已完成 2026-11-23（NOF-051）** | e12b7cb 不可编（UMDK 缺 is_gpu_seg）；改用 **bd5ee124d（wire v4）** 成功；vseg 采到 1056 task，**domain 非空**，W9 258.55 |
 | **M1b** | 切换 plain，同客户端同插桩 bench，node3 本机采集对比 | **已完成 2026-11-23（NOF-052）** | domain 与 vseg 完全相同；plain W9 **132.77**（旧客户端 133.29，版本无关）；**公平差距 vseg 258.55 vs plain 132.77 = 1.95×/+125.8µs**；P50−W9 311/147µs ⇒ ≈147µs/task 客户端开销 |
 | **M1c** | 零环境解析客户端 breakdown 日志（NOF-053） | **已完成 2026-11-23** | 客户端 QoS/worker/dispatch 仅 3%；master 元数据 RPC 116µs/key（41%）两臂共有；vseg 2× 在 drain 350 vs 110µs ⇒ **客户端调度排除，转 target/传输** |
-| **M2-target** | 换 target 进程 + target 侧逐 IO 打点 | **待用户批准（A/B）** | A：自编 bd5ee124d(v4) 带打点 target；B：磁盘 9a413a44(v6) + 已有 v6 bench。均不可回退 e12b7cb |
+| **M2-target** | 换 target 进程 + target 侧逐 IO 打点 | **已选 A（用户批准 2026-11-23）** | M2-0（NOF-054）只读取证：`ctrlr_bdev.c` read 提交点、`urma.c` data buffer/SGL 与 DETAIL 打印、nvmf request 字段、构建配置与 RPC 重启/回退预案；随后写补丁→构建→重启→采集。**不可回退 e12b7cb** |
 | **M1c** | target 侧插桩（SGL/bdev 提交参数/分段 tick） | 需重编 target + 重启（用户批准） | 定位 210µs 在 raid0 队列/NVMe/回调哪一段 |
 
 - NOF-048（最小重建验证）已完成，配方已用于 M1a；构建基线是否升级 tip 视后续需要（S2 暂缓）。

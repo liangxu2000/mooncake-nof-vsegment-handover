@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**无（NOF-053 已关闭 2026-11-23；等待用户批准 target 重启路线：A 自编带打点的 bd5ee124d(v4) / B 磁盘 9a413a44(v6)）**
+- 当前任务：**NOF-054（第二阶段 M2-0：target 打点源码上下文取证 + 构建/重启预案；零环境变更）**
 
 ## 第二阶段（2026-11-23 起）
 
@@ -146,6 +146,7 @@
 | NOF-049 | 已关闭 2026-11-23（**诊断排除**） | 同环境同 key T1 两臂：ON W9 **258.85** / OFF **251.75µs（−2.7%）**、端到端 P50 504.11→494.56（−1.9%）；OFF 日志 167KB 且 `URMA_SLOW_IO`/`nof_slow_task`/`nof_vsegment_operation`/`transfer_data_breakdown` 全 0（env 生效）；两臂 exec 占比 96.2–96.3% ⇒ **默认诊断/客户端背压不是 210µs 来源**。注意绝对 P50 494–504 与 NOF-040 274 不一致（疑 slot env/集群变化），后续固定口径 |
 | NOF-051 | 已关闭 2026-11-23（**通过；版本对齐成功**） | e12b7cb 因系统 UMDK 缺 `is_gpu_seg` 编不过；改用**同 wire v4 的紧邻后继 bd5ee124d**（GPU 注册 opt-in）构建成功（5 min、74 libs）；重链 `bench-io-params-e12`（md5 88ad3134…）在 **node3 本机握手成功**。vseg 采到 SUBMIT/WORKER **1056/1056**（400+128 keys ×2 child）；**ptr 注册域命中 100%**（2 个 ptr，child1=+2MiB）；child seg_lba 差恒 4096 blocks；lane/worker 各 264 均匀；buf_type=kHost、device=-1、**domain 全为非空 0x143cd90**；target W9 **258.55µs**（exec 97.2%）、端到端 P50 569.78（node3 本机） |
 | NOF-052 | 已关闭 2026-11-23（**公平对照：1.95×；domain/客户端版本排除**） | plain 同新客户端（bd5ee124d）W9 **132.77µs**、旧客户端（59662a26）**133.29µs**（+0.4%）⇒ 客户端版本无影响；plain/vseg 的 domain **完全相同**（非空 0x143cd90）⇒ domain 排除；**vseg 258.55 vs plain 132.77 = +125.8µs（1.95×）**；task 数 1056/528、P50−W9 311/147µs（≈147µs/task 客户端开销）。历史 plain 46–68µs 在 slot=1 不可复现（slot=1024 口径），3.75× 的旧对照不可直接比 |
+| NOF-054 | 已下发（2026-11-23，M2-0） | 用户已批准 **A 路线**（自编带打点 bd5ee124d/v4 target）。本单只读取证：`ctrlr_bdev.c` read 提交点、`urma.c` data buffer/SGL 与 DETAIL 打印点、nvmf request 字段、构建配置与 RPC 重启/回退预案；不构建、不重启 |
 | NOF-053 | 已关闭 2026-11-23（**客户端分解；QoS 排除**） | 指定 `batch_get_*` 为 0（单 key Get 走 `get_into_breakdown`/`query_rpc_breakdown`/`transfer_data_breakdown`/`nof_slow_task`）。plain 每 key 283µs = **master 元数据 query 116µs（41%）** + submit 6 + wait 156（含 target W9 68，超出 88）+ 其他 5；**QoS/worker/dispatch 仅 8–11µs（~3%）**。vseg 2× **不是 setup/QoS**（query 103 vs 116 反而低），而是 **drain 350 vs 110µs、max_subio 362 vs 112（3.2×）**、submit 19 vs 6 ⇒ **客户端调度排除**，vseg 的 2× 在 target/传输 drain 段 |
 | NOF-050 | 已关闭 2026-11-23（**阻塞：SPDK 版本不兼容**） | 补丁/编译/链接成功（`bench-io-params` 530,162,656B / md5 fc2b5129…，strings 命中 3 条）；但新 bench 连 target 失败：客户端 SPDK **9a413a44** vs target 运行中 **e12b7cb**，握手 rc=-71/-104；同事原 bench（59662a26，匹配 e12b7cb）同 env/参数 rc=0、P50 473.52 / target W9 259.77。**口径修正**：该 P50 为 **node1 远端 reader**，与 NOF-040 本机 274 不可比（SLOT=1 未改变 P50）；target 现跑的是 **deleted 旧二进制 736a902f**，磁盘 d6c39465=9a413a44 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
@@ -3210,3 +3211,44 @@ plain 参数行数/domain/ptr 命中/child/lane/blocks；plain 的 target W9 与
 ## 回执必答（第一行）
 
 三类 breakdown 行数；vseg/plain 的各分项 p50（setup/submit/wait/QoS/worker）；**147µs/task 落在哪一段、vseg 为何约 2×**；有无缺失字段/失败。
+
+---
+
+# NOF-054（待执行 · 第二阶段 M2-0：target 打点源码上下文取证 + 构建/重启预案 · 零环境变更 · 2026-11-23）
+
+## 背景
+
+- 用户已批准 **A 路线**：自编**带打点的 bd5ee124d（wire v4）** target，重启后与现有 v4 客户端/参数配对，拿 target 侧逐 IO 解释。
+- 本单只做**只读取证**，为写 target 插桩补丁和构建/重启任务做准备；**不构建、不重启、不动 target/master**。
+
+## A. 源码上下文（`$D/spdk-e12b7cb-src`，bd5ee124d；每处 ≤20 行原文 + file:line）
+
+1. `lib/nvmf/ctrlr_bdev.c`：
+   - read 命令处理函数（含 `p99_read_enter_tick` 的位置）与 `spdk_bdev_read*` 提交调用点；
+   - 记录函数名、`req`/`nvme_cmd`（lba/nlb）访问方式、传给 bdev 的 data buffer/iov、`io_flags`、bdev 名；
+   - 若该调用点不在 ctrlr_bdev.c，给出实际 file:line 与函数。
+2. `lib/nvmf/urma.c`：
+   - capsule 解析后 data buffer/SGL 的存放位置（`req->data`/`iov`/`payload` 等实际字段名）；
+   - `URMA_BDEV_DETAIL` 打印点与可用变量（现有 stage ticks、qid/cid）。
+3. nvmf request 结构定义（`lib/nvmf/nvmf_internal.h` 或实际头）：`struct spdk_nvmf_request` 中 data buffer/SGL/长度相关字段（≤20 行）。
+4. 三处文件的 md5 与 HEAD（bd5ee124d）。
+
+## B. 构建与重启预案（只读取证）
+
+1. `$D/spdk-e12b7cb-src` 的 build 配置（`mk/config.mk`、configure 命令、URMA/DPDK 开关）；确认 `nvmf_tgt` 目标是否已构建（`build/bin/nvmf_tgt` 路径/md5，未构建则说明）。
+2. 增量构建命令建议（只编译 `nvmf_tgt` 及依赖）；预计时长未测可注明。
+3. RPC 启动序列：
+   - `/home/yin/Vsegment/vseg_scripts/run_vesegment_target.sh` 与 `target_nvme_takeover.sh` 的路径/md5；
+   - 当前 target 341038 的只读配置（subsystems/transports/listeners/bdevs/raid0/ns）摘要；
+   - 重启后需重放的步骤（与 NOF-016 相同的路径），包括停止顺序（我方 master → target）。
+4. 回退预案：磁盘 9a413a44（v6）`nvmf_tgt` d6c39465 + 已有 v6 bench `bench-io-params`；若 A 的 target 启动/握手失败，切 B 的步骤。
+5. 记录 node3 上是否还有第三方负载（构建/进程），以及 `/home` 空间。
+
+## C. 边界
+
+- **零环境变更**：不构建、不重启、不动 target/master；只读源码/脚本/RPC；不贴大段源码（每处 ≤20 行）。
+- 不改同事原树；不改 `$D/spdk-e12b7cb-src`。
+
+## 回执必答（第一行）
+
+三处源码的 file:line 与关键字段（lba/nlb、data buffer/SGL、DETAIL 变量）；nvmf_tgt 构建状态与增量构建建议；RPC 启动/重启/回退预案；有无阻碍。
