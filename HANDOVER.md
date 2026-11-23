@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-049（第二阶段 S0：诊断开/关对照，判定 210µs 是否来自默认诊断/背压；零构建）**
+- 当前任务：**NOF-050（第二阶段 M1a：客户端 NoF 参数插桩构建 + vseg 参数采集）**
 
 ## 第二阶段（2026-11-23 起）
 
@@ -16,7 +16,9 @@
 - **M0（NOF-047）已完成**：复制并校验 Mooncake/SPDK 源码与 build（8.82GiB，md5 全 MATCH）。
 - **最小重建（NOF-048）已验证**：改一个 .cpp → 编译 61s → `ar r` 换库成员 → 重链 4s，产物 `--help` 正常；M1/S2 的代码迭代成本约 65s/轮。
 - **2026-11-23 复盘纠偏**：发现两处高价值线索——①构建基线 **be10be2 已落后远端 tip 4c0ea28**（含 `ff3e853` 诊断 opt-in/低时延默认、`13b7c19` 去重复校验等读路径修复）；②旧构建 `MC_HIFREQ_LOG_SAMPLE_RATE` **默认 1.0**，per-task 计时/breakdown 日志默认全开（tip 的提交明确说这会抬高读时延），而我们**从未测过"诊断全关"的 vseg**。
-- **修正后的顺序**：**S0 诊断开/关对照（NOF-049，零构建）** → S1 node3 本机裸 SPDK 定点读 → S2 构建 tip 4c0ea28 重测 → S3 仍无法解释才做代码插桩。详见 `第二阶段/README.md` 第 0 节（含源码证据与判据）。
+- **S0 结果（NOF-049，已完成）**：诊断全关 W9 仅 **258.85→251.75µs（−2.7%）** ⇒ 默认诊断/客户端背压排除。
+- **S2 复核（2026-11-23）**：be10be2→4c0ea28 的 `transfer_task.cpp` 仅 40 行改动（诊断 gating/UB poll 默认），**NoF 读提交/QoS/分块未变**；其余为客户端/写路径 ⇒ 构建 tip 对 210µs 的预期收益低，暂缓。S1（本机裸读）降为可选参照（vseg/plain 对比都在本机，宿主混淆不改变结论）。
+- **当前进入 M1a（NOF-050）**：客户端 NoF 参数插桩（补丁在 `第二阶段/patches/nof050_client_io_params.patch`），65s 构建 + vseg 采集；随后 NOF-051 做 plain 对照；NOF-052 视结果做 target 侧插桩（需重启 target，另行批准）。详见 `第二阶段/README.md` 第 0 节与 `第二阶段/patches/README.md`。
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -131,7 +133,8 @@
 | NOF-046 | 已关闭 2026-11-23（**顺序假设证否**） | **q1 单 lane：rx/exec/submit 顺序逆序对全 0、位移 0、单 lcore、submit=exec 100%**，但 bdev 仍 **223–265µs**（plain 同 lcore 43–52）；q4 逆序 61/496 仅来自 4 lane×2 child 的 8 条顺序流交错，且 q4≈q1 ⇒ 顺序不是差异来源；bdev 随执行次序仅 +19–24%（三种读法一致，通用排队）⇒ **"盘看成随机档"解释不成立**，剩余只有 target bdev 提交侧参数（buffer/描述符/flags/stride）需代码插桩 |
 | NOF-047 | 已关闭 2026-11-23（第二阶段 M0） | 复制 8.82GiB（Mooncake 源/build、SPDK 源/build），HEAD/status/关键二进制与静态库 md5 全部 MATCH；配置：Release、USE_NOF/NOF_URMA/UB/ETCD=ON、SPDK 指 /usr/local（**纯静态 74 个 .a、0 .so**）；**正在跑的 target 是 deleted 旧二进制（736a902f），磁盘为 d6c39465**；补丁点：target `ctrlr_bdev.c:466-467`、client `nvme_urma.c:995-1056`、Mooncake `transfer_task.cpp:3047/1080-1106` |
 | NOF-048 | 已关闭 2026-11-23（**通过**；基线仍待升级） | 最小重建成功：编译 61s、链接 4s，新 bench 530,148,040B / md5 43ba518d…，`--help` 与原版仅差第 1 行程序名；配方 = 编译 `transfer_task.cpp` → 复制 `libmooncake_store.a` 并用 `ar r` 替换成员 → 按 link.txt 重链；无 `_deps`、`/home/yin` 全可读。**注意：编译 -I 指向同事树（改头文件需前置我们的 include）、SPDK 用 /usr/local 静态库（target 插桩需换 `$D/spdk-build/lib` 重链）、新 bench RPATH 依赖同事 common/etcd**。构建基线仍建议 S2 升级到 tip 4c0ea28 |
-| NOF-049 | 已下发（2026-11-23，第二阶段 S0） | 零构建对照：同环境同 key，vseg T1 读两臂（诊断开 vs **诊断全关**：`MC_HIFREQ_LOG_SAMPLE_RATE=0`/`VSEG_SLOW_IO_US=0`/`MC_NOF_SLOW_TRACE_THRESHOLD_US=0`/无 `VSEG_DIAGNOSTIC`），比较 target 读窗口 W9——判定 210µs 是否来自默认诊断/客户端背压 |
+| NOF-049 | 已关闭 2026-11-23（**诊断排除**） | 同环境同 key T1 两臂：ON W9 **258.85** / OFF **251.75µs（−2.7%）**、端到端 P50 504.11→494.56（−1.9%）；OFF 日志 167KB 且 `URMA_SLOW_IO`/`nof_slow_task`/`nof_vsegment_operation`/`transfer_data_breakdown` 全 0（env 生效）；两臂 exec 占比 96.2–96.3% ⇒ **默认诊断/客户端背压不是 210µs 来源**。注意绝对 P50 494–504 与 NOF-040 274 不一致（疑 slot env/集群变化），后续固定口径 |
+| NOF-050 | 已下发（2026-11-23，第二阶段 M1a） | 用 `第二阶段/patches/nof050_client_io_params.patch`（仅 transfer_task.cpp，+56 行，`MC_NOF_IO_PARAMS_LOG=1` 触发）构建 `bench-io-params`，跑一遍 vseg T1 读，采集每 task 的 ptr/seg_lba/blocks/child/lane/buf_type/domain 与 `[register_buffer]` 区间，检查 ptr 是否在注册域内 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
@@ -2980,3 +2983,56 @@ CMake 关键配置与源码/SPDK 基线；复制是否完成（路径/占用/校
 ## 回执必答（第一行）
 
 ON/OFF 两臂的 target W9、端到端 P50、日志大小与关键日志行数；**诊断全关是否显著降低 W9**；有无失败。
+
+---
+
+# NOF-050（待执行 · 第二阶段 M1a：客户端 NoF 参数插桩构建 + vseg 参数采集 · 2026-11-23）
+
+## 背景
+
+- NOF-049：诊断全关后 target W9 仍 251.75µs（−2.7%）⇒ 默认诊断/客户端背压**不是** 210µs 来源。
+- 复盘核对 tip diff：be10be2→4c0ea28 的 `transfer_task.cpp` 仅 40 行诊断/UB 默认改动，**NoF 读提交/QoS/分块未变** ⇒ 构建 tip 对 210µs 预期收益低，暂缓；直接做 M1a 客户端插桩。
+- 补丁 `第二阶段/patches/nof050_client_io_params.patch`（base be10be2，仅 `transfer_task.cpp`，+56 行，纯日志、默认关闭）：每 task 打印 `NOF_IO_PARAMS_SUBMIT`（ptr/seg_lba/blocks/bytes/child/vseg_op_id/endpoint）与 `NOF_IO_PARAMS_WORKER`（ptr/seg_lba/blocks/lane/worker/buf_type/buf_device/domain）。
+- 现有 `[register_buffer] ... base_addr=... size=...` 启动日志可用于核对 ptr 是否落在注册域内。
+
+## A. 预检（只读）
+
+1. vseg master 2077841、target 341038、4457、Keys=800；记录起点 W 快照。
+2. 确认 `$D=/home/l00955908/mooncake-nof-vsegment/build` 与 `/tmp/nof048` 的 compile.sh/link.sh 仍在；记录原 bench 与 `libmooncake_store.a` 的 md5（回退基线）。
+3. keys 0/128/400/800 已被 preflight 污染 ⇒ 本单 **verify=false**。
+
+## B. 应用补丁 + 构建 `$D/bench-io-params`（复用 NOF-048 配方）
+
+1. 备份 `$D/mooncake-src/mooncake-store/src/transfer_task.cpp`（cp + md5）。
+2. 应用补丁（从 handover 仓的 `第二阶段/patches/nof050_client_io_params.patch`）：
+   `cd $D/mooncake-src && patch -p1 < <handover>/第二阶段/patches/nof050_client_io_params.patch`（或 `git apply`）；记录 rc 与补丁后文件 md5。
+3. 编译：按 `/tmp/nof048/compile.sh`（确认其 `-c` 指向 `$D/mooncake-src/.../transfer_task.cpp`），输出 `/tmp/nof050/transfer_task.o`；记录耗时/rc。
+4. 换库成员：`cp` 原 `libmooncake_store.a` → `/tmp/nof050/libmooncake_store_io_params.a`；把新 .o 命名为 `transfer_task.cpp.o`，`ar r` + `ranlib`；记录 rc。
+5. 重链：复制 `/tmp/nof048/link.sh` 为 `/tmp/nof050/link.sh`，仅改两处——库路径 → `/tmp/nof050/libmooncake_store_io_params.a`，输出 → `$D/bench-io-params`；执行；记录 rc/耗时/md5。
+6. 验收：`strings $D/bench-io-params | grep -c "NOF_IO_PARAMS"`（应 ≥2）；`$D/bench-io-params --help`（gflags rc=1、206 行）。失败 → 报第一个错误（≤20 行）停手，不改其他源码。
+
+## C. vseg 参数采集（T1，1 遍，诊断全关 + 参数日志开）
+
+- env：`MC_NOF_IO_PARAMS_LOG=1`；**诊断全关**：`MC_HIFREQ_LOG_SAMPLE_RATE=0`、`MC_NOF_SLOW_TRACE_THRESHOLD_US=0`、`SPDK_URMA_STAGE_TRACE_US=0`、不设 `VSEG_DIAGNOSTIC`；**`MC_STORE_PARTITION_SLOT_COUNT=1`**（与 master slot=1 对齐，修正 NOF-049 的 494–504 vs 274 口径偏差）；其余 vsegment flags + `SPDK_URMA_DEV_NAME`/`SPDK_URMA_CAPSULE_TRANSPORT` 等必填 env 同 NOF-040。
+- reader：`--num_keys=400 --num_threads=1 --batch_size=1 --nof_qpairs_per_segment=4 --warmup_keys=128 --verify=false`；日志 `run/nof050_vseg_params.log`（预计 ~2MB）。
+- 记录：端到端 Min/Avg/P50/P90/P99/Max、failed；target W9（n/avg/exec%）；`NOF_IO_PARAMS_SUBMIT`/`NOF_IO_PARAMS_WORKER` 行数；`[register_buffer]` 行（base_addr/size）全部列出（应 1–2 条）。
+- 分析：
+  1. 前 20 条 SUBMIT 与 WORKER 样例（原样）；
+  2. **ptr 注册域命中率**：每个 task 的 `ptr` 是否 ∈ 某个 `[base_addr, base_addr+size)`；给出命中数/总数与未命中样例；
+  3. `child=0/2` 与 `1/2` 的 `seg_lba` 差（应为 4096 blocks = 2MiB）、lane 分布、`buf_type`/`buf_device`/`domain` 取值；
+  4. `NOF_IO_PARAMS_SUBMIT` 与 `WORKER` 的 task 数是否与 400 keys×2 child 吻合。
+
+## D. 回答
+
+- 客户端每个 child 的 ptr、seg_lba、lane、buffer 类型/domain、注册域命中情况；
+- 是否存在"ptr 不在注册域 / buffer 类型异常 / child 的 LBA 不连续"等可解释 210µs 的客户端侧异常；
+- 与 plain 的逐字段对比留给 NOF-051（本单不跑 plain）。
+
+## E. 边界
+
+- 只改我们的 `$D/mooncake-src`（仅补丁）；不动同事原树/原 bench/原库；构建只在我们目录/`/tmp`。
+- 不改 target/master；reader 只读；不写盘数据（verify=false）；失败停手；不跑 plain、不构建 tip。
+
+## 回执必答（第一行）
+
+补丁/编译/链接是否成功与新 bench md5；vseg 参数日志行数、前 20 条样例、ptr 注册域命中率、child/lane/buf_type/domain 统计；target W9；有无失败。

@@ -1,0 +1,56 @@
+diff --git a/mooncake-store/src/transfer_task.cpp b/mooncake-store/src/transfer_task.cpp
+index 6b4b495..3962521 100644
+--- a/mooncake-store/src/transfer_task.cpp
++++ b/mooncake-store/src/transfer_task.cpp
+@@ -75,6 +75,12 @@ static bool IsSpdkNofDebugEnabled() {
+     return enabled;
+ }
+ 
++static bool IsSpdkNofIoParamsLogEnabled() {
++    static const bool enabled =
++        IsTruthyEnv(std::getenv("MC_NOF_IO_PARAMS_LOG"));
++    return enabled;
++}
++
+ static int GetSpdkNofDebugIntervalMs() {
+     static const int interval_ms = []() {
+         const char* raw_value = std::getenv("MC_NOF_DEBUG_INTERVAL_MS");
+@@ -1103,6 +1109,20 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
+                         task->failed = true;
+                         task->remaining_lba = 0;
+                     }
++                    if (IsSpdkNofIoParamsLogEnabled()) {
++                        LOG(INFO) << "NOF_IO_PARAMS_WORKER op=" << task->op
++                                  << " ptr=" << task->ptr
++                                  << " seg_lba=" << task->lba
++                                  << " blocks=" << task->lba_count
++                                  << " lane=" << task->io_lane_index
++                                  << " worker=" << work_idx
++                                  << " buf_type="
++                                  << static_cast<int>(task->buffer_info.type)
++                                  << " buf_device="
++                                  << task->buffer_info.device_id
++                                  << " domain=" << static_cast<void*>(
++                                         task->buffer_info.domain);
++                    }
+                 }
+ #endif
+                 const bool lane_was_empty = nof_qos->head[task->op] == nullptr;
+@@ -3076,6 +3096,17 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
+ 
+     if (size / block_size > static_cast<size_t>(std::numeric_limits<int>::max()))
+         return std::nullopt;
++    if (IsSpdkNofIoParamsLogEnabled()) {
++        LOG(INFO) << "NOF_IO_PARAMS_SUBMIT op=" << static_cast<int>(op_code)
++                  << " ptr=" << ptr
++                  << " seg_lba=" << (handle.buffer_address_ / block_size)
++                  << " blocks=" << (size / block_size)
++                  << " bytes=" << size
++                  << " block_size=" << block_size
++                  << " child=" << child_index << "/" << child_count
++                  << " vseg_op_id=" << vsegment_op_id
++                  << " endpoint=" << handle.transport_endpoint_;
++    }
+     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+     const bool track_timing =
+         mooncake::logging::ShouldSampleHiFreqLog(trace_id) ||
