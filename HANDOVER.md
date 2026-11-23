@@ -5,8 +5,8 @@
 - 之后每轮：`cd mooncake-nof-vsegment-handover && git pull`
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
-- 最后更新：2026-11-20
-- 当前任务：**NOF-031（先只读探测共享环境 → 干净则继续 stripe=4MiB 实验；取代 NOF-030）**
+- 最后更新：2026-11-23
+- 当前任务：**NOF-032（vseg-1 全新集群 + 纯单线程顺序写：布局假设的干净对照）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -96,7 +96,8 @@
 | NOF-028 | 已关闭 2026-11-20（**写入受阻，读未测**） | slot=1 被接受（partitions=1、reconcile 0）；writer 16 线程 377/400，**23 个 VSEGMENT_CREATING**（每跨 64MiB 卷边界丢 1 key，不重试）；容量 24×64MiB=1.5GiB 不足 1.6GiB；reader 未跑 |
 | NOF-029 | 已关闭 2026-11-20（**布局假设否**） | vseg-1：T1 P50 543.0 vs plain 258.3（2.10×），W9 263.6–276.8（更高）；分区数 1/64/1024 的 T1 全在 537.5–543.0 窄带 ⇒ **布局无关**；差距在 vsegment 读路径（2MiB child×16×128KiB）。数据 400/400 verify 0 错 |
 | NOF-030 | **已被 NOF-031 取代（未执行；若你已在跑则继续，回执按 NOF-030 登记）** | vsegment stripe=4MiB（每 key 单 child）实验；内容并入 NOF-031 |
-| NOF-031 | 已下发 | 只读环境探测（node1 共享、node3 独占）+ 干净则执行 stripe=4MiB 实验（同 NOF-030 口径） |
+| NOF-031 | 已关闭 2026-11-23 | 环境可用（同事仅占 8086 python3、node1 load ~2.6%）；stripe=4MiB：T1 551.6 / 16t 705.4、W9 252.3/270.5 ⇒ **未追平 plain**；**target IO 数 n=25,762 与 2MiB 相同 ⇒ stripe 不改 IO 粒度**；且 plain 的 n 同为 25,762 ⇒ **plain 也是 128KiB IO，差距在每 IO 执行时间而非 IO 大小** |
+| NOF-032 | 已下发 | vseg-1 + **全新集群、纯 T1 顺序写 400 keys**（读序=物理序的干净对照）→ 若 W9 降到 ~97、T1 ~258 ⇒ 布局/分配顺序是主因；否则是 vsegment 路径开销 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
@@ -426,6 +427,14 @@
 - 推算（非实测）：vseg-1 T1 543 ≈ 控制 91 + target W9 271 + 客户端流水线 ~181µs；W9 一项比 plain 多 174µs（占差距 285µs 的 61%）。
 - 遗留缺陷：`VSEGMENT_CREATING` 在单线程重写时仍复现 2 次（卷创建窗口）；属 vsegment 侧机制问题。
 - 环境：vseg-1 master PID 2667366 运行中（partitions=1、vsegments=26、logical_used=1.6GiB）。
+
+### NOF-031 关键事实（stripe 证否 + 口径纠正，2026-11-23）
+
+- **环境探测（node1 共享 / node3 独占）**：我方 master 2667366 与 target 341038 均存活；50056/9006/4457 均归我方；我方 etcd 键完整；yin 键未变。新发现同事 z00926396 的 `python3 http_metadata_server.py --port 8086`（PID 1955247）及 `mooncake_cluster` 键、client 进程——**仅记录未触碰**；node1 load 8.06（≈2.6%），node3 load 14.85（≈4.8%）。判定可用。
+- **stripe=4MiB（NOF-030 内容）**：quota stripe_size=4194304 生效、1024 分区、reconcile 0；writer 400/0；读 T1 P50 **551.6**（550.1–557.9）、16t **705.4**（675.2–786.6，离散 111µs）；target W9 **252.3 / 270.5**；未追平 plain（T1 慢 2.14×；16t −1.9% 在噪声内）。
+- **关键机制发现**：stripe 2MiB 与 4MiB 的 target IO 总数**完全相同（n=25,762）** ⇒ stripe 只改 child 打包，不改实际 IO 粒度（仍 128KiB）。
+- **口径纠正（重要）**：plain NoF（NOF-025）的 target W9 同样 n=25,762 ⇒ **plain 也是 128KiB 小 IO，不是"4MiB 大 IO"**；差距是**每条 IO 的执行时间**（plain 96.9µs vs vsegment 252µs），不是 IO 大小/数量。此前"改代码放大 IO"的提案缺乏证据支持。
+- 由此：读路径的 IO 粒度不是"调大 chunk"能解决的（NOF-015 已证 env 无效）；且**布局假设此前被污染**——NOF-028/029 的 vseg-1 是 16 线程先写 377 key（分配顺序打乱），r2 单线程只重写已有 key，物理布局并非"读序=写序"。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -1766,7 +1775,7 @@ quota stripe_size 是否 4194304、partitions=1024、reconcile 0；writer 400/0�
 
 ---
 
-# NOF-031（待执行 · 共享环境探测 + stripe=4MiB 实验 · 2026-11-20）
+# NOF-031（已关闭 · 共享环境探测 + stripe=4MiB 实验 · 2026-11-20）
 
 > 本单**取代 NOF-030**。用户告知：**node1 现非独占**（另有同事在使用，但不跑测试）；**node3 由用户独占**。先探测环境，确认我方环境未被影响后再继续实验；若环境有变则停手回报。
 
@@ -1805,3 +1814,56 @@ quota stripe_size 是否 4194304、partitions=1024、reconcile 0；writer 400/0�
 ## 回执必答（第一行）
 
 环境是否干净（我方 master/target/键/端口状态；node1 是否有他人负载）；若干净：stripe-4MiB 的 T1/16t P50 与 target W9、是否追平 plain；若停手：原因与证据。
+
+---
+
+# NOF-032（待执行 · vseg-1 全新集群 + 纯单线程顺序写 · 2026-11-23）
+
+## 背景与假设（重要）
+
+- 此前的 vseg-1 布局假设**被污染**：NOF-028 的 377 个 key 由 **16 线程**写入（分配顺序被打乱），NOF-029 的单线程只重写了已有 key ⇒ "读序=写序"从未真正成立。
+- stripe 已证否（2/4MiB 的 target IO 数均为 25,762）；plain 也是 128KiB IO（n=25,762），差距是**每条 IO 的执行时间**（96.9 vs 252µs），不是 IO 大小。
+- 本单做**干净对照**：全新集群 + vseg-1 + **纯单线程顺序写** 400 keys（顺序分配、读序=写序）：
+  - 若 target W9 降到 ~97µs、T1 接近 258µs ⇒ **布局/分配顺序是主因**，vsegment 可通过控制分配顺序追平 plain；
+  - 若仍 ~250/537 ⇒ **vsegment 读路径自身开销**，只能改代码。
+
+## A. 预检（只读）
+
+- 按 NOF-031 口径快速复核：我方 master（当前 stripe-4/slot-1024，PID 1610536）、target 341038、50056/9006/4457、etcd 键；node1 同事进程只记录不动；node3 独占。
+- 任一异常 → 停手回报。
+
+## B. 切换 vseg-1（标准 stripe 2MiB）
+
+1. 停当前 master（按 PID）；清**仅我方**键。
+2. 启动 master：NOF-004/007 同参数 + **`MC_STORE_PARTITION_SLOT_COUNT=1`**；stripe 保持标准 2MiB。
+3. `nof_register` 同命令；等 quota ≥20s；验证 partitions=1、`reconcile_fail=0`、初始 logical_capacity=64MiB。
+
+## C. 纯单线程顺序写（关键）
+
+- writer：**`--num_threads=1 --batch_size=1`**，400 keys × 4MiB，vsegment flags 同 NOF-018；日志 `run/writer_vseg1_t1seq.log`。
+- 若出现 `VSEGMENT_CREATING` 失败（卷边界）：允许**原地再跑一次同样的 T1 writer** 补齐（总尝试 ≤2 次）；确认 400/0 或至少 `logical_used=1,677,721,600` 且 `committed_allocations=400`；记录失败 key 数与位置。
+- 记录 vsegments 数量（预期 ~26）。
+
+## D. 读（同口径）
+
+- T1 × 3 遍 + 16t × 3 遍（verify=true、诊断关；client slot env=1）。
+- 记录 Avg/P50/P90/P99/Max、failed/verify；target W 块按"下一次连接打印上一轮"对齐；`rpc_first_us` p50。
+
+## E. 对比与回答
+
+| 场景 | T1 P50 | 16t P50 | target W9（T1） |
+|---|---|---|---|
+| plain NoF | 258.3 | 718.7 | 96.9 |
+| VSegment-1（16 线程写，被污染） | 543.0 | 739.5 | 271.2 |
+| **VSegment-1（顺序写，本单）** | ? | ? | ? |
+
+- 明确回答：顺序分配后 **W9 是否降到 ~97µs？T1 是否接近 258µs？布局假设是否成立？**
+- 若仍 ~250/537：记录差值，结论转为 vsegment 路径自身开销（为后续代码改动提供依据）。
+
+## F. 边界
+
+- 只动我方 master/cluster；不动 target 配置；共享机规则同 NOF-031（同事进程只记录）；失败停手。
+
+## 回执必答（第一行）
+
+T1 顺序写结果（400/0 或 2 次尝试、logical_used、vsegments）；vseg-1 干净版 T1/16t P50 与 target W9；**布局假设是否成立**；有无失败。
