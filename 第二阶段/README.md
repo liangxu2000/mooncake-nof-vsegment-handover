@@ -5,7 +5,7 @@
 - 目录约定：**第二阶段所有内容（文档、代码补丁、测量数据）统一放在 `第二阶段/` 目录下**；本文件为总文档/索引
 - 数据来源：`../HANDOVER.md` 各单回执 + 第一阶段最终报告 `../工作汇总.md`
 - 相关文件：`../HANDOVER.md`（任务通道）、`../工作汇总.md`（第一阶段最终报告）
-- **当前状态（2026-11-23）**：M1b 完成（公平对照 1.95×）；M1c 完成（客户端 QoS/调度排除）；**M2-0（NOF-054）完成：A 路线无需补丁——已构建的 bd5ee124d `nvmf_tgt` 自带 `URMA_STAGE_BUFFER` 逐 IO 24 字段（lba/nlb/各段 tick/lcore/flags，进程退出落盘）**。**M2-1（NOF-055）已下发**：按用户批准的 A 路线重启 target 到 bd5ee124d 并开启 BUFFER；之后 NOF-056 用同一 v4 插桩 bench 依次跑 vseg/plain 并让 target 退出落盘。**重启不可回退 e12b7cb**。详见下方第 0 节、「最小重建配方」与 `patches/README.md`。
+- **当前状态（2026-11-23）**：M1b 完成（公平对照 1.95×）；M1c 完成（客户端 QoS/调度排除）；M2-0 完成（A 无需补丁，bd5ee124d 自带 BUFFER 打点）；**M2-1 完成（NOF-055）：target 已切到 bd5ee124d（PID 394826）+ BUFFER 模式，4457/RAID0/ns 正常，buffer 文件 0B 待退出落盘；盘序变为 BDF 升序（旧序不可恢复）**。**M2-2（NOF-056）已下发**：同一 v4 插桩 bench 依次跑 vseg/plain（开 `SPDK_URMA_STAGE_TRACE_US=1`），再优雅停 target 触发 24 字段落盘并解析 126µs 所在段；预检含 NUMA 审计。**重启不可回退 e12b7cb**。详见下方第 0 节、「最小重建配方」与 `patches/README.md`。
 - 一句话：**数据/盘无罪、target 看到的命令与顺序也与 plain 完全相同，但 vseg 每条 128KiB 读在 target 的 bdev 执行段多花 ~210µs。第二阶段的目标就是把这 210µs 找出来并消掉。**
 
 ---
@@ -57,8 +57,8 @@
 | **M1b** | 切换 plain，同客户端同插桩 bench，node3 本机采集对比 | **已完成 2026-11-23（NOF-052）** | domain 与 vseg 完全相同；plain W9 **132.77**（旧客户端 133.29，版本无关）；**公平差距 vseg 258.55 vs plain 132.77 = 1.95×/+125.8µs**；P50−W9 311/147µs ⇒ ≈147µs/task 客户端开销 |
 | **M1c** | 零环境解析客户端 breakdown 日志（NOF-053） | **已完成 2026-11-23** | 客户端 QoS/worker/dispatch 仅 3%；master 元数据 RPC 116µs/key（41%）两臂共有；vseg 2× 在 drain 350 vs 110µs ⇒ **客户端调度排除，转 target/传输** |
 | **M2-target** | 换 target 进程 + target 侧逐 IO 打点 | **A 已选；M2-0 完成** | **无需补丁**：bd5ee124d nvmf_tgt 自带 `URMA_STAGE_BUFFER`（24 字段：lba/nlb/hz/exec/enter/submit/submit_return/callback/wait/enomem/rx/buffer/bdev_cpl/data_post/data_cpl/rel0/lcore/flags），进程退出落盘 |
-| **M2-1** | 重启 target 到 bd5ee124d + BUFFER | **已下发（NOF-055）** | 停 master/target、备份日志、核对 11 盘 BDF、同一 RPC 序列启动、验收 4457/RAID0/ns/buffer 文件；不读不写。**不可回退 e12b7cb** |
-| **M2-2** | vseg/plain 两阶段采集 + target 退出落盘 + 解析 | 下一单（NOF-056） | 逐 IO 24 字段拆 enter→submit / submit→callback / callback→bdev_cpl，定位 1.95× 在哪一段 |
+| **M2-1** | 重启 target 到 bd5ee124d + BUFFER | **已完成 2026-11-23（NOF-055）** | target **394826**（bd5ee124d/md5 979f5517…），4457/RAID0(11 盘/BDF 升序/256K/online)/ns 正常；BUFFER 生效（`run/urma_stage_nof055.bin` 0B、O_EXCL、退出落盘）；旧日志备份 32,780,200B/d294d6ef…；**盘序 BDF 升序、旧序不可恢复 ⇒ 新旧数据不可按 LBA 对比** |
+| **M2-2** | vseg/plain 两阶段采集 + target 退出落盘 + 解析 | **已下发（NOF-056）** | 同一 v4 插桩 bench；两阶段开 `SPDK_URMA_STAGE_TRACE_US=1`；优雅停 target 触发 24 字段落盘；按 exec_tick 间隙分段，拆 enter→submit / **submit_return→callback（SSD）** / callback→bdev_cpl / data 段，定位 1.95×；含 NUMA 审计 |
 | **M1c** | target 侧插桩（SGL/bdev 提交参数/分段 tick） | 需重编 target + 重启（用户批准） | 定位 210µs 在 raid0 队列/NVMe/回调哪一段 |
 
 - NOF-048（最小重建验证）已完成，配方已用于 M1a；构建基线是否升级 tip 视后续需要（S2 暂缓）。
