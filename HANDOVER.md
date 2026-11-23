@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-051（第二阶段 M1a-1：构建 e12b7cb 客户端并重试参数采集；A 路线，不动 target）**
+- 当前任务：**NOF-052（第二阶段 M1b：plain 同客户端对照采集，判定 domain/客户端版本是否混淆）**
 
 ## 第二阶段（2026-11-23 起）
 
@@ -20,7 +20,9 @@
 - **S2 复核（2026-11-23）**：be10be2→4c0ea28 的 `transfer_task.cpp` 仅 40 行改动（诊断 gating/UB poll 默认），**NoF 读提交/QoS/分块未变**；其余为客户端/写路径 ⇒ 构建 tip 对 210µs 的预期收益低，暂缓。S1（本机裸读）降为可选参照（vseg/plain 对比都在本机，宿主混淆不改变结论）。
 - **M1a（NOF-050）已构建成功但被版本阻塞**：补丁/编译/链接全部成功（`bench-io-params` md5 fc2b5129…），但新 bench 的客户端 SPDK 是 **9a413a44**，运行中 target 是 **e12b7cb**，握手失败（rc=-71/-104）；同事原 bench（匹配 e12b7cb）同参数正常（P50 473.52 / W9 259.77，**reader 在 node1 远端**，与 NOF-040 本机 274 不可比）。
 - **关键事实**：target 现跑的是 **deleted 旧二进制 736a902f**；磁盘上的 `nvmf_tgt` = **d6c39465（9a413a44）**。任何 target 重启都会永久切到 9a413a44（旧 e12b7cb 二进制不可恢复）。
-- **开发侧决策（2026-11-23）：先走 A**——在我们副本里构建 **e12b7cb** 客户端 SPDK（与运行中 target 同源、wire 兼容），重链已插桩的 bench 后重试；**不动 target、保留第一阶段基线**。B（node1 `/usr/local`=6fae46095，第三版本）成功概率低，暂不试。**若干净 e12b7cb 客户端仍握手失败**（旧 target 可能带本地改动）→ 再向用户申请 C（重启 target 到磁盘 9a413a44；一步对齐但**不可回退**，且需重测基线）。
+- **A 路线已成功（NOF-051，2026-11-23）**：e12b7cb 本身因系统 UMDK 缺 `is_gpu_seg` 编不过；改用 **wire v4 的紧邻后继 bd5ee124d**（GPU 注册 opt-in）构建成功；重链的 `bench-io-params-e12` 在 **node3 本机握手成功**。**wire 谱系**：e12b7cb / bd5ee124d / 170cbb9 = **v4**；91763b015 / 9a413a44 = **v6**（握手失败的根因）。
+- **vseg 参数（NOF-051）**：SUBMIT/WORKER 1056/1056；ptr 注册域 100%；child seg_lba 差 4096 blocks；lane 4 路均匀；buf_type=kHost、device=-1、**domain 全非空**；target W9 258.55µs、端到端 P50 569.78（node3 本机）。
+- **下一步（NOF-052）**：用**同一个 bd5ee124d 客户端 + 同一插桩 bench** 跑 plain，比较 domain/params/target W9——若 plain 的 domain 不同或 W9 降到 ~46–70 ⇒ vseg 差异真实；若 plain 也 ~250 ⇒ 新客户端版本是混淆变量（历史 plain 46 是旧客户端）。
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -136,7 +138,8 @@
 | NOF-047 | 已关闭 2026-11-23（第二阶段 M0） | 复制 8.82GiB（Mooncake 源/build、SPDK 源/build），HEAD/status/关键二进制与静态库 md5 全部 MATCH；配置：Release、USE_NOF/NOF_URMA/UB/ETCD=ON、SPDK 指 /usr/local（**纯静态 74 个 .a、0 .so**）；**正在跑的 target 是 deleted 旧二进制（736a902f），磁盘为 d6c39465**；补丁点：target `ctrlr_bdev.c:466-467`、client `nvme_urma.c:995-1056`、Mooncake `transfer_task.cpp:3047/1080-1106` |
 | NOF-048 | 已关闭 2026-11-23（**通过**；基线仍待升级） | 最小重建成功：编译 61s、链接 4s，新 bench 530,148,040B / md5 43ba518d…，`--help` 与原版仅差第 1 行程序名；配方 = 编译 `transfer_task.cpp` → 复制 `libmooncake_store.a` 并用 `ar r` 替换成员 → 按 link.txt 重链；无 `_deps`、`/home/yin` 全可读。**注意：编译 -I 指向同事树（改头文件需前置我们的 include）、SPDK 用 /usr/local 静态库（target 插桩需换 `$D/spdk-build/lib` 重链）、新 bench RPATH 依赖同事 common/etcd**。构建基线仍建议 S2 升级到 tip 4c0ea28 |
 | NOF-049 | 已关闭 2026-11-23（**诊断排除**） | 同环境同 key T1 两臂：ON W9 **258.85** / OFF **251.75µs（−2.7%）**、端到端 P50 504.11→494.56（−1.9%）；OFF 日志 167KB 且 `URMA_SLOW_IO`/`nof_slow_task`/`nof_vsegment_operation`/`transfer_data_breakdown` 全 0（env 生效）；两臂 exec 占比 96.2–96.3% ⇒ **默认诊断/客户端背压不是 210µs 来源**。注意绝对 P50 494–504 与 NOF-040 274 不一致（疑 slot env/集群变化），后续固定口径 |
-| NOF-051 | 已下发（2026-11-23，M1a-1/A 路线） | 在 `$D/spdk-src` checkout **e12b7cb** 并构建到我们自己的 prefix；用 e12b7cb 静态库重链已插桩 bench（`bench-io-params-e12`）；在 **node3 本机**重试 vseg 参数采集；不动 target/master；若仍握手失败则停手等 C 的授权 |
+| NOF-051 | 已关闭 2026-11-23（**通过；版本对齐成功**） | e12b7cb 因系统 UMDK 缺 `is_gpu_seg` 编不过；改用**同 wire v4 的紧邻后继 bd5ee124d**（GPU 注册 opt-in）构建成功（5 min、74 libs）；重链 `bench-io-params-e12`（md5 88ad3134…）在 **node3 本机握手成功**。vseg 采到 SUBMIT/WORKER **1056/1056**（400+128 keys ×2 child）；**ptr 注册域命中 100%**（2 个 ptr，child1=+2MiB）；child seg_lba 差恒 4096 blocks；lane/worker 各 264 均匀；buf_type=kHost、device=-1、**domain 全为非空 0x143cd90**；target W9 **258.55µs**（exec 97.2%）、端到端 P50 569.78（node3 本机） |
+| NOF-052 | 已下发（2026-11-23，M1b） | 切 plain 环境，用**同一个 bd5ee124d 客户端 + 同一插桩 bench**在 node3 本机跑 plain T1 读；比较 domain/ptr/child/lane/params、target W9、端到端——判定 vseg 差异是否真实，以及"新客户端版本"是否混淆 plain 基线 |
 | NOF-050 | 已关闭 2026-11-23（**阻塞：SPDK 版本不兼容**） | 补丁/编译/链接成功（`bench-io-params` 530,162,656B / md5 fc2b5129…，strings 命中 3 条）；但新 bench 连 target 失败：客户端 SPDK **9a413a44** vs target 运行中 **e12b7cb**，握手 rc=-71/-104；同事原 bench（59662a26，匹配 e12b7cb）同 env/参数 rc=0、P50 473.52 / target W9 259.77。**口径修正**：该 P50 为 **node1 远端 reader**，与 NOF-040 本机 274 不可比（SLOT=1 未改变 P50）；target 现跑的是 **deleted 旧二进制 736a902f**，磁盘 d6c39465=9a413a44 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
@@ -3044,7 +3047,9 @@ ON/OFF 两臂的 target W9、端到端 P50、日志大小与关键日志行数�
 
 ---
 
-# NOF-051（待执行 · 第二阶段 M1a-1：构建 e12b7cb 客户端并重试参数采集 · 2026-11-23）
+# NOF-051（已关闭 · 通过：e12b7cb 不可编，bd5ee124d 同 wire v4 打通并采到参数 · 2026-11-23）
+
+> 结果：e12b7cb 因系统 UMDK 缺 `is_gpu_seg` 编不过；改用同 wire v4 的紧邻后继 **bd5ee124d** 构建成功；重链 bench 在 node3 本机握手成功；vseg 采到 SUBMIT/WORKER 1056/1056，ptr 注册域 100%，child seg_lba 差 4096 blocks，lane 均匀，**domain 全非空**；target W9 258.55µs。wire 谱系：e12b7cb/bd5ee124d/170cbb9=v4，91763b015/9a413a44=v6。详见"第二阶段"上方决策说明。
 
 ## 背景与决策
 
@@ -3087,3 +3092,57 @@ ON/OFF 两臂的 target W9、端到端 P50、日志大小与关键日志行数�
 ## 回执必答（第一行）
 
 e12b7cb 构建是否成功与新 bench md5/版本串；握手是否成功；参数日志行数/前 20 条样例/ptr 注册域命中率/child/lane/buf_type/domain 统计；target W9；reader 是否在 node3；有无失败。
+
+---
+
+# NOF-052（待执行 · 第二阶段 M1b：plain 同客户端对照采集 · 2026-11-23）
+
+## 背景与目的
+
+- NOF-051：用 **bd5ee124d（wire v4）** 客户端 + 插桩 bench，在 **node3 本机**采到 vseg 参数：SUBMIT/WORKER 1056/1056；ptr 注册域 100%；child seg_lba 差恒 4096 blocks；4 lane 均匀；buf_type=kHost、device=-1、**domain 全为非空 0x143cd90**；target W9 **258.55µs**、端到端 P50 569.78。
+- 还差 plain 的**同客户端**对照。必须回答两件事：
+  1. plain 的 WORKER 参数是否不同（尤其 **domain 是否非空**、child/seg_lba 形态）；
+  2. **plain 用同一个新客户端时 target W9 是否仍 ~46–70µs**——若 plain 也 ~250，说明"新客户端版本"是混淆变量（历史 plain 46 是旧客户端），vseg 差异需重新解读。
+
+## A. 切换 plain 环境（只动我方 master/cluster；target 不动）
+
+1. 记录 vseg 状态（master 2077841、Keys=800）；按 PID 停 master；删**仅我方**键 `/cvm/vseg_nofvseg/` + `/oplog/vseg_nofvseg/`。
+2. 启动 **plain master**（NOF-035 参数：无 vsegment auto-plan/exclusive，50056/9006，`SPDK_URMA_DEV_NAME=udmac0d1e2`/`VSEG_URMA_DEVICE=udmac0d1e2`）；确认 leader/serving、`enabled=0`、无 quota。
+3. `nof_register` 同命令；确认 `NVMe-oF SSD: 100 GB`。
+4. plain writer：16t/batch16、400 keys、verify=false；验收 master `Keys=400` / `logical_used=1,677,721,600`、target 写窗口 n≈12,802；记录写窗口 W9。
+
+## B. plain 读（同一 bd5ee124d 客户端 + 同一插桩 bench，node3 本机）
+
+- 二进制：`$D/bench-io-params-e12`（md5 88ad3134…，客户端 bd5ee124d）。
+- flags：plain（`--vsegment_nof_io=false --segment_write_vsegment=false --replica_num=0 --nof_replica_num=1`），`--num_keys=400 --num_threads=1 --batch_size=1 --nof_qpairs_per_segment=4 --warmup_keys=128 --verify=false`；诊断全关；`MC_NOF_IO_PARAMS_LOG=1`；`MC_STORE_PARTITION_SLOT_COUNT=1`（与 NOF-051 保持同 env）；必需 SPDK/URMA env。
+- 在 **node3 本机**运行；日志 `run/nof052_plain_params.log`。
+- 采集：`NOF_IO_PARAMS_SUBMIT/WORKER` 行数（预期 528 = 400+128）；前 20 条样例；`[register_buffer]` 区间；ptr 注册域命中率；`domain`/`buf_type`/`device` 取值；`blocks`（plain 4MiB task 应为 8192）、`child`（预期 0/0）、`vseg_op_id`；lane 分布；target W9（n/avg/exec%）；端到端 Min/Avg/P50/P90/P99/Max；failed。
+
+## C. 对比与判决（vs NOF-051 vseg）
+
+| 项 | vseg（NOF-051） | plain（本单） |
+|---|---|---|
+| SUBMIT/WORKER | 1056/1056 | ?（预期 528） |
+| blocks / child | 4096 / 0/2,1/2 | ?（预期 8192 / 0/0） |
+| ptr 注册域 | 100% | ? |
+| buf_type / device / **domain** | kHost / -1 / **非空 0x143cd90** | ? |
+| lane 分布 | 4 路均匀 | ? |
+| target W9 | 258.55µs | ? |
+| 端到端 P50 | 569.78µs | ? |
+| P50 − W9 | ~311µs | ? |
+
+- 明确回答：
+  1. **plain 的 domain 是否与 vseg 相同（都非空）或为空/不同？** 若不同 ⇒ 这是首个客户端侧差异，直接指向 target 数据路径；
+  2. **plain 用同一个新客户端时 target W9 是否仍 ~46–70µs？**
+     - 是 ⇒ vseg 差异真实，与客户端版本无关；继续沿 domain/child 差异查 target 侧；
+     - 否（plain 也 ~250）⇒ **新客户端 bd5ee124d 是混淆变量**；历史 plain 46 是旧客户端，需用旧客户端重测 plain 或重新解释 210µs；
+  3. plain 的 `P50 − W9` 是否也 ~311µs（客户端版本开销）还是 ~20–30µs（vseg 特有）？
+
+## D. 边界
+
+- 只动我方 master/cluster；**不动 target**；plain 写入覆盖 [0,1.6GiB)（允许）；verify=false；reader 只读。
+- 不重启 target；失败停手；不跑 vseg（已有 NOF-051）。
+
+## 回执必答（第一行）
+
+plain 参数行数/domain/ptr 命中/child/lane/blocks；plain 的 target W9 与端到端 P50；**domain 是否不同、plain W9 是否仍 ~46–70、P50−W9 是否 ~311**；有无失败。

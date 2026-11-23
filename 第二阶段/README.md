@@ -5,7 +5,7 @@
 - 目录约定：**第二阶段所有内容（文档、代码补丁、测量数据）统一放在 `第二阶段/` 目录下**；本文件为总文档/索引
 - 数据来源：`../HANDOVER.md` 各单回执 + 第一阶段最终报告 `../工作汇总.md`
 - 相关文件：`../HANDOVER.md`（任务通道）、`../工作汇总.md`（第一阶段最终报告）
-- **当前状态（2026-11-23）**：M0 已完成、NOF-048 最小重建已验证（65s/轮）；**S0 已完成（诊断排除）**；**S2（构建 tip）暂缓**（NoF 读提交未变）；M1a 插桩已构建成功（`bench-io-params` md5 fc2b5129…），但**被客户端/target SPDK 版本不兼容阻塞**（客户端 9a413a44 vs target e12b7cb）。已选 **A 路线（NOF-051：构建 e12b7cb 客户端，不动 target）**；失败再申请 C（重启 target）。详见下方第 0 节（含 0.6 阻塞说明）、「最小重建配方」与 `patches/README.md`。
+- **当前状态（2026-11-23）**：M0/NOF-048 已完成；S0 诊断排除；S2 暂缓；**M1a-1 已打通（NOF-051：e12b7cb 不可编，改用同 wire v4 的 bd5ee124d 客户端，node3 本机握手成功并采到 vseg 参数）**；当前进入 **M1b（NOF-052：plain 同客户端对照）**。关键待答：plain 的 domain 是否不同、plain 的 target W9 是否仍 ~46–70（若也 ~250，则新客户端版本是混淆变量）。详见下方第 0 节（0.6/0.7）、「最小重建配方」与 `patches/README.md`。
 - 一句话：**数据/盘无罪、target 看到的命令与顺序也与 plain 完全相同，但 vseg 每条 128KiB 读在 target 的 bdev 执行段多花 ~210µs。第二阶段的目标就是把这 210µs 找出来并消掉。**
 
 ---
@@ -53,8 +53,8 @@
 | **S1** | node3 本机裸 urma_perf 定点读同一区 | 可选参照，~10 min | vseg/plain 对比都在本机，宿主混淆不改变结论；暂缓 |
 | **S2** | 构建 tip 4c0ea28 重测 | **暂缓** | diff 复核：be10be2→4c0ea28 的 `transfer_task.cpp` 仅 40 行诊断/UB 默认改动，**NoF 读提交/QoS/分块未变** ⇒ 对 210µs 预期收益低 |
 | **M1a** | 客户端 NoF 参数插桩（`patches/nof050_client_io_params.patch`）+ vseg 采集 | 构建成功，**被版本阻塞**（NOF-050） | 新 bench（SPDK 9a413a44）与 target（e12b7cb）握手失败；同事原 bench 正常 |
-| **M1a-1** | 构建 e12b7cb 客户端 SPDK（A 路线），重链插桩 bench，node3 本机重试 | **进行中（NOF-051）** | 握手成功 → 采参数；仍失败 → 申请 C（重启 target，不可回退） |
-| **M1b** | 切换 plain，同口径采集与对比 | 下一单（NOF-051） | 找出客户端侧差异；若无差异 ⇒ target 插桩 |
+| **M1a-1** | 构建 e12b7cb 客户端 SPDK，重链插桩 bench，node3 本机重试 | **已完成 2026-11-23（NOF-051）** | e12b7cb 不可编（UMDK 缺 is_gpu_seg）；改用 **bd5ee124d（wire v4）** 成功；vseg 采到 1056 task，**domain 非空**，W9 258.55 |
+| **M1b** | 切换 plain，同客户端同插桩 bench，node3 本机采集对比 | **进行中（NOF-052）** | plain 的 domain/W9/P50−W9 是否与 vseg 不同；若 plain W9 也 ~250 ⇒ 客户端版本是混淆变量 |
 | **M1c** | target 侧插桩（SGL/bdev 提交参数/分段 tick） | 需重编 target + 重启（用户批准） | 定位 210µs 在 raid0 队列/NVMe/回调哪一段 |
 
 - NOF-048（最小重建验证）已完成，配方已用于 M1a；构建基线是否升级 tip 视后续需要（S2 暂缓）。
@@ -71,6 +71,17 @@
 - **环境提醒**：target 当前跑 deleted 旧二进制，任何意外重启都会切到 9a413a44（e12b7cb 不可恢复）；node1 在 15:02 有第三方 root `cmake --build ... -j308`，做时延测量时需记录/避开。
 
 ---
+
+### 0.7 NOF-051 结果（M1a-1 打通）与 M1b 待答（2026-11-23）
+
+- **wire 谱系（决定握手）**：`e12b7cb` / `bd5ee124d` / `170cbb9` = **WIRE v4**；`91763b015` / `9a413a44` = **WIRE v6**。运行中 target 是 v4；我们的第一个 bench 用了 v6 ⇒ 握手失败。NOF-050 根因坐实。
+- **构建**：`e12b7cb` 本身**不可编译**（系统 UMDK `umdk-urma-devel-26.06.0-B020` 缺 `is_gpu_seg`/`urma_register_seg_dmabuf`，属新 API）；改用其**紧邻后继 `bd5ee124d`**（"make GPU registration mechanisms opt-in"，wire 仍 v4）→ `./configure --with-urma` + `gmake -j64` 成功（约 5 min、74 个 `.a`）。
+- **握手**：重链后的 `bench-io-params-e12`（md5 `88ad3134…`）在 **node3 本机**成功连接 target，target 日志零新增 handshake 失败。
+- **vseg 参数（400 keys + 128 warmup，T1）**：SUBMIT/WORKER **1056/1056**（= 528 keys × 2 child）；`ptr` 注册域命中 **100%**（仅 2 个 ptr，child1 = +2 MiB）；child `seg_lba` 差恒 **4096 blocks = 2 MiB**；lane/worker 各 264，4 路均匀；`blocks` 全 4096（2 MiB）；`buf_type=kHost`、`buf_device=-1`、**`domain` 全为非空 `0x143cd90`**；`vseg_op_id` 全 0（该 build 未递增）。
+- **target W9**：258.55µs（n=16,902，exec 97.2%）；端到端 P50 569.78µs（node3 本机）⇒ 客户端侧开销约 311µs（**远高于历史 NOF-040 的 ~19µs**；与 bd5ee124d 客户端或同机竞争有关，未验证）。
+- **关键待答（NOF-052）**：
+  1. plain 用**同一个 bd5ee124d 客户端**时，WORKER 的 `domain` 是否与 vseg 相同（都非空）或为空/不同？
+  2. plain 的 target W9 是否仍 ~46–70µs？若也 ~250 ⇒ **新客户端版本是混淆变量**（历史 plain 46 来自旧客户端），210µs 的归因需重做；若 ~46–70 ⇒ vseg 差异真实，继续沿 domain/child 查 target 侧。
 
 ## 1. 与总目标的关系
 
