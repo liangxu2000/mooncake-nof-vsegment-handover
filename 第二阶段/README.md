@@ -119,6 +119,14 @@
   - **B**：直接用磁盘上的 **9a413a44（v6）** target + 已有 **v6 打点 bench**（`bench-io-params`）；无需 target 构建，但版本跳两代（wire v6、nvmf/urma.c +239 行），行为可能变化、需重测基线；重启前可先只读确认新版逐 IO 字段是否更丰富。
   - 两者都需重放 RPC 配置、重新 register/mount、重测 vseg/plain 基线，且**不可回退到 e12b7cb**。
 
+### 0.10 NUMA 审计（用户 2026-11-23 提问；**放到 NOF-056/后续任务，不改已开跑的 NOF-055**）
+
+- **已确定的固定项**：URMA 设备一直是 **udmac0d1e2**（UB controller0；target 与 client 都是；NOF-005 误用 udmac1d1e2 失败后已改回）；target reactors 固定 `-m [2-7]`；客户端 bench 的 `NR_SOCKETS=numa_num_configured_nodes()`、`bindToSocket(tid%NR_SOCKETS)`、`numa_alloc_onnode(..., t%NR_SOCKETS)` ⇒ **T1 的读线程绑 socket 0、buffer 在 node 0**；16t 时线程/buffer 轮转到 4 个节点。
+- **未审计/未控制**：①11 块 NVMe 的 BDF `numa_node`；②URMA 设备 `udmac0d1e2` 的 numa_node；③target 的 4640 个 hugepages（旧记录 4×1160）及 8GiB iobuf 实际落在哪些节点；④每条 IO 的 iobuf/数据 buffer 节点（2MiB vs 4MiB task 可能选中不同池/节点）；⑤客户端 buffer 与设备/盘的节点距离。
+- **为什么重要**：target 的 iobuf 需求（~8GiB）大于单节点 hugepages（~2.3GiB），**必然跨节点**；若 vseg（2MiB task）与 plain（4MiB task）的 iobuf 分配落在不同 NUMA 节点，或盘/设备跨节点，可能贡献 target W9 的 1.95×。这是**尚未排除的混淆变量**。
+- **审计清单（加入 NOF-056 的预检，只读）**：`lscpu`/`numactl -H`；11 BDF + 系统盘 2b 的 `numa_node`；`/sys/class/uburma/*/device/numa_node`；`/sys/devices/system/cpu/cpu{2..7}/node*`；每节点 hugepages total/free；reader 的 `Allocated ... NUMA-aware, N sockets` 行。
+- 若审计显示 vseg/plain 的 buffer/盘/设备节点不同，再设计受控 NUMA 实验（pin 核/内存/设备）；在此之前不把 1.95× 归因于 NUMA。
+
 ## 1. 与总目标的关系
 
 ### 1.1 原始目标（交接文档）
