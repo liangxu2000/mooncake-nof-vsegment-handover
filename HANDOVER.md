@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-054（第二阶段 M2-0：target 打点源码上下文取证 + 构建/重启预案；零环境变更）**
+- 当前任务：**NOF-055（第二阶段 M2-1：重启 target 到 bd5ee124d 并开启 BUFFER 逐 IO 落盘；按 A 路线获批）**
 
 ## 第二阶段（2026-11-23 起）
 
@@ -25,10 +25,9 @@
 - **NOF-052 结果（公平对照，2026-11-23）**：plain 新客户端 W9 **132.77µs** / 旧客户端 **133.29µs**（+0.4%）⇒ **客户端版本对 W9 无影响**；plain/vseg 的 domain **完全相同**（非空 0x143cd90）⇒ **domain 排除**；**vseg 258.55 vs plain 132.77 = +125.8µs（1.95×）**。历史 plain 46–68µs 是 **slot=1024** 口径，在 slot=1 下不可复现 ⇒ **旧的 3.75×/210µs 对照不再成立，公平差距是 1.95×/+126µs**。
 - **新发现**：两臂 `P50 − W9` = vseg **311µs** / plain **147µs**，≈**147µs/task 的客户端开销**（vseg 2 task/key、plain 1 ⇒ 2.11× vs 2.00×）；它放大了端到端差异（570 vs 280），但 target W9 的 1.95× 仍是数据面核心。
 - **NOF-053 客户端分解（2026-11-23）**：plain 每 key 283µs = **master 元数据 query 116µs（41%）** + submit 6 + wait 156（含 target W9 68，超出 88）+ 其他 5；**QoS/worker/dispatch 仅 8–11µs（~3%）**。vseg 的 2× **不是 setup/QoS**（query 103 vs 116 更低），而是 **drain 350 vs 110µs、max_subio 362 vs 112（3.2×）**、submit 19 vs 6 ⇒ **客户端调度排除**；vseg 2× 在 target/传输 drain 段。**master 元数据 RPC ~110µs/key 是两臂共有的固定大头**（与 vseg/plain 无关，是 plain 绝对时延的最大单项）。
-- **待用户批准：target 重启路线**（要拿 target 侧 1.95×/126µs 的逐 IO 解释，必须换 target 进程；当前 target 是 deleted e12b7cb，旧二进制不可恢复）：
-  - **A**：自编**带打点的 bd5ee124d（v4）** target，保持现有 v4 客户端/参数（行为最接近当前 target；需 target 侧代码插桩+构建+重启）；
-  - **B**：直接用磁盘上的 **9a413a44（v6）** target + 我们已有的 **v6 打点 bench**（`bench-io-params`）；无需 target 构建，但版本跳两代（wire v6、nvmf/urma.c +239 行），行为可能变化、需重测基线；可能自带更丰富的逐 IO 明细（重启前可先只读源码确认）。
-  - 两者都**不可回退到 e12b7cb**；均需重放 RPC 配置、重新 register/mount、重测 vseg/plain 基线。
+- **用户已批准 A 路线**（自编 bd5ee124d/v4 target）；**NOF-054 取证确认：A 无需写补丁**——已构建的 `$D/spdk-e12b7cb-src/build/bin/nvmf_tgt`（md5 979f5517…）自带全套 target 打点，尤其 **`URMA_STAGE_BUFFER` 逐 IO 24 字段**：`trace_seq qid cid lba nlb hz exec enter submit submit_return callback wait enomem rx buffer bdev_cpl data_post data_cpl rel0 lcore flags`；**进程退出时落盘**。BUFFER env：`SPDK_URMA_STAGE_TARGET_SINK=buffer` + `SPDK_URMA_STAGE_TARGET_PATH=<不存在文件>` + `SPDK_URMA_STAGE_TARGET_CAPACITY=200000`（默认 16.7M×192B≈3GiB）；客户端必须 `SPDK_URMA_STAGE_TRACE_US!=0` 才会请求 trace。
+- **重启预案（NOF-054 取证）**：停 plain master 2454260 → 停 target 341038（先备份 `/tmp/nvmf_tgt.log` 32.5MB 与 pid）→ 等 spdk.sock 消失 → 用 `TARGET_SPDK_ROOT=$D/spdk-e12b7cb-src` + `TARGET_DUMP_SEC=10` + BUFFER env 起 target；wrapper 实际路径 `/home/yin/Vsegment/run_vesegment_target.sh`（非 vseg_scripts/）。RAID0 `superblock=false` ⇒ 11 盘 BDF/顺序必须核对；nvme 名可能重排；node3 有第三方 `royi:mooncake_client`（109% CPU）与 load 14.4。回退 B = 磁盘 9a413a44（v6）nvmf_tgt + `bench-io-params`（需先把 `build.9a413a44` 改回 `build`）。
+- **下一步**：NOF-055 重启 target 到 bd5ee124d 并开启 BUFFER（不读不写）；NOF-056 用同一 v4 插桩 bench 依次跑 vseg/plain 读并让 target 退出落盘，解析逐 IO 24 字段（重点：enter→submit 队列、submit→callback bdev、callback→bdev_cpl 完成、lba/nlb/lcore）。
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -146,7 +145,8 @@
 | NOF-049 | 已关闭 2026-11-23（**诊断排除**） | 同环境同 key T1 两臂：ON W9 **258.85** / OFF **251.75µs（−2.7%）**、端到端 P50 504.11→494.56（−1.9%）；OFF 日志 167KB 且 `URMA_SLOW_IO`/`nof_slow_task`/`nof_vsegment_operation`/`transfer_data_breakdown` 全 0（env 生效）；两臂 exec 占比 96.2–96.3% ⇒ **默认诊断/客户端背压不是 210µs 来源**。注意绝对 P50 494–504 与 NOF-040 274 不一致（疑 slot env/集群变化），后续固定口径 |
 | NOF-051 | 已关闭 2026-11-23（**通过；版本对齐成功**） | e12b7cb 因系统 UMDK 缺 `is_gpu_seg` 编不过；改用**同 wire v4 的紧邻后继 bd5ee124d**（GPU 注册 opt-in）构建成功（5 min、74 libs）；重链 `bench-io-params-e12`（md5 88ad3134…）在 **node3 本机握手成功**。vseg 采到 SUBMIT/WORKER **1056/1056**（400+128 keys ×2 child）；**ptr 注册域命中 100%**（2 个 ptr，child1=+2MiB）；child seg_lba 差恒 4096 blocks；lane/worker 各 264 均匀；buf_type=kHost、device=-1、**domain 全为非空 0x143cd90**；target W9 **258.55µs**（exec 97.2%）、端到端 P50 569.78（node3 本机） |
 | NOF-052 | 已关闭 2026-11-23（**公平对照：1.95×；domain/客户端版本排除**） | plain 同新客户端（bd5ee124d）W9 **132.77µs**、旧客户端（59662a26）**133.29µs**（+0.4%）⇒ 客户端版本无影响；plain/vseg 的 domain **完全相同**（非空 0x143cd90）⇒ domain 排除；**vseg 258.55 vs plain 132.77 = +125.8µs（1.95×）**；task 数 1056/528、P50−W9 311/147µs（≈147µs/task 客户端开销）。历史 plain 46–68µs 在 slot=1 不可复现（slot=1024 口径），3.75× 的旧对照不可直接比 |
-| NOF-054 | 已下发（2026-11-23，M2-0） | 用户已批准 **A 路线**（自编带打点 bd5ee124d/v4 target）。本单只读取证：`ctrlr_bdev.c` read 提交点、`urma.c` data buffer/SGL 与 DETAIL 打印点、nvmf request 字段、构建配置与 RPC 重启/回退预案；不构建、不重启 |
+| NOF-054 | 已关闭 2026-11-23（**A 路线无需补丁**） | 已构建的 bd5ee124d `nvmf_tgt`（`$D/spdk-e12b7cb-src/build/bin/nvmf_tgt`，md5 979f5517…）**本身带全套 target 打点**：URMA_BDEV_DETAIL 6 段 + **URMA_STAGE_BUFFER 逐 IO 24 字段**（lat/nlb/各段 tick/lcore/flags）+ W1–W10；无需写补丁。读提交点 `ctrlr_bdev.c:449/493`（`req->iov/iovcnt`、cdw10/11+cdw12）；BUFFER env：`SINK=buffer`+`PATH`(O_EXCL)+`CAPACITY=200000`（默认 3GiB 内存），**进程退出时落盘**；客户端须 `SPDK_URMA_STAGE_TRACE_US!=0`。重启预案/回退 B（9a413a44 v6）已取证；wrapper 实际在 `/home/yin/Vsegment/run_vesegment_target.sh` |
+| NOF-055 | 已下发（2026-11-23，M2-1） | 按 A 路线重启 target 到 bd5ee124d，开启 `URMA_STAGE_BUFFER`（SINK=buffer、PATH、CAPACITY=200000、DUMP_SEC=10）；停 plain master 2454260、停 target 341038（备份日志/pid）、核对 11 盘 BDF 顺序、启动并验收 4457/RAID0/ns/buffer 文件；**不跑读、不写数据** |
 | NOF-053 | 已关闭 2026-11-23（**客户端分解；QoS 排除**） | 指定 `batch_get_*` 为 0（单 key Get 走 `get_into_breakdown`/`query_rpc_breakdown`/`transfer_data_breakdown`/`nof_slow_task`）。plain 每 key 283µs = **master 元数据 query 116µs（41%）** + submit 6 + wait 156（含 target W9 68，超出 88）+ 其他 5；**QoS/worker/dispatch 仅 8–11µs（~3%）**。vseg 2× **不是 setup/QoS**（query 103 vs 116 反而低），而是 **drain 350 vs 110µs、max_subio 362 vs 112（3.2×）**、submit 19 vs 6 ⇒ **客户端调度排除**，vseg 的 2× 在 target/传输 drain 段 |
 | NOF-050 | 已关闭 2026-11-23（**阻塞：SPDK 版本不兼容**） | 补丁/编译/链接成功（`bench-io-params` 530,162,656B / md5 fc2b5129…，strings 命中 3 条）；但新 bench 连 target 失败：客户端 SPDK **9a413a44** vs target 运行中 **e12b7cb**，握手 rc=-71/-104；同事原 bench（59662a26，匹配 e12b7cb）同 env/参数 rc=0、P50 473.52 / target W9 259.77。**口径修正**：该 P50 为 **node1 远端 reader**，与 NOF-040 本机 274 不可比（SLOT=1 未改变 P50）；target 现跑的是 **deleted 旧二进制 736a902f**，磁盘 d6c39465=9a413a44 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
@@ -3214,7 +3214,9 @@ plain 参数行数/domain/ptr 命中/child/lane/blocks；plain 的 target W9 与
 
 ---
 
-# NOF-054（待执行 · 第二阶段 M2-0：target 打点源码上下文取证 + 构建/重启预案 · 零环境变更 · 2026-11-23）
+# NOF-054（已关闭 · **A 路线无需补丁**：bd5ee124d nvmf_tgt 自带全套打点 · 2026-11-23）
+
+> 结果：已构建的 bd5ee124d `nvmf_tgt`（md5 979f5517…）已含 `URMA_BDEV_DETAIL` 6 段 + **`URMA_STAGE_BUFFER` 逐 IO 24 字段**（lba/nlb/各段 tick/lcore/flags）+ W1–W10；无需写 target 补丁。BUFFER 在**进程退出时落盘**，客户端须 `SPDK_URMA_STAGE_TRACE_US!=0`。重启/RPC/回退预案已取证（wrapper 实际在 `/home/yin/Vsegment/run_vesegment_target.sh`）。详见"第二阶段"上方决策说明。
 
 ## 背景
 
@@ -3252,3 +3254,52 @@ plain 参数行数/domain/ptr 命中/child/lane/blocks；plain 的 target W9 与
 ## 回执必答（第一行）
 
 三处源码的 file:line 与关键字段（lba/nlb、data buffer/SGL、DETAIL 变量）；nvmf_tgt 构建状态与增量构建建议；RPC 启动/重启/回退预案；有无阻碍。
+
+---
+
+# NOF-055（待执行 · 第二阶段 M2-1：重启 target 到 bd5ee124d + 开启 BUFFER 逐 IO 落盘 · 2026-11-23）
+
+## 背景与授权
+
+- 用户已批准 **A 路线**（target 重启）；NOF-054 确认**无需补丁**：已构建的 bd5ee124d `nvmf_tgt` 自带 `URMA_STAGE_BUFFER` 逐 IO 24 字段打点（lba/nlb/各段 tick/lcore/flags），**进程退出时落盘**。
+- 本单只做**重启与验收**：停 plain master、停旧 target、按同一 RPC 序列启动我们的 bd5ee124d target（BUFFER 模式）；**不跑读、不写数据**，target 保持运行供 NOF-056 采集。
+- **target 重启后不可回退 e12b7cb**（旧二进制已删除）；回退 B（磁盘 9a413a44/v6 + `bench-io-params`）预案已取证。
+
+## A. 预检与备份（只读）
+
+1. 记录当前：plain master **PID 2454260**（leader/serving、Keys=400）；target **341038**（`/var/tmp/nvmf_tgt.pid`）、4457、`/tmp/nvmf_tgt.log` 32.5MB、`/var/tmp/spdk.sock`；hugepages Total/Free；node3 load 与第三方进程（`royi:mooncake_client` 等）**只记录**。
+2. 备份：`/tmp/nvmf_tgt.log` → `run/nvmf_tgt_e12b7cb_<ts>.log`（记录 md5/字节）；`/var/tmp/nvmf_tgt.pid` → `run/`；记录 target cmdline/env（只读）。
+3. 核对 11 块盘 BDF：`0000:21:00.0, 22:00.0, 28:00.0, 29:00.0, 2a:00.0, 91:00.0, 92:00.0, a1:00.0, a2:00.0, a3:00.0, a4:00.0`；每盘 15,002,931,712 B；系统盘 `0000:2b:00.0` **禁碰**。
+
+## B. 停服（顺序敏感）
+
+1. 停 plain master（node1，PID 2454260，`kill -TERM`）；确认退出。
+2. 停 target（PID 341038，`kill -TERM`；等退出；30s 不退先记录再升级信号）；确认 4457/spdk.sock 释放、vfio 盘已 restore 为 nvme（takeover 的 restore 步骤）。
+3. **核对重启候选盘**：11 个 BDF 与容量一致、系统盘保护生效；nvme 名可能重排，**以 BDF 为准**；盘数/BDF 不符 → 停手回报，不强起。
+
+## C. 启动我们的 bd5ee124d target（BUFFER 模式）
+
+1. 目标：`TARGET_SPDK_ROOT=$D/spdk-e12b7cb-src`（`build/bin/nvmf_tgt` md5 **979f5517…**）+ wrapper `/home/yin/Vsegment/run_vesegment_target.sh`（md5 9eea126e…）+ `TARGET_DUMP_SEC=10`。
+2. **BUFFER env**：
+   - `SPDK_URMA_STAGE_TARGET_SINK=buffer`
+   - `SPDK_URMA_STAGE_TARGET_PATH=/home/l00955908/mooncake-nof-vsegment/run/urma_stage_<tag>.bin`（**必须不存在**，O_EXCL）
+   - `SPDK_URMA_STAGE_TARGET_CAPACITY=200000`
+   - 注意 wrapper 在 `TARGET_TRACE_ENTRIES>0` 时会强制 `SPDK_URMA_STAGE_TARGET_SINK=quiet`：保持 `TARGET_TRACE_ENTRIES=0` 或绕过该行；**以实际 env 为准并记录**。
+3. 同一 RPC 序列（NOF-054）：iobuf → framework_start_init → `bdev_nvme_attach_controller` ×11（按 BDF/顺序）→ `nvmf_create_transport`（URMA、udmac0d1e2、max_io 8MiB 等）→ `nvmf_create_subsystem`（NQN）→ `bdev_raid_create -r raid0 -z 256` → `nvmf_subsystem_add_ns` → `nvmf_subsystem_add_listener -t URMA -f IPv4 -a 192.168.84.149 -s 4457`。
+4. 验收（缺一停手/按回退 B）：
+   - 4457 LISTEN；subsystem/NQN、nsid1→URMA_RAID0、listener 正确；
+   - `nvmf_get_transports`：URMA/udmac0d1e2/capsule urma；
+   - target 版本串 bd5ee124d、启动日志含 target timing/URMA_STAGE 相关行；
+   - **BUFFER 文件已创建**（路径/大小；O_EXCL）；
+   - raid0 online、11 base bdev、hugepages 余量。
+5. **停手**：不启动 master、不 register、不跑 bench、不写盘业务数据；target 保持运行（BUFFER 模式）供 NOF-056 使用。
+
+## D. 边界
+
+- target 重启已获用户批准（A）；**不可回退 e12b7cb**；回退 B（9a413a44/v6 + `bench-io-params`）步骤已记录（需先把 `$D/spdk-src/build.9a413a44` 改回 `build`）。
+- 不动 node1 同事进程；node3 第三方进程只记录；失败停手。
+- 不跑任何读；不写盘业务数据。
+
+## 回执必答（第一行）
+
+target 是否成功切到 bd5ee124d（PID/版本/md5）；4457/RAID0/ns/transport 是否正常；BUFFER 文件路径/大小/容量；旧日志备份与 pid；盘/BDF 核对；有无失败。
