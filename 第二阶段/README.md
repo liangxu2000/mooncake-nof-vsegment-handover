@@ -5,7 +5,7 @@
 - 目录约定：**第二阶段所有内容（文档、代码补丁、测量数据）统一放在 `第二阶段/` 目录下**；本文件为总文档/索引
 - 数据来源：`../HANDOVER.md` 各单回执 + 第一阶段最终报告 `../工作汇总.md`
 - 相关文件：`../HANDOVER.md`（任务通道）、`../工作汇总.md`（第一阶段最终报告）
-- **当前状态（2026-11-23）**：M2 完成；M3-0（NOF-060）证明**两臂 NoF 提交层完全同构**（同一 `submitSpdkNofOperation`、同参数、128KiB chunk、8MiB/lane、task 内 32 IO 同 qpair；唯一实测差异是 2MiB-child 时代的突发 16 vs 32）。**NOF-061 已下发（M3-1，零构建、target 不重启）**：新建 vseg 集群用**新 cluster_id `vseg_nof061`**，写 400 keys 后 vseg 读（逐 128KiB trace）；然后**不重写**，用旧 `vseg_nofvseg` 的 plain 元数据读**同一批 LBA 上的 vseg 数据** ⇒ 同一数据、两读路径的决定性隔离；同时取 vseg4 突发长度与 task 级 drain/fifo/credit。**重启不可回退 e12b7cb**。详见第 0 节（0.10–0.15）、「最小重建配方」与 `patches/README.md`。
+- **当前状态（2026-11-23）**：M2 完成；M3-0（NOF-060）证明**两臂 NoF 提交层完全同构**；**M3-1（NOF-061）已判决：同一份数据、同一 LBA、同一 disk/lcore/命令，plain bdev 57µs vs vseg 249µs（同 LBA 配对 4.64×）⇒ 差异在 vseg 读路径/会话，数据二次无罪**；且 vseg4 突发 = 31（4MiB）与 plain 相同 ⇒ NOF-060 的 16 vs 32 不复存在。**NOF-062 已下发（M3-2，零构建、target 不重启）**：同一份数据上 vseg/plain 各跑 T1/T4/T16 三档 trace 读取并发曲线（判 gap 收敛/恒定/单向追平），并把 NOF-061 日志 16 字段全段分解 + target 读路径源码取证（buffer 归属、每会话状态），给 M3-3 唯一插桩点。**重启不可回退 e12b7cb**。详见第 0 节（0.10–0.15）、「最小重建配方」与 `patches/README.md`。
 - 一句话：**数据/盘无罪、target 看到的命令与顺序也与 plain 完全相同，但 vseg 每条 128KiB 读在 target 的 bdev 执行段多花 ~210µs。第二阶段的目标就是把这 210µs 找出来并消掉。**
 
 ---
@@ -62,7 +62,7 @@
 | **M2-3** | 离线判别"快/慢 IO 的局部条件"（零环境） | **已完成 2026-11-23（NOF-058）** | **并发排除**（ov=0：vseg 206 vs plain 39，ov 分布同为 34.4%）；**局部 LBA 顺序排除**（紧接/busy=False 仍 5×）；plain 慢 IO 全部是盘首 keys 0–97，快 IO 全在 keys≥98；same-LBA 5.07× 但受写轮次混杂 ⇒ 剩"数据状态 vs 读路径" |
 | **M2-4** | 单轮写入下：stripe=4MiB 单 child 验证 + 同数据裸 SPDK 判别 | **已完成 2026-11-23（NOF-059）** | **单 child 属实**（读 528 SUBMIT/8192/child=0/1）但 **未追平**（P50 547.92 vs 268.44，2.04×）⇒ child 数无关；**同一数据裸读顺序 40.0 vs 40.8µs、随机 220.16 vs 220.16** ⇒ **数据物理状态无罪**；差异锁定在 vseg 客户端驱动 4MiB NoF 操作的方式 |
 | **M3-0** | 客户端 NoF 提交层取证（零环境） | **已完成 2026-11-23（NOF-060）** | **两臂完全同构**：params 除 child 外全同（op/blocks=8192/bytes=4MiB/block_size=512/endpoint/lane/domain/ptr 对齐）；源码 `transfer_task.cpp:3076` 同一函数同参数、128KiB chunk、8MiB/lane、task 内 32 IO 同 qpair；child 仅日志标签。URMA_SLOW_IO 有绝对 tick；唯一实测差异=突发 16 vs 32（2MiB-child 时代），vseg4 未获取 |
-| **M3-1** | 同一数据两读路径 + 逐 128KiB 时钟（零构建、target 不重启） | **NOF-061 已下发** | 新 cid `vseg_nof061` 写 400 keys → vseg 读（trace）→ 不重写、用旧 `vseg_nofvseg` plain 元数据读同一批 LBA 的 vseg 数据（trace）⇒ plain 快则为 vseg 读路径/会话，plain 慢则为数据-路径交互；同时取 vseg4 突发长度与 task 级 drain/fifo/credit |
+| **M3-1** | 同一数据两读路径 + 逐 128KiB 时钟（零构建、target 不重启） | **已完成 2026-11-23（NOF-061）** | 写 LBA 集合与 plain 逐值相同；零写入用 plain 元数据读同一批 LBA：**plain P50 308.37 / bdev 57µs** vs **vseg P50 573.03 / bdev 249µs**；同 LBA 配对 12,324 条 **246 vs 53（4.64×）**，plain 更快 85.1% ⇒ **差异在 vseg 读路径/会话**。vseg4 突发 31（4MiB）与 plain 相同；新增排除：突发形态、target lcore（同核仍 4.3×）、顺序/预热 |
 | **M1c** | target 侧插桩（SGL/bdev 提交参数/分段 tick） | 需重编 target + 重启（用户批准） | 定位 210µs 在 raid0 队列/NVMe/回调哪一段 |
 
 - NOF-048（最小重建验证）已完成，配方已用于 M1a；构建基线是否升级 tip 视后续需要（S2 暂缓）。
@@ -310,7 +310,8 @@ target 重启 **PID 708167**（bd5ee124d / md5 979f5517…，**无 BUFFER**，�
 | 数据物理状态（写者/写轮次） | NOF-059 | **排除**：同一数据裸读顺序 40.0 vs 40.8µs、随机 220.16 vs 220.16、W9 86.3 vs 79.6 |
 | child 数 | NOF-059 | **排除**：stripe=4MiB 单 child 已验证（528/8192/child=0/1），P50 仍 2.04× |
 | 客户端 NoF 提交层（函数/参数/chunk/lane/qpair） | NOF-060 | **排除（完全同构）**：同一 `submitSpdkNofOperation`、同参数、128KiB、8MiB/lane、32 IO 同 qpair；child 仅日志标签 |
-| vseg 元数据/会话层（vseg master 解析、endpoint/segment、target 会话资源） | NOF-061 | **待查**：同一份 vseg 数据用 plain 读路径再读（不重写）——plain 快 ⇒ 本行；plain 慢 ⇒ 数据-读路径交互 |
+| vseg 元数据/会话层（vseg master 解析、endpoint/segment、target 会话资源） | NOF-061 | **已定案为本行**：同一份 vseg 数据用 plain 路径读 bdev 57µs vs vseg 249µs；同 LBA 配对 4.64× |
+| 会话/qpair 身份的**作用机制**（完成检测/唤醒 vs 每命令固有 vs 恒定排队） | NOF-062 | **待查**：同一数据上 T1/T4/T16 并发曲线 + 16 字段全段分解 + target 读路径源码取证 |
 | 测量伪影 | NOF-035 | plain 96.9→99.14 可复现 |
 | 传输/客户端 | NOF-041 | data/outside 反而更小 |
 | 连接预热 | NOF-039 | warmup 不能跳过；慢区是固定段 |
