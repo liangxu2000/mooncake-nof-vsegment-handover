@@ -5,7 +5,7 @@
 - 目录约定：**第二阶段所有内容（文档、代码补丁、测量数据）统一放在 `第二阶段/` 目录下**；本文件为总文档/索引
 - 数据来源：`../HANDOVER.md` 各单回执 + 第一阶段最终报告 `../工作汇总.md`
 - 相关文件：`../HANDOVER.md`（任务通道）、`../工作汇总.md`（第一阶段最终报告）
-- **当前状态（2026-11-23）**：M2 完成；M3-0（NOF-060）两臂提交层完全同构；**M3-1（NOF-061）判决：同一份数据用 plain 路径读 bdev 57µs、vseg 路径 249µs（同 LBA 配对 4.64×）⇒ 差异在 vseg 读路径/会话，数据二次无罪**；**M3-2（NOF-062）定案：bdev p50 T1 249/54（4.61×）→ T4 262/259（1.01×）→ T16 270/265（1.02×），gap 随并发强收敛，差异 100% 在 `bdev_us`（其余 15 段为 0）⇒ 完成检测/唤醒类，且 plain 是单向追平**。**NOF-063 已下发（M3-3，零构建、零环境）**：只在源码里定位那 ~195µs——`poll_group_poll` 主链、50–500µs 时间常量与 env 默认值、qpair↔jetty/JFC↔poll group 绑定与每会话自由度、本地 NVMe 完成轮询方式、`req_complete` 前是否 defer；结论给「可直接定位」或「唯一插桩点+预期读数」。**重启不可回退 e12b7cb**。详见第 0 节（0.10–0.15）、「最小重建配方」与 `patches/README.md`。
+- **当前状态（2026-11-23）**：M2 完成；M3-0（NOF-060）两臂提交层同构；M3-1（NOF-061）同数据 plain 快 4.64× ⇒ 差异在 vseg 读路径/会话；**M3-2（NOF-062）定案：bdev p50 T1 249/54 → T4 262/259 → T16 270/265，gap 随并发强收敛，差异 100% 在 `bdev_us`**；**M3-3（NOF-063）静态取证：全链路无 50–500µs 时间常量；发现 `stride=worker_count=6` vs `send_jfc_count=2` 的结构错配，但开发侧复核判定其两臂对称、且同臂 4 个 qid 时延均匀 ⇒ 不是 4.6× 的原因，`SPDK_URMA_JFC_COUNT=6` 不作判决实验**。**NOF-064 已下发（M3-4，需改码/重编/重启，待用户批准）**：逐 IO 插桩——子命令字段（nsid/lba/nbytes/iov_cnt/iov 分布/SQ）+ 轮询节奏（`poll_round` 增量、`nvme_poll` 轮与完成数、`bdev_us`），判 H1 没轮到 / H2 轮到但 CQ 空 / H3 两者均 ~1 而仍慢。**重启不可回退 e12b7cb**。详见第 0 节（0.10–0.15）、「最小重建配方」与 `patches/README.md`。
 - 一句话：**数据/盘无罪、target 看到的命令与顺序也与 plain 完全相同，但 vseg 每条 128KiB 读在 target 的 bdev 执行段多花 ~210µs。第二阶段的目标就是把这 210µs 找出来并消掉。**
 
 ---
@@ -63,7 +63,8 @@
 | **M2-4** | 单轮写入下：stripe=4MiB 单 child 验证 + 同数据裸 SPDK 判别 | **已完成 2026-11-23（NOF-059）** | **单 child 属实**（读 528 SUBMIT/8192/child=0/1）但 **未追平**（P50 547.92 vs 268.44，2.04×）⇒ child 数无关；**同一数据裸读顺序 40.0 vs 40.8µs、随机 220.16 vs 220.16** ⇒ **数据物理状态无罪**；差异锁定在 vseg 客户端驱动 4MiB NoF 操作的方式 |
 | **M3-0** | 客户端 NoF 提交层取证（零环境） | **已完成 2026-11-23（NOF-060）** | **两臂完全同构**：params 除 child 外全同（op/blocks=8192/bytes=4MiB/block_size=512/endpoint/lane/domain/ptr 对齐）；源码 `transfer_task.cpp:3076` 同一函数同参数、128KiB chunk、8MiB/lane、task 内 32 IO 同 qpair；child 仅日志标签。URMA_SLOW_IO 有绝对 tick；唯一实测差异=突发 16 vs 32（2MiB-child 时代），vseg4 未获取 |
 | **M3-1** | 同一数据两读路径 + 逐 128KiB 时钟（零构建、target 不重启） | **已完成 2026-11-23（NOF-061）** | 写 LBA 集合与 plain 逐值相同；零写入用 plain 元数据读同一批 LBA：**plain P50 308.37 / bdev 57µs** vs **vseg P50 573.03 / bdev 249µs**；同 LBA 配对 12,324 条 **246 vs 53（4.64×）**，plain 更快 85.1% ⇒ **差异在 vseg 读路径/会话**。vseg4 突发 31（4MiB）与 plain 相同；新增排除：突发形态、target lcore（同核仍 4.3×）、顺序/预热 |
-| **M3-2** | 并发-时延曲线 + 16 字段全段分解 + target 读路径源码 | **已完成 2026-11-23（NOF-062）** | bdev p50 **249/54（4.61×）→ 262/259（1.01×）→ 270/265（1.02×）**（vseg/plain，T1/T4/T16）；vseg 恒 249→270、plain 单向追平 54→259；**差异 100% 在 `bdev_us`**；同 qid 配对 T1 4.4–4.8×、T4/T16 1.0×；`transport.c:932` 每 poll group 独立 buf_cache、`urma.c:2493` bdev_cpl 在 poll 上下文取；**target 无 vseg 语义** |
+| **M3-3** | URMA transport 轮询/阻塞路径源码取证（零环境） | **已完成 2026-11-23（NOF-063）** | 主链 `transport.c:777→779`→`urma.c:2303`（81 行）；**无 50–500µs 常量**（`urma_poll_jfc` 无 timeout、无 sleep/spin）；结构：`stride=worker_count=6` vs `send_jfc_count=2` ⇒ 仅 worker 0/1 轮询网络，qpair JFC=建连序 mod 2 与属主无对齐；**复核：两臂对称 + 同臂 4 qid 同值 ⇒ 不解释 4.6×**；本地 NVMe 每轮不限量、无 defer ⇒ 静态无法定位，转插桩 |
+| **M3-4** | target 逐 IO 插桩（子命令字段 + 轮询节奏） | **NOF-064 已下发（待用户批准改码/重编/重启）** | 判定设备收到的命令是否真相同（iov_cnt/SQ/lba 全字段），并用 `d_rounds`/`d_nvme_poll`/`d_nvme_cpl` 分开 H1 没轮到 / H2 轮到但 CQ 空 / H3 两者均 ~1；回退锚点 md5 `979f5517…` |
 | **M1c** | target 侧插桩（SGL/bdev 提交参数/分段 tick） | 需重编 target + 重启（用户批准） | 定位 210µs 在 raid0 队列/NVMe/回调哪一段 |
 
 - NOF-048（最小重建验证）已完成，配方已用于 M1a；构建基线是否升级 tip 视后续需要（S2 暂缓）。
@@ -313,7 +314,8 @@ target 重启 **PID 708167**（bd5ee124d / md5 979f5517…，**无 BUFFER**，�
 | 客户端 NoF 提交层（函数/参数/chunk/lane/qpair） | NOF-060 | **排除（完全同构）**：同一 `submitSpdkNofOperation`、同参数、128KiB、8MiB/lane、32 IO 同 qpair；child 仅日志标签 |
 | vseg 元数据/会话层（vseg master 解析、endpoint/segment、target 会话资源） | NOF-061 | **已定案为本行**：同一份 vseg 数据用 plain 路径读 bdev 57µs vs vseg 249µs；同 LBA 配对 4.64× |
 | 会话/qpair 身份的**作用机制**（完成检测/唤醒 vs 每命令固有 vs 恒定排队） | NOF-062 | **已定案：完成检测/唤醒类**——gap T1 195µs → T4 3µs → T16 5µs，差异 100% 在 bdev_us |
-| 那 195µs 在源码里的来源（阻塞等待/超时/批量/事件合并/轮询预算） | NOF-063 | **待查**：`poll_group_poll` 主链 + 50–500µs 常量 + qpair↔jetty/JFC↔PG 绑定 + 本地 NVMe 轮询方式 |
+| 那 195µs 在源码里的来源（阻塞等待/超时/批量/事件合并/轮询预算） | NOF-063 | **已排除常量/阻塞**：无 50–500µs 常量、无 sleep；结构错配两臂对称 ⇒ 不解释 |
+| 设备实际收到的子命令与 target 轮询节奏（插桩） | NOF-064 | **待查**：iov_cnt/SQ/lba + `d_rounds`/`d_nvme_poll`/`d_nvme_cpl` |
 | 测量伪影 | NOF-035 | plain 96.9→99.14 可复现 |
 | 传输/客户端 | NOF-041 | data/outside 反而更小 |
 | 连接预热 | NOF-039 | warmup 不能跳过；慢区是固定段 |
