@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-033（只读：vseg-1 读 LBA 序列取证，验证"顺序写是否真顺序"）**
+- 当前任务：**NOF-034（最后干净组合：vseg-1 + stripe=4MiB + 纯 T1 顺序写 → 读）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -98,7 +98,8 @@
 | NOF-030 | **已被 NOF-031 取代（未执行；若你已在跑则继续，回执按 NOF-030 登记）** | vsegment stripe=4MiB（每 key 单 child）实验；内容并入 NOF-031 |
 | NOF-031 | 已关闭 2026-11-23 | 环境可用（同事仅占 8086 python3、node1 load ~2.6%）；stripe=4MiB：T1 551.6 / 16t 705.4、W9 252.3/270.5 ⇒ **未追平 plain**；**target IO 数 n=25,762 与 2MiB 相同 ⇒ stripe 不改 IO 粒度**；且 plain 的 n 同为 25,762 ⇒ **plain 也是 128KiB IO，差距在每 IO 执行时间而非 IO 大小** |
 | NOF-032 | 已关闭 2026-11-23（**布局二度否证**） | 全新 vseg-1 + 纯 T1 顺序写（2 次尝试后对象层 400 全齐）：T1 P50 **536.7**、16t **921.8**、target W9 **251.1**（plain 258.3/718.7/96.9）；分区/stripe/写序全部试完，W9 恒 250–252 ⇒ 每 IO 执行成本是 vsegment 路径自身；`VSEGMENT_CREATING` 第 3 次复现 |
-| NOF-033 | 已下发 | 只读 LBA 序列取证（低阈值诊断，1 遍 T1）：验证 vseg-1 的读 IO 是否真顺序/连续，补上布局假设缺失的前提 |
+| NOF-033 | 已关闭 2026-11-23 | **LBA 完全连续**：key i 严格占 [i×8192,(i+1)×8192) 块、397/399 步长 8192、key 内相邻差 256 占 93.4%、0 次 >1MiB 跳变、覆盖 98.4% ⇒ 布局彻底洗清；期间 W9 仍 258.9µs（plain 96.9）。代码复核：plain 与 vsegment 最终都调用同一 `submitSpdkNofOperation`，target 端无 vsegment 概念 ⇒ 差异只能来自 IO 到达时序/缓存，不是"vsegment 寻址" |
+| NOF-034 | 已下发 | 未测的干净组合：vseg-1 + stripe=4MiB（每 key 单 child）+ 纯 T1 顺序写 → T1/16t 读；判定"每 key 拆 2 child"是否为剩余成本 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
@@ -444,6 +445,14 @@
 - **布局二度否证**：分区 1/64/1024 × stripe 2/4MiB × 写序（16 线程/T1）全部组合下，target W9 恒 **250–252µs**、T1 恒 537–552µs；plain 同尺寸 IO 为 **96.9µs**、T1 258.3µs。
 - **尚未取证的前提**：T1 顺序写是否真的产生**物理连续**的 LBA（无 LBA trace）；vseg-1 的 16t 变差（921.8 vs 739.5）原因也未知。
 - `VSEGMENT_CREATING` 缺陷第 3 次复现（16 线程 23 个、单线程首次 23 个、补齐 2 个）⇒ 稳定机制缺陷，建议单独立项。
+
+### NOF-033 关键事实（LBA 完全连续；布局彻底洗清，2026-11-23）
+
+- vseg-1 的 400 个 key **严格占据 LBA [i×8192, (i+1)×8192) 块**（4MiB/个）；key 起点步长 8192 出现 397/399 次，单调递增；key 内相邻差=256 占 93.4%，**0 次 >1MiB 跳变**；128KiB 槽覆盖率 98.4%；2MiB（4096 块）IO 占 3.2%（372/400 key 至少 1 条）。
+- 该窗口 target W9 = **258.9µs（exec 97.4%）**，仍是 plain（96.9）的 2.67 倍 ⇒ **在"完全连续"这一最优布局下 W9 不变**，布局维度正式排除。
+- **代码复核（开发侧）**：plain（一次 4MiB task）与 vsegment（N×2MiB task）最终都调用同一个 `submitSpdkNofOperation` → 同一个 QoS/驱动；target 端只看到 NVMe 命令，**没有 vsegment 概念** ⇒ "vsegment 寻址让每 IO 贵 2.6×"的说法不成立；差异只能来自 IO 到达时序、并发形态或盘缓存状态。
+- 需警惕：plain 的 W9 96.9µs 取自滚动窗口，可能混入写路径快 IO（写 W9 27.8µs），有被拉低的风险；**端到端仍是主指标**。
+- 尚未测的干净组合：**slot=1 + stripe=4MiB（每 key 单 child）+ 纯 T1 顺序写**（NOF-032 是 2MiB stripe=2 child；NOF-031 是 1024 分区+16 线程写，布局散）。
 
 ### 口径与数据安全（2026-11-20 用户补充）
 
@@ -1879,7 +1888,7 @@ T1 顺序写结果（400/0 或 2 次尝试、logical_used、vsegments）；vseg-
 
 ---
 
-# NOF-033（待执行 · 只读 LBA 序列取证 · 2026-11-23）
+# NOF-033（已关闭 · 只读 LBA 序列取证 · 2026-11-23）
 
 ## 背景
 
@@ -1914,3 +1923,55 @@ T1 顺序写结果（400/0 或 2 次尝试、logical_used、vsegments）；vseg-
 ## 回执必答（第一行）
 
 vseg-1 读 IO 的 LBA 是否连续/顺序（每 key 内、key 间）；相邻差=256 的比例；3 段样例；target W9；**LBA 数据是否能为布局洗清或坐实**。
+
+---
+
+# NOF-034（待执行 · 最后干净组合：vseg-1 + stripe=4MiB + T1 顺序写 · 2026-11-23）
+
+## 背景与假设（最后一个未测组合）
+
+- NOF-032（布局干净）：slot=1 + **stripe=2MiB** ⇒ 每 key **2 个 child**；T1 536.7 / W9 251.1。
+- NOF-031（stripe=4MiB）：**slot=1024 + 16 线程写**（布局散）；T1 551.6 / W9 252.3。
+- 从未测过：**slot=1 + stripe=4MiB（每 key 单 child）+ 纯 T1 顺序写（布局连续）**。
+  - 若该组合 T1 接近 plain 258.3、W9 降到 ~97 ⇒ **"每 key 拆 2 child"就是剩余成本**，vsegment 可通过该配置追平 plain；
+  - 若仍 ~537/252 ⇒ 每 key 的客户端开销在别处（需代码层定位）。
+
+## A. 预检（只读）
+
+- 当前 vseg-1 master（PID 1648052）、target 341038、4457、etcd 键；node1 同事进程只记录不动；node3 独占。异常 → 停手。
+
+## B. 切换 vseg-1 + stripe4（只动我方 master/cluster）
+
+1. 停当前 master（按 PID）；清**仅我方**键。
+2. 启动 master：NOF-004/007 同参数 + `MC_STORE_PARTITION_SLOT_COUNT=1` + **`--vsegment_stripe_size=4194304`**。
+3. `nof_register` 同命令；等 quota ≥20s；验证 `stripe_size=4194304`、partitions=1、`reconcile_fail=0`。
+
+## C. 纯 T1 顺序写
+
+- writer：**`--num_threads=1 --batch_size=1`**，400 keys × 4MiB（vsegment flags 同 NOF-018）；日志 `run/writer_vseg1_s4m_t1.log`。
+- `VSEGMENT_CREATING`（卷边界）允许多跑 1 次补齐（总尝试 ≤2）；确认 `committed_allocations=400` 或 `logical_used=1,677,721,600`；记录 vsegments。
+- 若两次后仍缺 key → 停手回报（不第 3 次）。
+
+## D. 读（同口径）
+
+- T1 × 3 遍 + 16t × 3 遍（verify=true、诊断关、client slot env=1）。
+- 记录 Avg/P50/P90/P99/Max、failed/verify；target W 块按"下一次连接打印上一轮"对齐；`rpc_first_us` p50。
+
+## E. 对比与回答
+
+| 场景 | 布局 | child | T1 P50 | 16t P50 | W9（T1） |
+|---|---|---|---|---|---|
+| plain NoF | 连续 | 无 | 258.3 | 718.7 | 96.9 |
+| vseg-1 / stripe2 | 连续 | 2×2MiB | 536.7 | 921.8 | 251.1 |
+| **vseg-1 / stripe4（本单）** | 连续 | **1×4MiB** | ? | ? | ? |
+
+- 明确回答：**单 child + 连续布局下，T1 是否接近 258？W9 是否降到 ~100 量级？** 若是 → child 拆分是成本、配置可解；若否 → 客户端每 key 开销在别处（转代码层定位）。
+- 保留该环境。
+
+## F. 边界
+
+- 只动我方 master/cluster；不动 target；共享机规则；失败停手。
+
+## 回执必答（第一行）
+
+stripe=4MiB/partitions=1 是否生效；T1 顺序写是否补齐（committed/logical_used/vsegments）；vseg-1/4MiB 的 T1/16t P50 与 target W9；**是否追平 plain（258.3/96.9）**；有无失败。
