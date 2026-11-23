@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-059（第二阶段 M2-4：单轮写入下验证 stripe=4MiB 单 child + 同数据裸 SPDK 判别；含 target 重启）**
+- 当前任务：**NOF-060（第二阶段 M3-0：客户端 NoF 提交层取证与插桩点定位；零环境、不重启不构建）**
 
 ## 第二阶段（2026-11-23 起）
 
@@ -34,6 +34,8 @@
 - **NOF-057 完成（2026-11-23，M2-2 定案）**：补齐 **400 keys**（2 次尝试，VSEGMENT_CREATING 23→0；vsegments=26，补写多建 1 个尾卷，不影响 key/LBA）；vseg T1 P50 **551.22** / W9 **261.44**，plain P50 **277.50** / W9 **137.00**；target 优雅退出落盘 **33,792 条、dropped=0**；**126µs 100% 落在 `submit_return→callback`（bdev/SSD 执行段）**，其余 6 段为 0（data 段 vseg 反而更短 6 vs 12µs）；两段 `nlb=256`、**lba 集合完全相同**、flags 全 3；**NUMA 完全无关**（vseg node0 p50 256 / node2 255；plain 59/61）；唯一留下的差异是**盘级访问流**：换盘率 **79.7% vs 50.0%**、每盘 LBA 递增 **98.0% vs 99.9%**、每盘回退 **31 vs 1**（2MiB child 铺 8 盘、child1 从 disk8 绕回 disk0–4）。**但 NOF-034（stripe=4MiB 单 child 仍 W9 250）与 NOF-046（q1 顺序仍慢）与该解释有张力 ⇒ 不把"child 数"直接当根因**；下一步 NOF-058 用离线数据判别快/慢 IO 的局部条件（同盘并发重叠 vs 同队列 LBA 局部性）。
 - **NOF-058 完成（2026-11-23，M2-3：并发与局部顺序均排除）**：零环境（target 保持 down、只读 `run/urma_stage_nof055.bin` 与两份 params 日志）。**同 tick 占比 0.01%/0%、两种 tie-break 结果一致**（顺序指标稳定）；vseg 客户端提交序换盘 59.7% vs target 执行序 79.7%（+20pp，target 内部有重排放大），plain 两序均 50%。**ov=0（该盘零并发）**：vseg **206µs**（n=4,400，34.4%）vs plain **39µs**（n=4,405，34.4%）；两臂 ov 分布几乎相同 ⇒ **并发/队列深度排除**。**同 (disk,lcore) 紧接前驱（gap≤512）**：vseg p50 **275** vs plain **61**；busy=False（前驱已完成）vseg **206** vs plain **39**；同 gap 桶（near<8MiB）vseg 207 vs plain 41 ⇒ **局部 LBA 顺序排除**。**plain 的快 IO 全部在高 LBA 区（keys≥98，8,336 条 <64µs）；慢 IO 全部是盘首慢区 keys 0–97（3,133 条 ≥128µs，LBA≤802,304≈391MiB）**；vseg 在高 LBA 区也全慢（9,664 条 p50 256）。**同一 LBA（keys≥98）两段读**：vseg mean 250.2 vs plain mean 49.4（**5.07×**）——但 vseg 数据写轮次与 plain 数据不同（vseg 377 keys 单写 + 23 keys 补写；plain 后写覆盖），**该对比受写入历史混杂，不能单独归因**。客户端 per-lane 顺序率 vseg 93.9% vs plain 99.2%（文件行序，`[推断]`）；child0/child1 SUBMIT 严格交替 100%。**判决：24 字段内无判别变量；候选只剩"vseg 写出的数据物理状态"与"读路径的全局/请求层差异"** ⇒ NOF-059。
 - **NOF-059 已下发（M2-4，含 target 重启）**：**同时回答两个问题**——① `--vsegment_stripe_size=4194304` 是否真正实现每 key 单 child（528 条 SUBMIT、blocks=8192），且 W9 是否从 ~256 回落到 plain 档；② 同一份单轮写入的 vseg 数据、**不重写**，用裸 SPDK `urma_perf`（NOF-045 同款）顺序/随机读：顺序快（~41µs/91）⇒ 数据无罪、读路径仍有差异；顺序慢（~220）⇒ **写出的数据物理状态**是主因。随后 plain 写+读+裸读作同批对照。**target 用 bd5ee124d 同 RPC 重启、不启用 BUFFER、本单结束保持运行**；所有裸读在 Mooncake 读之后（preflight 写不影响 R1）。
+- **NOF-059 完成（2026-11-23，M2-4：单 child 无效；数据无罪；锁定读路径）**：target 重启成功（**PID 708167**、md5 979f5517…、bd5ee124d、4457；无 BUFFER env；首启因 11 盘 vfio 残留 ABORT，用 takeover `-r -y` 还原后重启，同 NOF-055 补救）。**stripe=4MiB 确实实现每 key 单 child**：写 params 377+23 条、读 params **528/528**，全部 `blocks=8192`、`child=0/1`（2MiB 时为 1056）。**但 vseg4 未追平**：客户端 P50 **547.92** vs plain **268.44**（**2.04×**；NOF-057 为 551.22 vs 277.50=1.99×）⇒ **child 数无关**。**同一份数据裸 SPDK 读**：顺序 p50 **40.0 vs 40.8µs**（W9 86.3 vs 79.6）、随机 **220.16 vs 220.16µs**（W9 191.1 vs 190.9）⇒ **数据物理状态无罪**。plain 写 400/0、0.16s、9921 MiB/s、params 400 SUBMIT/8192/child=0/0；plain 读 P50 268.44。裸读 D2（key 200 定点）=218.88µs（4MiB 单 key 内部顺序仍"随机档"）。preflight 覆盖 key98/key200 各 128KiB（已知）。**target W9 本单表（vseg 122.6 vs plain 30.4）受 dump 滞后/跨相位影响，不作结论**；per-key 24 字段需 BUFFER（本单禁止）。环境末态：target **保持运行**（708167，无 BUFFER）、两 master 已停、无 bench。**判决：child 数无关、数据无罪 ⇒ 差异在 vseg 客户端把同一 4MiB NoF 操作驱动到 target 的方式（提交时序/SGL/buffer/endpoint）** ⇒ NOF-060。
+- **NOF-060 已下发（M3-0，零环境取证）**：① 对比 NOF-059 的 vseg4/plain 读写 params **全字段**（重点 `endpoint/ptr/block_size/bytes/child/vseg_op_id/lane`）——两臂在 NoF 提交层是否完全同构；② 检查 NOF-057 `URMA_SLOW_IO` 行是否有绝对时间戳（有则算提交节奏/突发，无则记 `[未获取]`）；③ 只读客户端源码（`nvme_urma.c` + `transfer_task.cpp`/vsegment runtime），找出 4MiB→32×128KiB 切分与提交的确切路径、vseg/plain 差异清单、以及 **M3-1 最小插桩点与重建路径**。**零环境：target 不动、不构建、不改码**。
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -156,7 +158,8 @@
 | NOF-056 | 已关闭 2026-11-23（**B2 停手：VSEGMENT_CREATING 23 次；NUMA 审计完成**） | vseg 从零建集群后 T1 写触发 **23 次 VSEGMENT_CREATING**（key 16,33,…,390 步长 17），只写入 377/400 keys、logical_used 1,581,252,608；按规则未跑 reader/未切 plain/未停 target（buffer 0B）。**NUMA 审计**：4 节点（node0 cpu0–69、node2 cpu154–237，距离 20）；**11 盘 5 块 node0 / 6 块 node2**；target 核 2–7 全在 node0；hugepages 各节点 1160、free 16/75/128/128；uburma numa 不可读 |
 | NOF-057 | 已关闭 2026-11-23（**126µs 定位于 SSD 执行段；NUMA 排除；访问流差异**） | 补齐 400 keys（2 次尝试；VSEGMENT_CREATING 23→0；vsegments=26）；vseg T1 P50 **551.22**/W9 **261.44**，plain **277.50**/**137.00**；落盘 **33,792 条 dropped=0**；**126µs 100% 在 `submit_return→callback`（bdev/SSD）**，其余 6 段 0、data 段 vseg 更短；两段 `nlb=256`、**lba 集合完全相同**、flags 全 3；**NUMA 排除**（256/255 vs 59/61）；盘级访问流：换盘率 **79.7% vs 50.0%**、每盘递增 **98.0% vs 99.9%**、回退 **31 vs 1**。与 NOF-034/046 有张力，child 数不直接当根因；NOF-058 离线判别局部条件 |
 | NOF-058 | 已关闭 2026-11-23（**并发与局部顺序均排除；判据指向数据状态/读路径**） | 零环境；同 tick 0.01%/0%、两种 tie-break 一致；**ov=0：vseg 206µs vs plain 39µs**（两臂 ov 分布均 34.4%）⇒ 并发排除；**同 (disk,lcore) 紧接/busy=False：vseg 275/206 vs plain 61/39** ⇒ 局部 LBA 顺序排除；plain 快 IO 全在 keys≥98（8,336 条 <64µs）、慢 IO 全是盘首 keys 0–97（3,133 条，LBA≤802,304）；**同一 LBA（keys≥98，n=9,664）：vseg 250.2 vs plain 49.4（5.07×）但受写轮次混杂**；vseg 客户端序换盘 59.7% vs target 执行序 79.7%（+20pp，`[推断]`）；**24 字段内无判别变量** ⇒ NOF-059 |
-| NOF-059 | 已下发 2026-11-23（M2-4，**含 target 重启**） | bd5ee124d 同 RPC 重启（不启用 BUFFER、结束保持运行）；vseg **stripe=4MiB** 单轮写 400 keys（≤3 次补齐，写/读均开 params）→ 验证每 key 单 child（528 SUBMIT、blocks=8192）并读（W9）；**不重写**用裸 SPDK `urma_perf` 顺序 D1（keys 98–399）/D2（key 200）/D3（随机）读同一数据；随后 plain 16t 写+读+裸读 D1/D3 对照 ⇒ 判"单 child 是否追平""数据状态 vs 读路径" |
+| NOF-059 | 已关闭 2026-11-23（**单 child 无效；数据无罪；锁定读路径**） | target 重启 708167（bd5ee124d/无 BUFFER/保持运行）；**stripe=4MiB 单 child 属实**（读 528 SUBMIT/8192/child=0/1）；vseg4 P50 **547.92** vs plain **268.44（2.04×）**，与双 child 1.99× 同档 ⇒ child 无关；同一数据裸 SPDK 顺序 **40.0 vs 40.8µs**（W9 86.3/79.6）、随机 **220.16/220.16** ⇒ **数据物理状态无罪**；判决：差异在 vseg 客户端驱动 4MiB NoF 操作的方式 ⇒ NOF-060 |
+| NOF-060 | 已下发 2026-11-23（M3-0，**零环境取证**） | 对比 NOF-059 vseg4/plain 读写 params 全字段（endpoint/ptr/block_size/bytes/child/vseg_op_id/lane）；检查 NOF-057 URMA_SLOW_IO 是否有绝对时间戳（提交节奏/突发）；只读客户端源码（nvme_urma.c + transfer_task.cpp/vsegment runtime）定位 4MiB→32×128KiB 提交路径与两臂差异，给 M3-1 插桩点与最小重建路径；target 不动、不构建 |
 | NOF-053 | 已关闭 2026-11-23（**客户端分解；QoS 排除**） | 指定 `batch_get_*` 为 0（单 key Get 走 `get_into_breakdown`/`query_rpc_breakdown`/`transfer_data_breakdown`/`nof_slow_task`）。plain 每 key 283µs = **master 元数据 query 116µs（41%）** + submit 6 + wait 156（含 target W9 68，超出 88）+ 其他 5；**QoS/worker/dispatch 仅 8–11µs（~3%）**。vseg 2× **不是 setup/QoS**（query 103 vs 116 反而低），而是 **drain 350 vs 110µs、max_subio 362 vs 112（3.2×）**、submit 19 vs 6 ⇒ **客户端调度排除**，vseg 的 2× 在 target/传输 drain 段 |
 | NOF-050 | 已关闭 2026-11-23（**阻塞：SPDK 版本不兼容**） | 补丁/编译/链接成功（`bench-io-params` 530,162,656B / md5 fc2b5129…，strings 命中 3 条）；但新 bench 连 target 失败：客户端 SPDK **9a413a44** vs target 运行中 **e12b7cb**，握手 rc=-71/-104；同事原 bench（59662a26，匹配 e12b7cb）同 env/参数 rc=0、P50 473.52 / target W9 259.77。**口径修正**：该 P50 为 **node1 远端 reader**，与 NOF-040 本机 274 不可比（SLOT=1 未改变 P50）；target 现跑的是 **deleted 旧二进制 736a902f**，磁盘 d6c39465=9a413a44 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
@@ -3510,7 +3513,9 @@ target 是否成功切到 bd5ee124d（PID/版本/md5）；4457/RAID0/ns/transpor
 
 ---
 
-# NOF-059（待执行 · 第二阶段 M2-4：单轮写入下验证 stripe=4MiB 单 child + 同数据裸 SPDK 判别 · 2026-11-23）
+# NOF-059（已关闭 · 单 child 无效；数据无罪；锁定读路径 · 2026-11-23）
+
+> 结果：target 重启 **PID 708167**（bd5ee124d/md5 979f5517…、无 BUFFER env、保持运行；首启因 vfio 残留 ABORT，takeover `-r -y` 还原后成功）。**stripe=4MiB 确实每 key 单 child**：写 params 377+23、读 params **528/528**，全部 `blocks=8192 child=0/1`。vseg4 读 Min/Avg/P50/P90/P99/Max = 462.17/554.79/**547.92**/631.42/700.07/1011.90、failed=0；plain 读 Avg 339.75/**P50 268.44**/P90 574.79/P99 691.91 ⇒ **2.04×，与 2MiB 双 child 的 1.99× 同档 ⇒ child 数无关**。同一份数据裸 SPDK（node1 gap urma_perf，md5 c653c0a6…）：D1 顺序 keys98–399 **p50 40.0/W9 86.3**（vseg 数据）vs **40.8/79.6**（plain 数据）；D3 随机 **220.16/191.1** vs **220.16/190.9**；D2 单 key 200 定点 4MiB = **218.88/187.9** ⇒ **数据物理状态无罪；单 key 内部顺序读也已是"随机档"**。preflight 覆盖 LBA 802816（key98）与 1638400（key200）各 128KiB。plain 写 400/0（0.16s、9921 MiB/s、SUBMIT=400/8192/child=0/0）、Keys=400。**target W9 本单表（vseg 122.6 vs plain 30.4）受 dump 滞后/跨相位与 n 分块不齐影响，不用于结论**（per-key 需 BUFFER，本单禁止）。新增偏差：首次 target 启动 ABORT（11 盘 vfio 残留）；首次写以非 root 失败（改 sudo）；写触发 23 次 VSEGMENT_CREATING，按规则补 1 轮。末态：**target 保持运行**（708167、4457、无 BUFFER）、两 master 已停、无 bench。**判决：child 数无关、数据无罪 ⇒ 差异在 vseg 客户端把同一 4MiB NoF 操作驱动到 target 的方式** ⇒ NOF-060。
 
 ## 背景与目标
 
@@ -3584,3 +3589,57 @@ target 是否成功切到 bd5ee124d（PID/版本/md5）；4457/RAID0/ns/transpor
 ## 回执必答（第一行）
 
 target 重启验收（PID/md5/4457/RAID0/BDF）；stripe=4MiB 是否生效（quota + 写/读 params 的 child/blocks/SUBMIT 数）；vseg4 P50/W9；D1/D2/D3 裸读（vseg 数据）client p50 与 W9；plain 写验收 + P50/W9；D1/D3 裸读（plain 数据）；**vseg4 是否追平 plain**；**数据状态 vs 读路径的判决**；有无失败。
+
+---
+
+# NOF-060（待执行 · 第二阶段 M3-0：客户端 NoF 提交层取证与插桩点定位 · 零环境 · 2026-11-23）
+
+## 背景与目标
+
+- NOF-059：`stripe=4MiB` **确实**每 key 单 child（读 `SUBMIT=528`、`blocks=8192`、`child=0/1`），但端到端 **547.92 vs plain 268.44µs（2.04×）**，与双 child 的 1.99× 同档 ⇒ **child 数不是原因**。
+- 同一份数据裸 SPDK：顺序 **40.0 vs 40.8µs**、随机 **220.16 vs 220.16µs** ⇒ **数据物理状态无罪**。
+- 因此差异只剩 **vseg 客户端把同一个 4MiB NoF 操作驱动到 target/盘的方式**（提交时序/顺序/SGL/buffer/endpoint/会话），或 target 对两种会话请求的处理。
+- 本单是 **M3-0 取证**（零环境、不重启、不构建、不改码）：用已有日志 + 客户端源码，回答"两臂在 NoF 提交层到底有没有差别、差在哪一层"，并给出 M3-1 的精确插桩点与最小重建路径。
+
+## A. 现有 params 日志全字段对比（只读）
+
+1. input：node3 `run/nof059_vseg4_read.log`、`run/nof059_plain_read.log`、`run/nof059_vseg4_write.log`、`run/nof059_plain_write.log`（node1 对应 master/register 日志不需要）。
+2. 打印 `NOF_IO_PARAMS_SUBMIT` 与 `NOF_IO_PARAMS_WORKER` 的**字段全集**，各给 2 条原始样本；然后按臂聚合：
+   - SUBMIT：`op/seg_lba/blocks/bytes/block_size/child/vseg_op_id/endpoint` 的取值/分布；**`endpoint` 的唯一值清单**（两臂是否同一会话/段）；`ptr` 的 min/max 与对齐（mod 4096 / mod 131072）；
+   - WORKER：`lane/worker` 分布；`buf_type/buf_device/domain`；`ptr` 对齐；`blocks`；文件序下每 lane 的 seg_lba 单调率（剔除 warmup 4,096 条后给测量遍）。
+3. **明确回答：两臂在 NoF 提交参数上是否有任何差异；若全部相同，写 `[事实] 无差异`**。
+
+## B. 现有客户端逐 IO 日志的时间信息（NOF-057 产物）
+
+1. 在 `run/nof057_vseg_read.log` / `run/nof057_plain_read.log` 中找 `URMA_SLOW_IO` 行（各 ~16,910 条）：打印**字段全集** + 2 条样本。
+2. 判断是否存在**绝对时间戳/tick**（而非 duration）：若有，按 qid 重建每 128KiB 的提交间隔、突发大小（如 <5µs 连续条数）与空闲间隙，并给出两臂分布；若无，明确 `[未获取]`（**不得用文件行序猜时间**）。
+3. 若行内带 target 回传的 rx/exec tick，可作 target 到达节奏的交叉验证（以 NOF-057 buffer 为准，不重复费力）。
+
+## C. 客户端源码取证（我们自己的 bd5ee124d 副本，只读）
+
+目标：找出"4MiB NoF 操作 → 32×128KiB NVMe 命令"的**确切代码路径**，以及 vseg/plain 两条路径在该层的差异。
+
+1. 客户端 SPDK：`$D/spdk-e12b7cb-src/lib/nvme/nvme_urma.c`（及同目录相关文件）——128KiB 切分的实际位置、每个子请求的 SGL/payload 构造（iov 数、ptr/rkey）、qpair/jetty 选择、提交循环顺序、可用的 submit/completion tick。
+2. Mooncake：`$D/mooncake-src/mooncake-store/src/transfer_task.cpp`（及 `vsegment_runtime.cpp` 如相关）——`submitSpdkNofOperation` 的调用点与参数（chunk/`nof_qpairs_per_segment`/`nof_inflight_bytes`/endpoint），以及 **vseg 路径与 plain 路径在此函数前后的差异**（是否经 vsegment runtime、buffer/QoS/批处理/顺序是否不同）。
+3. 给出 `file:line` 与关键字段，明确回答：
+   - 两臂最终是否**同一函数、同一参数**？若有差异，逐条列出（首要候选）；
+   - 512B→128KiB 的切分发生在哪一层？切分后是否按 LBA 顺序提交、是否跨 qpair 轮转、每 qpair 在途上限是多少；
+   - **M3-1 插桩点清单**：要打印的 per-128KiB 字段（qid/jetty、lba/nlb、payload ptr、SGL 数、submit tick、completion tick、outstanding）、env 开关、需要重建哪些 `.a`、如何重链 bench（引用 NOF-048/051 的配方）。
+4. 不构建、不改文件、不重启。
+
+## D. 结论（必答）
+
+1. params 层是否有差异（逐字段）；
+2. `URMA_SLOW_IO` 是否有可用绝对时间戳（有/无/哪些字段）；
+3. 源码层 vseg vs plain 在 128KiB 提交路径上的**差异清单**（无则明确写"无差异"）；
+4. **M3-1 插桩清单**（文件:行、字段、env、构建步骤、预计产物）；
+5. 若发现某个参数/路径差异已可直接解释 2×，给出验证方案（可先于 M3-1）。
+
+## E. 边界
+
+- 零环境：target 保持运行（NOF-059 末态 PID 708167，**不重启/不停/不启用 BUFFER**）；不构建；不写盘；只读日志与源码。
+- 不改任何源码；产物写 `run/nof060_*.txt`（≤3 个，每个 ≤1MB）。
+
+## 回执必答（第一行）
+
+params 层字段对比（endpoint/ptr/block_size/bytes/child 等是否全部相同）；`URMA_SLOW_IO` 时间戳可用性；源码层 vseg vs plain 的差异清单；M3-1 插桩点与最小重建路径；有无失败。
