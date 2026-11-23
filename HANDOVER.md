@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-064（第二阶段 M3-4：target 逐 IO 插桩——子命令字段 + 轮询节奏；需改码/重编/重启，待用户批准）**
+- 当前任务：**NOF-065（第二阶段 M3-5：v3 零干扰插桩（环形缓冲 + delta + iov 字段）+ 新 cid 一次写入 + 两臂 T1 采集）**
 
 ## 第二阶段（2026-11-23 起）
 
@@ -44,6 +44,8 @@
 - **NOF-063 已下发（M3-3，零构建、零环境）**：只在源码里回答「那 ~195µs 是谁在等」——① `urma.c` 的 `poll_group_poll` 全路径是否有**阻塞等待/超时/批量上限/事件合并**（列出所有 100–500µs 量级时间常量与 env 默认值）；② qpair/jetty/**JFC** 与 poll group 的绑定结构，以及**两个会话在这套结构里可能不同的唯一自由度**；③ 本地 NVMe 完成由谁轮询（是否 interrupt/事件模式）；④ `req_complete` 之前是否有 defer/批量回写；⑤ 结论：源码能否直接定位（候选常量与实测 195µs 比对），还是必须插桩（给唯一插桩点与预期读数）。**不改码、不跑测试、target 不动。**
 - **NOF-063 完成（2026-11-23，M3-3：静态无 50–500µs 常量；找到结构性错配，但开发侧复核判定其对称、不能解释臂间差）**：`poll_group_poll` 主链 = `transport.c:777→779` → `urma.c:2303 nvmf_urma_poll_group_poll`（2303–2383，81 行）。**`[事实]` 50–500µs 量级时间常量 = 0 个**：`urma_poll_jfc` 无 timeout 形参、`urma.c` 内 `nanosleep/usleep/spdk_delay_us/sched_yield` 零命中；`abort_timeout_sec=1`、`min_kato=10000`、`jfc_depth=4096`、`jetty_depth=2048` 全不在该量级。环境实际值：`/proc/708167/environ` 只有 `SPDK_URMA_DEV_NAME` + `SPDK_URMA_TARGET_DUMP_SEC`；`nvmf_get_transports` = `send/recv_jfc_count=2`、`num_jetty_per_ep=1`。**结构发现**：`stride = worker_count = 6` 而 `send_jfc_count = 2` ⇒ `for (j = worker_index; j < 2; j += 6)` **只有 worker_index 0/1 两个 reactor 轮询网络**，2..5 完全不轮询；qpair 的 JFC = 建连序 mod 2，且与属主 worker_index 无对齐关系 ⇒ 跨线程投递（`urma.c:2289 spdk_thread_send_msg`）→ `completion_msg_fn` → `handle_completion`（`exec_tick` 在 `2167`）。本地 NVMe 侧：`bdev_nvme.c:1970 spdk_nvme_poll_group_process_completions(group,0,…)` 每轮不限量、无中断/idle；`req_complete` 前无 defer（读路径全内联）。**开发侧复核（重要）**：该错配在两臂间**对称**——plain 属主 {2,3,4,5}=worker{0,1,2,3}、vseg 属主 {6,7,2,3}=worker{4,5,0,1}，**两边都是 2 个 qpair 落在轮询核、2 个落在非轮询核**，且 qid→JFC 同为 mod 2；更要紧的是**同一臂内 4 个 qid 时延均匀**（vseg 247–250、plain 52–56），若机制来自属主核/JFC 绑定，四个绑定各异的 qpair 不可能同值 ⇒ **该结构不是 4.6× 的原因，也不构成 `SPDK_URMA_JFC_COUNT=6` 实验的依据**（该实验可另作参照，不作为判决实验）。**结论：静态读码无法判定 195µs，必须插桩**；候选读数表 H1（完成早在 CQ、reactor 没轮到：`d_rounds` 大 / `d_nvme_poll` 小且首轮即拿到）、H2（轮到了但 CQ 空：`d_nvme_poll` 大、多数轮 0）、H3（两者均 ~1 而 bdev_us 仍大 ⇒ 调度抢占或设备侧）。产物 `run/nof063_source_poll.txt`（11,455B）；target 708167 未重启（起始时间 17:35:36 未变）。偏差：`worker_count`/`send_jfc_count` 运行期实际值无 RPC 可读，已列入插桩一次性打印；期间发现 node3 有第三方 `royi` master（50151），仅记录未触碰。
 - **NOF-064 已下发（M3-4，需改码/重编/重启——待用户批准后才执行）**：target 逐 IO 插桩两组信息——① **子命令字段**（`nsid/lba/nbytes/iov_cnt/iov[0]`+总长/SQ 位置/qpair/thread）以判定"设备收到的命令是否真的相同"；② **轮询节奏**（`urma.c:2303` 入口线程本地 `poll_round`、`bdev_nvme.c:1970` 的 `nvme_poll` 轮与完成数、`bdev_us`），把 H1/H2/H3 分开；附一次性映射打印（worker_index/worker_count/JFC 索引）。两臂同代码、开关 `NOF064_TRACE=1`、T1 各 1 遍，另加一次**反序复测**（plain 先、vseg 后）确认臂间差在插桩下仍成立。回退=旧二进制 md5 `979f5517…` + 原 RPC。
+- **NOF-064 结果（2026-11-23，M3-4：改码/重编/重启三步完成，两臂采集未完成 · 部分关闭）**：新 target **PID 1587271、md5 `21ced674…`**、4457/RAID0(11 盘)/transport 验收全通过、`NOF064_TRACE=1` 生效。三份二进制并存：`nof059`=`979f5517…`（原 bd5ee124d）、`nof064`=`21ced674…`（v1 插桩，在跑）、`nof064b`=`afe95672…`（v2，补读路径快照，已编译未运行）。编译坑：`nof064_*` 符号在 nvmf 库而 bdev 模块不链它 → 计数器改定义在 `bdev_nvme.c`、`urma.c` 弱引用。**一次性映射实测**：`worker_index 0→core3, 1→core4, 2→core5, 3→core6, 4→core7, 5→core2`。**两处硬阻塞**：① **重启使 target identity 变化**（raid0/nsid1 uuid `c697219c…`→`63a1e3cd…`，base bdev uuid 未变）⇒ `vseg_nof061` mount `rc[-300] INVALID_VERSION`、`SUBMIT=0`；**plain `vseg_nofvseg` 仍可挂载**（`[事实]` vseg 元数据跨 target 重启失效，plain 不受影响 —— 产品级缺陷）；② **v1 插桩位置错**：读路径走 `urma.c:1921`（C2H，no pull），v1 只插了 `2214`（PULLING）⇒ 读 IO 没取快照，`d_rounds=467,099,749` 是绝对值不是 delta。已采集只有 plain 臂 v1（client P50 317.44、400/0；target 4,000 条 `NOF064_IO`：bdev mean 248.8 / p50 225 / p90 312、≤70µs 占 16.6%）。**开发侧判定（关键）**：该 225µs **大概率是 per-IO printf 的观测者效应**——32 个 IO 在飞时每完成一条打印会推迟后续 IO，plain 无插桩口径是 54µs；同一污染也会让 `d_*` 计数失真、把 H1 伪装成成立 ⇒ **v1 数据不可用于任何 bdev/`d_*` 结论**。
+- **NOF-065 已下发（M3-5，沿用 2026-11-23 改码/重编/重启授权）**：① 插桩升级 **v3**——把 per-IO printf 换成**静态环形数组**（≥400k×96B，带 valid 标记，非 reactor pthread 每 3s 追加落盘），补 **iov 字段**（`nsid/lba/nbytes/iov_cnt/iov[0].base/len/total_iov_bytes`），并把 `d_rounds/d_nvme_poll/d_nvme_cpl` 改成**真 delta**；② 重启到 v3 后**新 cid `vseg_nof065` 写一次 400 keys**（重启后 vseg 旧元数据必失效，故必须重写）；③ 两臂 T1 各 2 遍 instrumented + 各 1 遍 **`NOF065_TRACE=0` 对照**（零干扰验证，差 >5% 则整轮作废）；④ 解析按 `bdev_us` 分桶给 `d_*` p50/p90，并用 `/proc/<target>/numa_maps` 把 `iov[0].base` 分 NUMA 桶（buffer 归属首次可查）。**判决前明确弃用两条旧假设**：v1 的 225µs、以及 JFC/stride 结构（`exec_tick` 在 `handle_completion` 内、跨线程投递在它之前 ⇒ 不进 bdev_us 窗口，`stride=1`/`JFC_COUNT=6` 不作为修复实验）。
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -171,7 +173,8 @@
 | NOF-061 | 已关闭 2026-11-23（**判决：vseg 读路径/会话；数据二次无罪**） | 写 LBA 集合与 plain 逐值相同；**零写入**用 plain 元数据读同一批 LBA：plain P50 **308.37**（复测 330.41）/bdev **57**；vseg 同数据 P50 **573.03**（复测 601.09）/bdev **249**；**同 LBA 配对 12,324 条 246 vs 53（4.64×），plain 更快 85.1%**。vseg4 突发 **31（4MiB）与 plain 完全相同** ⇒ NOF-060 的 16 vs 32 不复存在；新增排除突发形态、target lcore（同核仍 4.3×）、顺序/预热。剩余唯一变量=会话/qpair 身份 ⇒ NOF-062 |
 | NOF-062 | 已关闭 2026-11-23（**gap 随并发强收敛 ⇒ 完成检测类**） | bdev p50 **T1 249/54（4.61×）→ T4 262/259（1.01×）→ T16 270/265（1.02×）**；vseg 恒 249→270、plain 单向追平 54→259 ⇒ 判据① + ③。**差异 100% 在 `bdev_us`**，其余段 0、`outside` 同 21µs、`wait/enomem` 为 0。同 qid 配对 T1 4.4–4.8×、T4/T16 1.0×。源码链到 `transport.c:932`（每 poll group 独立 buf_cache）与 `urma.c:2493`（bdev_cpl 在 poll 上下文取）；**target 无 vseg 语义**；两臂仅会话身份与 qpair→lcore 分配不同 ⇒ NOF-063 |
 | NOF-063 | 已关闭 2026-11-23（**无 50–500µs 常量；结构错配对称，不解释臂间差**） | 主链 `transport.c:777→779`→`urma.c:2303`（81 行）；`urma_poll_jfc` 无 timeout、`usleep/nanosleep/spdk_delay_us` 零命中 ⇒ **静态无该量级常量**。结构：`stride=worker_count=6` vs `send_jfc_count=2` ⇒ 仅 worker 0/1 轮询网络，qpair JFC=建连序 mod 2 与属主无对齐 ⇒ 跨线程投递；本地 NVMe 每轮不限量、无 defer。**复核：错配两臂对称（各 2 个轮询 + 2 个非轮询），且同臂 4 个 qid 时延均匀 ⇒ 不是 4.6× 原因，JFC_COUNT=6 不作判决实验** ⇒ 必须插桩 ⇒ NOF-064 |
-| NOF-064 | **已批准 2026-11-23（用户批准改码/重编/重启）· 待执行** | 逐 IO 插桩：① 子命令字段（nsid/lba/nbytes/iov_cnt/iov 分布/SQ/qpair/thread）② 轮询节奏（poll_round 增量、nvme_poll 轮与完成数、bdev_us）+ 一次性 worker/JFC 映射；两臂 T1 各 1 遍 + 反序复测；判 H1 没轮到 / H2 轮到但 CQ 空 / H3 两者均 1 而仍慢；回退=旧二进制 `979f5517…` |
+| NOF-064 | 已关闭 2026-11-23（**部分：改码/重编/重启完成；采集受阻**） | 新 target **1587271 / `21ced674…`**、验收全过、`NOF064_TRACE=1`；三份二进制并存（`nof059` 979f5517 / `nof064` 21ced674 / `nof064b` afe95672）。`worker_index 0→core3,1→core4,2→core5,3→core6,4→core7,5→core2`。**阻塞①重启使 nsid1 uuid 变（c697219c→63a1e3cd）⇒ `vseg_nof061` mount rc[-300]，plain 元数据不受影响**（产品级缺陷）；**阻塞②v1 插在 2214 而非读路径 1921 ⇒ `d_*` 是绝对值**。plain v1：client P50 317.44、bdev p50 225（**判为 printf 观测者效应，不可用**）⇒ NOF-065 |
+| NOF-065 | 已下发 2026-11-23（M3-5，沿用改码/重编/重启授权） | v3 插桩：printf→**环形数组 + 非 reactor 线程落盘**、补 iov 字段、`d_*` 改真 delta；重启后**新 cid `vseg_nof065` 写一次 400 keys**；两臂 T1 各 2 遍 + 各 1 遍 `TRACE=0` 对照（差 >5% 作废）；解析按 `bdev_us` 分桶、`iov[0].base` 分 NUMA 桶 |
 | NOF-053 | 已关闭 2026-11-23（**客户端分解；QoS 排除**） | 指定 `batch_get_*` 为 0（单 key Get 走 `get_into_breakdown`/`query_rpc_breakdown`/`transfer_data_breakdown`/`nof_slow_task`）。plain 每 key 283µs = **master 元数据 query 116µs（41%）** + submit 6 + wait 156（含 target W9 68，超出 88）+ 其他 5；**QoS/worker/dispatch 仅 8–11µs（~3%）**。vseg 2× **不是 setup/QoS**（query 103 vs 116 反而低），而是 **drain 350 vs 110µs、max_subio 362 vs 112（3.2×）**、submit 19 vs 6 ⇒ **客户端调度排除**，vseg 的 2× 在 target/传输 drain 段 |
 | NOF-050 | 已关闭 2026-11-23（**阻塞：SPDK 版本不兼容**） | 补丁/编译/链接成功（`bench-io-params` 530,162,656B / md5 fc2b5129…，strings 命中 3 条）；但新 bench 连 target 失败：客户端 SPDK **9a413a44** vs target 运行中 **e12b7cb**，握手 rc=-71/-104；同事原 bench（59662a26，匹配 e12b7cb）同 env/参数 rc=0、P50 473.52 / target W9 259.77。**口径修正**：该 P50 为 **node1 远端 reader**，与 NOF-040 本机 274 不可比（SLOT=1 未改变 P50）；target 现跑的是 **deleted 旧二进制 736a902f**，磁盘 d6c39465=9a413a44 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
@@ -3859,7 +3862,9 @@ vseg4 写/读是否成功与 Keys；vseg4 突发长度（32/16）与 submit 间�
 
 ---
 
-# NOF-064（待执行 · 第二阶段 M3-4：target 逐 IO 插桩——子命令字段 + 轮询节奏 · **需改码/重编/重启** · 2026-11-23）
+# NOF-064（已关闭·部分 · 改码/重编/重启完成；vseg 臂因重启 identity 变化不可挂载、v1 插桩位置错 · 2026-11-23）
+
+> 结果：三步全部完成——新 target **PID 1587271、md5 `21ced674…`**、4457 / nsid1=URMA_RAID0 / 11 盘 strip256K online / transport urma 验收全通过、`NOF064_TRACE=1`。二进制三份并存（`nof059` 979f5517 = 原 bd5ee124d；`nof064` 21ced674 = v1 在跑；`nof064b` afe95672 = v2 补读路径快照，已编译未运行）。编译坑：`nof064_*` 在 nvmf 库、bdev 模块不链它 ⇒ 计数器改定义在 `bdev_nvme.c`、`urma.c` 弱引用。**实测映射**：`worker_index 0→core3, 1→core4, 2→core5, 3→core6, 4→core7, 5→core2`（确证 NOF-063 的 stride 结构：只有 worker 0/1 = core3/core4 轮询 JFC）。**阻塞①（产品级事实）**：重启使 raid0/nsid1 uuid 由 `c697219c-1034-476f-aca8-ae3ac8de3567` 变为 `63a1e3cd-d735-4b0d-83ce-4b967fe490d7`（base bdev uuid 未变）⇒ `vseg_nof061` register rc=0 但 master mount `rc[-300] INVALID_VERSION`、reader `SUBMIT=0`；**plain `vseg_nofvseg` 仍正常挂载（100GiB）** ⇒ **vseg 元数据跨 target 重启失效、plain 不受影响**。**阻塞②**：v1 把快照插在写路径 `urma.c:2214`（PULLING），读走 `1921`（C2H, no pull）⇒ 读 IO 未取快照，`d_rounds=467,099,749` 等为绝对计数。已采 plain 臂 v1：client P50 **317.44**（400/0）、target 4,000 条 `NOF064_IO` bdev mean **248.8** / p50 **225** / p90 **312**、≤70µs 仅 16.6%。**开发侧判定：该 225µs 大概率是 per-IO printf 的观测者效应**（32 IO 在飞时逐条打印推迟后续 IO；plain 无插桩口径为 54µs），同一污染会让 `d_*` 失真并伪装出 H1 ⇒ **v1 数据不用于任何 bdev/`d_*` 结论**；另**弃用 JFC/stride 假设**（`exec_tick` 在 `handle_completion` 内、跨线程投递在其之前 ⇒ 不进 bdev_us 窗口）。⇒ NOF-065。
 
 ## 0. 授权与前置（**用户已于 2026-11-23 明确批准：改码 + 重编 + 重启 target**）
 
@@ -3914,3 +3919,65 @@ vseg4 写/读是否成功与 Keys；vseg4 突发长度（32/16）与 submit 间�
 ## 回执必答（第一行）
 
 是否获授权并完成改码/重编/重启（新 PID、md5、4457/RAID0 验收）；两臂子命令字段（nsid/lba/nbytes/iov_cnt/total_iov_bytes/SQ）是否一致；`d_rounds`/`d_nvme_poll`/`d_nvme_cpl` 与 `bdev_us` 的对应关系；H1/H2/H3 判定；同臂 4 个 qid 是否同值；worker_index/JFC 实测映射；根因假设与修复方案；有无失败/回退。
+
+---
+
+# NOF-065（待执行 · 第二阶段 M3-5：v3 零干扰插桩（环形缓冲 + 真 delta + iov 字段）+ 新 cid 一次写入 + 两臂 T1 采集 · 2026-11-23）
+
+## 0. 授权与三条前置判决（**必读，避免重复劳动**）
+
+- **授权**：沿用 2026-11-23 用户批准的范围（仅日志改码 + 重编 + 同 RPC 重启 target）；写入仅限本单 C3 的**一次** 400 keys（用户已在 NOF-064 回执的三选一中授权「重启 + 写入」）。
+- **判决 1：v1 的 plain 225µs 不可用**。per-IO `printf` 在 32 个 IO 在飞时会推迟后续 IO（plain 无插桩口径 54µs），同一污染也会让 `d_rounds/d_nvme_poll` 失真、把 H1 伪装成成立。⇒ 本轮必须改成**零干扰记录**（环形数组 + 独立线程落盘），并自带 on/off 对照。
+- **判决 2：JFC/stride 结构不解释 bdev_us**。`exec_tick` 在 `handle_completion` 内（读路径 `urma.c:1921`），而 qpair 的跨线程投递（`urma.c:2289`）发生在它**之前** ⇒ 不在 `exec→bdev_cpl` 窗口内。故 `stride=1` / `SPDK_URMA_JFC_COUNT=6` **不作为本问题的修复实验**（可作旁证，另立单）。
+- **判决 3（产品级新事实）**：target 重启使 raid0/nsid1 uuid 变化 ⇒ **vseg 元数据失效（mount rc[-300] INVALID_VERSION）**，plain 元数据不受影响。⇒ 任何重启后必须用**新 cid 重写数据**；旧 cid 的 vseg 元数据不要再尝试挂载。
+
+## A. 预检（只读）
+
+1. target 1587271 alive、4457、RAID0 11 base/11 operational、strip 256K、md5 `21ced674…`、`NOF064_TRACE=1`。
+2. 三份二进制路径与 md5（`nof059` 979f5517 / `nof064` 21ced674 / `nof064b` afe95672）；确认源码树 `urma.c` 已有 `*.nof064orig` 备份。
+3. 记录当前 nsid1 uuid（重启后再记一次，用于复现判决 3）。
+4. etcd：`/cvm|/oplog/vseg_nofvseg/`（plain 元数据，禁止删）、`vseg_nof061`（已失效、保留作证据）、`vseg_nof065`（预期 0）。
+
+## B. 插桩 v3（**只加日志**，基于 v2 `nof064b`）
+
+1. **去 printf**：`NOF064_IO` 的 per-IO 打印全部删除，改为写**静态环形数组**：预分配 ≥400,000 条 × 96B（≈38MB），每条带 `valid` 标记（先写 payload，最后 `__atomic_store_n(&valid,1,...)`）。
+2. **补 iov 字段**（`module/bdev/nvme/bdev_nvme.c` 组装 nvme 命令处）：`nsid`、`lba`、`nbytes`、`iov_cnt`、`iov[0].base`、`iov[0].len`、`total_iov_bytes`、`bdev_io` 指针；与 urma 记录用 `(cid,qid,lba,nbytes)` 关联。
+3. **真 delta**：`exec_tick` 处快照 `poll_round / nvme_poll_calls / nvme_cpl_total`，`req_complete` 处算差值（v1 打绝对值是因为读路径没快照）。
+4. **落盘**：起一个**非 reactor 的 pthread**（不进 SPDK reactor 集合），每 3s 把新增 `valid=1` 记录**追加**写 `/tmp/nof065_trace.bin`（每行一条，含时间戳），不阻塞 reactor；target 全程保持运行。
+5. **一次性打印**（允许 printf，非 IO 路径）：会话建立打印 `cid + hostnqn + 时间`；qpair 打印 `qid → worker_index → core → send_jfc_index`；启动打印 `worker_count / send_jfc_count / recv_jfc_count`。
+6. 开关 `NOF065_TRACE=1`，关闭时**零开销**；产物 `build/bin/nvmf_tgt.nof065`，**保留** 979f5517 / 21ced674 / afe95672 三份。
+
+## C. 重启 + 新 cid 写一次
+
+1. 停当前 target（记录 PID/md5/日志 offset），用 `nvmf_tgt.nof065` + 同 RPC 重放 + `NOF065_TRACE=1` 重启；验收同 NOF-064（4457 LISTEN / nsid1=URMA_RAID0 / 11 盘 BDF 升序 strip256K online / transport urma/udmac0d1e2 / handshake 失败 0）。**不通过 → 回退 `nof059` + 原 RPC 并停手**。
+2. 记录新 nsid1 uuid；起 vseg master **新 cid `vseg_nof065`**（slot=1、`--vsegment_stripe_size=4194304`、其余同 NOF-059 B1）；register；等 quota；验收 `partitions=1`、`reconcile_fail=0`。
+3. **T1 writer 写一次 400 keys**（`--num_threads=1 --batch_size=1`、vseg flags、verify=false；`VSEGMENT_CREATING` ≤3 次补齐）；验收 `Keys=400`、`logical_used=1,677,721,600`；记录写 params 的 `seg_lba` 集合（预期 0..3268608 步长 8192）。**此后全程禁止再写。**
+
+## D. 两臂采集（T1，各 2 遍 + 各 1 遍无插桩对照）
+
+1. **vseg 臂**（cid `vseg_nof065`）：T1 ×2，env 同 NOF-062 B2 + `NOF065_TRACE=1`；日志 `run/nof065_vseg_t1{,_r2}.log`。
+2. **vseg 对照**：T1 ×1，`NOF065_TRACE=0`；日志 `run/nof065_vseg_t1_notrace.log`。
+3. **plain 臂**（cid `vseg_nofvseg`，读**同一批 LBA**）：T1 ×2 instrumented + ×1 `TRACE=0`；日志 `run/nof065_plain_t1{,_r2,_notrace}.log`。
+4. 每遍结束等 ≥4s（等 flusher 落盘），记录 `/tmp/nof065_trace.bin` 的字节偏移区间与该遍 `cid`，便于按遍切分。
+5. 收尾：停两 master；**target 保持运行**（nof065 二进制）；不删 etcd 键。
+
+## E. 解析与判决（必答）
+
+1. **零干扰验证**：两臂 instrumented vs `TRACE=0` 的 client P50/P90，差值 >5% ⇒ **本轮数据全部作废**并停手回报（不要强行解释）。
+2. **命令是否真相同**：两臂 `iov_cnt / iov[0].base / iov[0].len / total_iov_bytes / nsid / lba` 的分布；把 `iov[0].base` 用 `/proc/<target>/numa_maps` **按 NUMA 节点分桶**（buffer 物理归属首次可查）。
+3. **H1/H2/H3**：按 `bdev_us` 分桶（<70 / 70–150 / 150–300 / >300µs）给 `d_rounds / d_nvme_poll / d_nvme_cpl` 的 p50/p90（**必须是 delta**）。
+4. **同臂 4 个 qid**：`bdev_us` 与 `d_*` 是否同值；给出实测 `qid→worker→core→jfc` 表。
+5. **判决**：① 设备收到的命令是否真相同（若 iov 不同，直接给差异项）；② 195µs 属 H1（没轮到）/ H2（轮到但 CQ 空）/ H3（两者均 ~1、仍是 250µs）；③ 若 H1：属主 reactor 同轮还在干什么（同轮其他 qpair 完成数、`check_lifetime_socket`、capsule 处理计数）；若 H2：转设备/队列方向；若 H3：查调度抢占（`/proc/<tid>/stat` involuntary_switches、CPU 迁移、steal）。
+6. **M3-6 修复方案**：唯一假设 + 改哪一行/哪个参数 + 预期（target bdev 250 → 60µs 量级）+ 验证口径。
+
+## F. 边界
+
+- 只加日志，**禁止**改控制流、加锁、改缓冲分配/SGL/buffer 类型、改 RPC 默认值。
+- 重启验收不通过 → 回退 `nof059`（979f5517）+ 原 RPC + 原启动脚本，停手回报。
+- 写入仅 C3 一次；D 段零写入；不删 `/cvm|/oplog/vseg_nofvseg/`。
+- 脚本放 `/tmp`；产物 `run/nof065_*.txt`（≤3 个、每个 ≤1MB）；完整 trace 放 `/tmp/nof065_trace.bin`（不受 1MB 限制）。
+- 失败停手保现场；任何"看起来能解释但没达到零干扰验证"的结论一律不写。
+
+## 回执必答（第一行）
+
+零干扰对照结果（instrumented vs TRACE=0 的 P50 差）；两臂 iov 字段是否相同（含 `iov[0].base` 的 NUMA 桶）；`bdev_us` 分桶下的 `d_rounds/d_nvme_poll/d_nvme_cpl`（delta）；H1/H2/H3 判定；同臂 4 qid 是否同值；`qid→worker→core→jfc` 实测表；M3-6 修复方案；有无失败/回退。

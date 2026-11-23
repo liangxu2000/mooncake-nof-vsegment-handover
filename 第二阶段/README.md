@@ -5,7 +5,7 @@
 - 目录约定：**第二阶段所有内容（文档、代码补丁、测量数据）统一放在 `第二阶段/` 目录下**；本文件为总文档/索引
 - 数据来源：`../HANDOVER.md` 各单回执 + 第一阶段最终报告 `../工作汇总.md`
 - 相关文件：`../HANDOVER.md`（任务通道）、`../工作汇总.md`（第一阶段最终报告）
-- **当前状态（2026-11-23）**：M2 完成；M3-0（NOF-060）两臂提交层同构；M3-1（NOF-061）同数据 plain 快 4.64× ⇒ 差异在 vseg 读路径/会话；**M3-2（NOF-062）定案：bdev p50 T1 249/54 → T4 262/259 → T16 270/265，gap 随并发强收敛，差异 100% 在 `bdev_us`**；**M3-3（NOF-063）静态取证：全链路无 50–500µs 时间常量；发现 `stride=worker_count=6` vs `send_jfc_count=2` 的结构错配，但开发侧复核判定其两臂对称、且同臂 4 个 qid 时延均匀 ⇒ 不是 4.6× 的原因，`SPDK_URMA_JFC_COUNT=6` 不作判决实验**。**NOF-064 已下发（M3-4，需改码/重编/重启，待用户批准）**：逐 IO 插桩——子命令字段（nsid/lba/nbytes/iov_cnt/iov 分布/SQ）+ 轮询节奏（`poll_round` 增量、`nvme_poll` 轮与完成数、`bdev_us`），判 H1 没轮到 / H2 轮到但 CQ 空 / H3 两者均 ~1 而仍慢。**重启不可回退 e12b7cb**。详见第 0 节（0.10–0.15）、「最小重建配方」与 `patches/README.md`。
+- **当前状态（2026-11-23）**：M3-0（NOF-060）提交层同构；M3-1（NOF-061）同数据 plain 快 4.64×；M3-2（NOF-062）**bdev p50 T1 249/54 → T4 262/259 → T16 270/265，差异 100% 在 `bdev_us`**；M3-3（NOF-063）静态无 50–500µs 常量，JFC/stride 结构错配经复核**不进 bdev_us 窗口**（`exec_tick` 在 `handle_completion` 内、跨线程投递在其前）；**M3-4（NOF-064）改码/重编/重启三步完成（target 1587271 / `21ced674…`），但两处受阻：① 重启使 raid0/nsid1 uuid 变化 ⇒ vseg 元数据 mount rc[-300]（plain 不受影响，产品级缺陷）；② v1 插桩插在写路径 2214 而非读路径 1921，`d_*` 为绝对值**。**v1 的 plain 225µs 判为 per-IO printf 观测者效应（无插桩口径 54µs），不用于任何结论**。**NOF-065 已下发（M3-5，沿用改码/重编/重启授权）**：v3 零干扰插桩（printf→环形数组 + 独立线程落盘、补 iov 字段、`d_*` 改真 delta）→ 重启后新 cid `vseg_nof065` 写一次 400 keys → 两臂 T1 各 2 遍 + 各 1 遍 `TRACE=0` 对照（差 >5% 整轮作废）→ 按 `bdev_us` 分桶判 H1/H2/H3、`iov[0].base` 分 NUMA 桶。**重启不可回退 e12b7cb**。
 - 一句话：**数据/盘无罪、target 看到的命令与顺序也与 plain 完全相同，但 vseg 每条 128KiB 读在 target 的 bdev 执行段多花 ~210µs。第二阶段的目标就是把这 210µs 找出来并消掉。**
 
 ---
@@ -64,7 +64,8 @@
 | **M3-0** | 客户端 NoF 提交层取证（零环境） | **已完成 2026-11-23（NOF-060）** | **两臂完全同构**：params 除 child 外全同（op/blocks=8192/bytes=4MiB/block_size=512/endpoint/lane/domain/ptr 对齐）；源码 `transfer_task.cpp:3076` 同一函数同参数、128KiB chunk、8MiB/lane、task 内 32 IO 同 qpair；child 仅日志标签。URMA_SLOW_IO 有绝对 tick；唯一实测差异=突发 16 vs 32（2MiB-child 时代），vseg4 未获取 |
 | **M3-1** | 同一数据两读路径 + 逐 128KiB 时钟（零构建、target 不重启） | **已完成 2026-11-23（NOF-061）** | 写 LBA 集合与 plain 逐值相同；零写入用 plain 元数据读同一批 LBA：**plain P50 308.37 / bdev 57µs** vs **vseg P50 573.03 / bdev 249µs**；同 LBA 配对 12,324 条 **246 vs 53（4.64×）**，plain 更快 85.1% ⇒ **差异在 vseg 读路径/会话**。vseg4 突发 31（4MiB）与 plain 相同；新增排除：突发形态、target lcore（同核仍 4.3×）、顺序/预热 |
 | **M3-3** | URMA transport 轮询/阻塞路径源码取证（零环境） | **已完成 2026-11-23（NOF-063）** | 主链 `transport.c:777→779`→`urma.c:2303`（81 行）；**无 50–500µs 常量**（`urma_poll_jfc` 无 timeout、无 sleep/spin）；结构：`stride=worker_count=6` vs `send_jfc_count=2` ⇒ 仅 worker 0/1 轮询网络，qpair JFC=建连序 mod 2 与属主无对齐；**复核：两臂对称 + 同臂 4 qid 同值 ⇒ 不解释 4.6×**；本地 NVMe 每轮不限量、无 defer ⇒ 静态无法定位，转插桩 |
-| **M3-4** | target 逐 IO 插桩（子命令字段 + 轮询节奏） | **NOF-064 已下发（待用户批准改码/重编/重启）** | 判定设备收到的命令是否真相同（iov_cnt/SQ/lba 全字段），并用 `d_rounds`/`d_nvme_poll`/`d_nvme_cpl` 分开 H1 没轮到 / H2 轮到但 CQ 空 / H3 两者均 ~1；回退锚点 md5 `979f5517…` |
+| **M3-4** | target 逐 IO 插桩（子命令字段 + 轮询节奏） | **部分完成 2026-11-23（NOF-064）** | 改码/重编/重启全过（PID 1587271 / md5 `21ced674…`，`NOF064_TRACE=1`；三份二进制保留）；`worker_index 0→core3,1→core4,2→core5,3→core6,4→core7,5→core2`。**阻塞①重启使 nsid1 uuid 变化 ⇒ `vseg_nof061` mount rc[-300]（plain 元数据正常）**；**阻塞②v1 插在写路径 2214、读走 1921 ⇒ `d_*` 为绝对值**。plain v1 bdev p50 225µs **判为 printf 观测者效应（不可用）** |
+| **M3-5** | v3 零干扰插桩 + 新 cid 写入 + 两臂对照 | **NOF-065 已下发** | 环形数组（≥400k 条）+ 非 reactor 线程 3s 落盘；补 `iov_cnt/iov[0]/total_iov_bytes`；`d_*` 改真 delta；重启后新 cid `vseg_nof065` 写一次；两臂各 2 遍 + 各 1 遍 `TRACE=0`（差 >5% 作废）；`bdev_us` 分桶 + `iov[0].base` 分 NUMA 桶 |
 | **M1c** | target 侧插桩（SGL/bdev 提交参数/分段 tick） | 需重编 target + 重启（用户批准） | 定位 210µs 在 raid0 队列/NVMe/回调哪一段 |
 
 - NOF-048（最小重建验证）已完成，配方已用于 M1a；构建基线是否升级 tip 视后续需要（S2 暂缓）。
@@ -315,7 +316,8 @@ target 重启 **PID 708167**（bd5ee124d / md5 979f5517…，**无 BUFFER**，�
 | vseg 元数据/会话层（vseg master 解析、endpoint/segment、target 会话资源） | NOF-061 | **已定案为本行**：同一份 vseg 数据用 plain 路径读 bdev 57µs vs vseg 249µs；同 LBA 配对 4.64× |
 | 会话/qpair 身份的**作用机制**（完成检测/唤醒 vs 每命令固有 vs 恒定排队） | NOF-062 | **已定案：完成检测/唤醒类**——gap T1 195µs → T4 3µs → T16 5µs，差异 100% 在 bdev_us |
 | 那 195µs 在源码里的来源（阻塞等待/超时/批量/事件合并/轮询预算） | NOF-063 | **已排除常量/阻塞**：无 50–500µs 常量、无 sleep；结构错配两臂对称 ⇒ 不解释 |
-| 设备实际收到的子命令与 target 轮询节奏（插桩） | NOF-064 | **待查**：iov_cnt/SQ/lba + `d_rounds`/`d_nvme_poll`/`d_nvme_cpl` |
+| 设备实际收到的子命令与 target 轮询节奏（插桩） | NOF-064 | **受阻**：重启使 vseg 元数据失效 + v1 插桩错位/打印污染 |
+| 零干扰插桩下的 iov 字段与轮询 delta | NOF-065 | **待查**：环形缓冲 + 真 delta + `iov[0].base` NUMA 桶 |
 | 测量伪影 | NOF-035 | plain 96.9→99.14 可复现 |
 | 传输/客户端 | NOF-041 | data/outside 反而更小 |
 | 连接预热 | NOF-039 | warmup 不能跳过；慢区是固定段 |
