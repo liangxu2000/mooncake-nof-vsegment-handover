@@ -118,12 +118,33 @@ bench 的线程 buffer 由 `numa_alloc_onnode` 分配后 `client_->register_buff
 
 ## 4. 代码改造方案（分里程碑）
 
-### M0：建立我们自己的可重建构建树（前置）
+### M0：建立我们自己的可重建构建树（前置）——已完成（NOF-047，2026-11-23）
 
-- 复制同事源码 `/home/yin/nof/mooncake-vesegment`（HEAD be10be2 + 两个 go.mod/go.sum 改动）与我们需要的 SPDK 源码（yin `spdk-cpu`，HEAD e12b7cb + 其工作区改动）到 `/home/l00955908/mooncake-nof-vsegment/build/` 下，**不改动同事原树**；
-- 复用/复制对应 build 目录，修正 CMake/Make 路径；
-- 目标：**原样重编一次，产物 md5 与同事二进制一致**（证明构建链可复现）；记录编译命令、耗时、磁盘占用；
-- 保留原二进制与 md5 作为回退基线。
+**已复制并校验（全部 md5 MATCH，共 8.82 GiB）**，位于 `/home/l00955908/mooncake-nof-vsegment/build/`：
+
+| 副本 | 大小 | 校验 |
+|---|---|---|
+| `mooncake-src/` | 197M | HEAD be10be2、status 2 行（go.mod/go.sum）MATCH |
+| `mooncake-build-colleague/` | 7.7G | `stress_cluster_bench` md5 59662a26… MATCH |
+| `spdk-src/` | 763M | HEAD 9a413a44…、status 0 行 MATCH；含自带 build/ |
+| `spdk-build/` | 298M | `nvmf_tgt` d6c39465…、`libspdk_nvmf.a` 107a761b… MATCH |
+
+**构建配置（来自同事 CMakeCache）**：Release；USE_NOF=ON、USE_NOF_URMA=ON、USE_UB=ON、USE_NOF_GPU_DIRECT=OFF、USE_UBSHMEM=OFF、YLT_ENABLE_URMA=ON、STORE_USE_ETCD=ON；SPDK_INCLUDE_DIR=/usr/local/include、SPDK_LIB_DIR=/usr/local/lib；NOF_URMA/URMA lib=/usr/lib64/liburma.so。
+
+**重要约束（M1 必须遵守）**：
+
+1. **SPDK 纯静态**：`spdk-build/lib` 74 个 `.a`、0 个 `.so`，`/usr/local/lib` 同样纯静态 ⇒ 插桩后不能靠 `LD_LIBRARY_PATH` 换库，必须**用我们的 `.a` 重新链接** bench/nvmf_tgt。
+2. **路径耦合**：`mooncake-build-colleague/CMakeCache.txt` 与 `spdk-src/mk/config.mk` 内仍写死 `/home/yin/nof/...`；新建 build 目录重配置或做最小重链，不能直接依赖同事原树。
+3. **正在跑的 target 是 deleted 旧二进制**：PID 341038 的 `/proc/exe` md5 **736a902f…**，磁盘 `spdk-src/build/bin/nvmf_tgt` 是 **d6c39465…** ⇒ target 侧插桩生效必须换进程启动（需用户批准，并先完整抓取/复现 RPC 配置）。
+4. 冗余 298MB（`spdk-src/build` 与 `spdk-build` 相同）：暂保留作回退参考。
+
+**补丁定位（已确认）**：
+
+- target 读提交点：`spdk-src/lib/nvmf/ctrlr_bdev.c:466-467`（p99_read_enter_tick）；`URMA_BDEV_DETAIL` 在 `spdk-src/lib/nvmf/urma.c`；
+- 客户端 capsule/SGL 构造：`spdk-src/lib/nvme/nvme_urma.c:995-1056`；
+- Mooncake：`submitSpdkNofOperation` 在 `mooncake-src/mooncake-store/src/transfer_task.cpp:3047`，`ResolveBuffer` 在 `1080-1106`。
+
+**M0 下一步（NOF-048，M1a-0）**：只读取证 compile/link 命令，做一次**最小重建**（只重编一个未改文件 + 重链新 bench），验证构建路径；不跑 bench、不动 target/master。
 
 ### M1：插桩（只加日志，不改行为）
 

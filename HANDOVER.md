@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-047（第二阶段 M0：构建/依赖取证 + 复制源码与 build 到我们目录）**
+- 当前任务：**NOF-048（第二阶段 M1a-0：Mooncake 最小重建验证（未改源码））**
 
 ## 第二阶段（2026-11-23 起）
 
@@ -126,7 +126,8 @@
 | NOF-044 | 已关闭 2026-11-23（**明细已有但退化，不重启**） | 现有 13,767 条 `URMA_BDEV_DETAIL`（8 计时字段），但 `submit_to_callback_us ≡ bdev_us`（全量）、其余子段≈0 ⇒ 拆不开 raid0/NVMe；无时间戳、trace_seq 每会话重置、LEGACY 只采 ≥40µs（plain 偏斜）；cmdline 仅 `-m [2-7] --wait-for-rpc`，重启需 RPC 重放 ⇒ 按 A4 不重启 |
 | NOF-045 | 已关闭 2026-11-23（**vseg 区数据无罪，慢在 vseg 路径**） | 裸 SPDK 顺序 QD1：A（vseg 区 1.6G）p50 **40.96**/W9 **91.57**；B（plain 区 3.2G）**41.28/91.28**；C（0.5G）**215.04/155.79**；D（0–0.5G）**212.48/153.92**；E（同 A 区随机）**220.16/188.90** ⇒ 高 LBA 的 vseg 数据裸读快（41µs）而 Mooncake-vseg 253µs ⇒ **慢在 vseg 路径（+~210µs）**；低 LBA [0,~1GiB) 盘本身慢；盘对顺序/随机极敏感（41 vs 220µs，vseg 253 正在"随机档"） |
 | NOF-046 | 已关闭 2026-11-23（**顺序假设证否**） | **q1 单 lane：rx/exec/submit 顺序逆序对全 0、位移 0、单 lcore、submit=exec 100%**，但 bdev 仍 **223–265µs**（plain 同 lcore 43–52）；q4 逆序 61/496 仅来自 4 lane×2 child 的 8 条顺序流交错，且 q4≈q1 ⇒ 顺序不是差异来源；bdev 随执行次序仅 +19–24%（三种读法一致，通用排队）⇒ **"盘看成随机档"解释不成立**，剩余只有 target bdev 提交侧参数（buffer/描述符/flags/stride）需代码插桩 |
-| NOF-047 | 已下发（2026-11-23，第二阶段 M0） | 只读取证 Mooncake/SPDK 构建配置、依赖与补丁上下文；把源码与 build 复制到我们目录（不改同事原树、不构建、不跑服务），为 M1 插桩构建做准备 |
+| NOF-047 | 已关闭 2026-11-23（第二阶段 M0） | 复制 8.82GiB（Mooncake 源/build、SPDK 源/build），HEAD/status/关键二进制与静态库 md5 全部 MATCH；配置：Release、USE_NOF/NOF_URMA/UB/ETCD=ON、SPDK 指 /usr/local（**纯静态 74 个 .a、0 .so**）；**正在跑的 target 是 deleted 旧二进制（736a902f），磁盘为 d6c39465**；补丁点：target `ctrlr_bdev.c:466-467`、client `nvme_urma.c:995-1056`、Mooncake `transfer_task.cpp:3047/1080-1106` |
+| NOF-048 | 已下发（2026-11-23，M1a-0） | 只读取证 compile/link 命令；用**最小重建**（只重编一个未改文件 + 重链新 bench）验证构建路径，`--help` 通过即停；不跑 bench、不动 target/master |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
@@ -2886,3 +2887,46 @@ vseg q4/q1 与 plain 的 target rx/exec 顺序（逆序对/断点/样例）、bd
 ## 回执必答（第一行）
 
 CMake 关键配置与源码/SPDK 基线；复制是否完成（路径/占用/校验）；补丁上下文（bdev 提交点、capsule/SGL 构造点、Mooncake 行号）；构建配方建议（下一步怎么在我们的副本里构建）；有无失败。
+
+---
+
+# NOF-048（待执行 · 第二阶段 M1a-0：Mooncake 最小重建验证（未改源码）· 2026-11-23）
+
+## 背景与目标
+
+- NOF-047 已把 Mooncake/SPDK 源码与 build 复制到 `$D=/home/l00955908/mooncake-nof-vsegment/build`（md5 全 MATCH）。
+- 直接新建 cmake build 目录可能因依赖（FetchContent/_deps、无外网）或路径耦合失败；先用**最小重建**验证：
+  1. 从现有 build 里提取 `transfer_task.cpp` 的编译命令与 `stress_cluster_bench` 的链接命令；
+  2. **只重编一个未改动的源文件 + 重链一个新 bench**（不改任何源码、不覆盖现有二进制）；
+  3. `--help` 能跑即停。
+- 本单**不跑 bench、不动 target/master、不写盘数据**；为 M1a 插桩构建拿到确切配方。
+
+## A. 只读取证（回执必须给）
+
+1. 从 `$D/mooncake-build-colleague/compile_commands.json` 提取 `mooncake-store/src/transfer_task.cpp` 的**完整编译命令**（≤20 行，含 include/flags）。
+2. 找到 `stress_cluster_bench` 的**链接命令**：优先 `.../mooncake-store/benchmarks/CMakeFiles/stress_cluster_bench.dir/link.txt`；若没有，用 `gmake -C $D/mooncake-build-colleague -n stress_cluster_bench` 取（不实际执行）。
+3. 依赖布局：该 build 是否用 FetchContent/_deps（路径在哪、是否都在 build 目录内）；是否仍有 `/home/yin/...` 绝对路径（列关键项）。
+4. 现有 `transfer_task.cpp.o` 的路径/时间；`stress_cluster_bench` 现有二进制路径/md5/大小。
+
+## B. 最小重建（不跑 bench）
+
+1. 用 A1 的命令编译 **`$D/mooncake-src/mooncake-store/src/transfer_task.cpp`（未改）**，输出到 `/tmp/nof048/transfer_task.o`；只改输入/输出路径，flags 原样。
+2. 用 A2 的链接命令，把该 .o **替换**原 `transfer_task.cpp.o` 的位置，链接出一个**新二进制** `$D/bench-rebuild-test`；不覆盖任何现有二进制。
+3. 运行 `$D/bench-rebuild-test --help | head -30`（只跑帮助）；记录退出码、md5、大小。
+4. 若编译或链接失败：报第一个错误（≤20 行）+ 缺失项（头文件/库/依赖），停手；**不要**改为全量 cmake 构建。
+5. 若链接命令依赖 `_deps` 或 `/home/yin` 路径：记录这些路径是否仍存在/可读；若不可读，停手回报（不要复制/修改同事原树）。
+
+## C. 交付
+
+- 可复现的**编译命令 + 链接命令**（M1a 直接复用）；
+- 最小重建是否成功、新 bench md5/大小、`--help` 结果；
+- 需要开发侧决策的偏差（≤5 条）。
+
+## D. 边界
+
+- 不修改任何源码；不改同事原树；不构建整个项目；不跑 bench。
+- 临时文件放 `/tmp/nof048/`；结束后可删；不写盘数据。
+
+## 回执必答（第一行）
+
+编译/链接命令是否取得；最小重建是否成功（新 bench md5/大小/`--help`）；依赖与路径是否可读；有无失败。
