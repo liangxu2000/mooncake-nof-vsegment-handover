@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-052（第二阶段 M1b：plain 同客户端对照采集，判定 domain/客户端版本是否混淆）**
+- 当前任务：**NOF-053（第二阶段：解析现有客户端 breakdown 日志，分解每 key 客户端开销；零环境）**
 
 ## 第二阶段（2026-11-23 起）
 
@@ -22,7 +22,9 @@
 - **关键事实**：target 现跑的是 **deleted 旧二进制 736a902f**；磁盘上的 `nvmf_tgt` = **d6c39465（9a413a44）**。任何 target 重启都会永久切到 9a413a44（旧 e12b7cb 二进制不可恢复）。
 - **A 路线已成功（NOF-051，2026-11-23）**：e12b7cb 本身因系统 UMDK 缺 `is_gpu_seg` 编不过；改用 **wire v4 的紧邻后继 bd5ee124d**（GPU 注册 opt-in）构建成功；重链的 `bench-io-params-e12` 在 **node3 本机握手成功**。**wire 谱系**：e12b7cb / bd5ee124d / 170cbb9 = **v4**；91763b015 / 9a413a44 = **v6**（握手失败的根因）。
 - **vseg 参数（NOF-051）**：SUBMIT/WORKER 1056/1056；ptr 注册域 100%；child seg_lba 差 4096 blocks；lane 4 路均匀；buf_type=kHost、device=-1、**domain 全非空**；target W9 258.55µs、端到端 P50 569.78（node3 本机）。
-- **下一步（NOF-052）**：用**同一个 bd5ee124d 客户端 + 同一插桩 bench** 跑 plain，比较 domain/params/target W9——若 plain 的 domain 不同或 W9 降到 ~46–70 ⇒ vseg 差异真实；若 plain 也 ~250 ⇒ 新客户端版本是混淆变量（历史 plain 46 是旧客户端）。
+- **NOF-052 结果（公平对照，2026-11-23）**：plain 新客户端 W9 **132.77µs** / 旧客户端 **133.29µs**（+0.4%）⇒ **客户端版本对 W9 无影响**；plain/vseg 的 domain **完全相同**（非空 0x143cd90）⇒ **domain 排除**；**vseg 258.55 vs plain 132.77 = +125.8µs（1.95×）**。历史 plain 46–68µs 是 **slot=1024** 口径，在 slot=1 下不可复现 ⇒ **旧的 3.75×/210µs 对照不再成立，公平差距是 1.95×/+126µs**。
+- **新发现**：两臂 `P50 − W9` = vseg **311µs** / plain **147µs**，≈**147µs/task 的客户端开销**（vseg 2 task/key、plain 1 ⇒ 2.11× vs 2.00×）；它放大了端到端差异（570 vs 280），但 target W9 的 1.95× 仍是数据面核心。
+- **下一步（NOF-053）**：零环境解析现有客户端 breakdown 日志（`batch_get_data_breakdown`/`batch_get_nof_wait_breakdown`/`transfer_data_breakdown`，vseg NOF-040 与 plain NOF-039 均 node3 本机、诊断开），分解 setup/submit/wait/QoS/worker，定位 147µs/task 的构成；再决定 target 侧插桩（需重启批准）或客户端优化。
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -139,7 +141,8 @@
 | NOF-048 | 已关闭 2026-11-23（**通过**；基线仍待升级） | 最小重建成功：编译 61s、链接 4s，新 bench 530,148,040B / md5 43ba518d…，`--help` 与原版仅差第 1 行程序名；配方 = 编译 `transfer_task.cpp` → 复制 `libmooncake_store.a` 并用 `ar r` 替换成员 → 按 link.txt 重链；无 `_deps`、`/home/yin` 全可读。**注意：编译 -I 指向同事树（改头文件需前置我们的 include）、SPDK 用 /usr/local 静态库（target 插桩需换 `$D/spdk-build/lib` 重链）、新 bench RPATH 依赖同事 common/etcd**。构建基线仍建议 S2 升级到 tip 4c0ea28 |
 | NOF-049 | 已关闭 2026-11-23（**诊断排除**） | 同环境同 key T1 两臂：ON W9 **258.85** / OFF **251.75µs（−2.7%）**、端到端 P50 504.11→494.56（−1.9%）；OFF 日志 167KB 且 `URMA_SLOW_IO`/`nof_slow_task`/`nof_vsegment_operation`/`transfer_data_breakdown` 全 0（env 生效）；两臂 exec 占比 96.2–96.3% ⇒ **默认诊断/客户端背压不是 210µs 来源**。注意绝对 P50 494–504 与 NOF-040 274 不一致（疑 slot env/集群变化），后续固定口径 |
 | NOF-051 | 已关闭 2026-11-23（**通过；版本对齐成功**） | e12b7cb 因系统 UMDK 缺 `is_gpu_seg` 编不过；改用**同 wire v4 的紧邻后继 bd5ee124d**（GPU 注册 opt-in）构建成功（5 min、74 libs）；重链 `bench-io-params-e12`（md5 88ad3134…）在 **node3 本机握手成功**。vseg 采到 SUBMIT/WORKER **1056/1056**（400+128 keys ×2 child）；**ptr 注册域命中 100%**（2 个 ptr，child1=+2MiB）；child seg_lba 差恒 4096 blocks；lane/worker 各 264 均匀；buf_type=kHost、device=-1、**domain 全为非空 0x143cd90**；target W9 **258.55µs**（exec 97.2%）、端到端 P50 569.78（node3 本机） |
-| NOF-052 | 已下发（2026-11-23，M1b） | 切 plain 环境，用**同一个 bd5ee124d 客户端 + 同一插桩 bench**在 node3 本机跑 plain T1 读；比较 domain/ptr/child/lane/params、target W9、端到端——判定 vseg 差异是否真实，以及"新客户端版本"是否混淆 plain 基线 |
+| NOF-052 | 已关闭 2026-11-23（**公平对照：1.95×；domain/客户端版本排除**） | plain 同新客户端（bd5ee124d）W9 **132.77µs**、旧客户端（59662a26）**133.29µs**（+0.4%）⇒ 客户端版本无影响；plain/vseg 的 domain **完全相同**（非空 0x143cd90）⇒ domain 排除；**vseg 258.55 vs plain 132.77 = +125.8µs（1.95×）**；task 数 1056/528、P50−W9 311/147µs（≈147µs/task 客户端开销）。历史 plain 46–68µs 在 slot=1 不可复现（slot=1024 口径），3.75× 的旧对照不可直接比 |
+| NOF-053 | 已下发（2026-11-23） | 零环境：解析现有 `batch_get_data_breakdown`/`batch_get_nof_wait_breakdown`/`transfer_data_breakdown`（NOF-040 vseg、NOF-039 plain，均 node3 本机、诊断开），分解 setup/submit/wait/QoS/worker 开销，定位 ≈147µs/task 客户端成本的构成 |
 | NOF-050 | 已关闭 2026-11-23（**阻塞：SPDK 版本不兼容**） | 补丁/编译/链接成功（`bench-io-params` 530,162,656B / md5 fc2b5129…，strings 命中 3 条）；但新 bench 连 target 失败：客户端 SPDK **9a413a44** vs target 运行中 **e12b7cb**，握手 rc=-71/-104；同事原 bench（59662a26，匹配 e12b7cb）同 env/参数 rc=0、P50 473.52 / target W9 259.77。**口径修正**：该 P50 为 **node1 远端 reader**，与 NOF-040 本机 274 不可比（SLOT=1 未改变 P50）；target 现跑的是 **deleted 旧二进制 736a902f**，磁盘 d6c39465=9a413a44 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
@@ -3095,7 +3098,9 @@ e12b7cb 构建是否成功与新 bench md5/版本串；握手是否成功；参�
 
 ---
 
-# NOF-052（待执行 · 第二阶段 M1b：plain 同客户端对照采集 · 2026-11-23）
+# NOF-052（已关闭 · 公平对照 1.95×；domain/客户端版本排除；发现 147µs/task 客户端开销 · 2026-11-23）
+
+> 结果：plain 同新客户端 W9 **132.77µs**、旧客户端 **133.29µs**（+0.4%）⇒ 客户端版本无影响；plain/vseg 的 domain 完全相同（非空）⇒ domain 排除；**vseg 258.55 vs plain 132.77 = +125.8µs（1.95×）**。历史 plain 46–68 是 slot=1024 口径，旧的 3.75×/210µs 不再成立。两臂 P50−W9 = 311/147µs ⇒ ≈147µs/task 客户端开销。详见"第二阶段"上方决策说明。
 
 ## 背景与目的
 
@@ -3146,3 +3151,56 @@ e12b7cb 构建是否成功与新 bench md5/版本串；握手是否成功；参�
 ## 回执必答（第一行）
 
 plain 参数行数/domain/ptr 命中/child/lane/blocks；plain 的 target W9 与端到端 P50；**domain 是否不同、plain W9 是否仍 ~46–70、P50−W9 是否 ~311**；有无失败。
+
+---
+
+# NOF-053（待执行 · 第二阶段：解析现有客户端 breakdown 日志，分解每 key 客户端开销 · 零环境操作 · 2026-11-23）
+
+## 背景
+
+- NOF-052：vseg P50 569.78 / W9 258.55；plain P50 279.95 / W9 132.77；`P50 − W9` = **311 / 147µs**，≈**147µs/task**（vseg 2 task/key、plain 1）。这个客户端开销放大了端到端差异，需要知道它落在哪一段。
+- 客户端源码（be10be2）已有三类 breakdown 日志（诊断开时输出）：
+  - `batch_get_data_breakdown`：`setup_us / submit_us / wait_blocked_us / checksum_us / result_us / lease_us / total_us`；
+  - `batch_get_nof_wait_breakdown`：`nof_tasks / sub_ios / ready_before_wait / blocked_futures / future_wait_* / dispatch_queue_* / worker_setup_* / tasks_ahead_* / qos_fifo_wait_*`；
+  - `transfer_data_breakdown`：`op / replica / strategy / slices / bytes / submit_us / wait_us / total_us / status`。
+
+## A. 输入（node3 `run/`，只读；先确认存在，缺失则停手回报）
+
+- vseg：`nof040_vseg_t1_q4.log`（T1 q4、诊断开、旧客户端、slot=1、400 keys）
+- plain：`nof039_read_t1_w400.log`（T1、诊断开、slot=1024、1200 keys）
+- **口径注意**：两者 master 负载/slot 不同，绝对值不可直接比；本单看**组件占比与结构**，以及 vseg 内 task 翻倍的影响。
+
+## B. 解析
+
+1. 统计每份日志中三类 breakdown 的行数。
+2. `batch_get_data_breakdown`（每 key 一行）：n、p50/p90/mean 的 `setup_us / submit_us / wait_blocked_us / checksum_us / result_us / lease_us / total_us`；并检查 `total_us` 与各分项之和的残差。
+3. `batch_get_nof_wait_breakdown`（每批一行）：`nof_tasks / sub_ios / ready_before_wait / blocked_futures / future_wait_* / dispatch_queue_avg / worker_setup_avg / tasks_ahead_avg / qos_fifo_wait_avg` 的 n 与均值/分位。
+4. `transfer_data_breakdown`（每 transfer 一行）：n、`submit_us / wait_us / total_us` 的 p50/p90；plain 与 vseg 的每 key transfer 数（预期 1 vs 2）。
+5. 若日志含有 trace_id/时间戳，可按 key 对齐并给出 3 个 key 的完整时间线（≤20 行样例）；没有则只做聚合。
+
+## C. 回答
+
+| 组件 | vseg（NOF-040） | plain（NOF-039） | 备注 |
+|---|---|---|---|
+| setup_us p50 | ? | ? | 控制面/元数据 |
+| submit_us p50 | ? | ? | 提交 |
+| wait_blocked_us p50 | ? | ? | 传输等待 |
+| checksum/result/lease | ? | ? | 其他 |
+| total_us p50 | ? | ? | 每 key |
+| dispatch_queue_avg / worker_setup_avg / qos_fifo_wait_avg | ? | ? | 客户端调度 |
+| transfer wait_us p50 / 每 key 次数 | ? | ? | 1 vs 2 |
+
+- 明确回答：
+  1. **147µs/task 的客户端开销主要落在哪一段**（控制面 setup / 传输 wait / QoS/worker / 其他）？
+  2. vseg 的每 key 开销为什么约为 plain 的 2×：是 `wait_blocked` 随 task 数翻倍，还是 setup/QoS 也翻倍？
+  3. `transfer_data_breakdown.wait_us` 与 target W9 的关系（wait_us 是否包含 W9；能否用 wait_us − W9 得到客户端/传输层开销）；
+  4. 对下一步的含义：若控制面 setup 占主导 → 优化 master/route；若 QoS/worker 占主导 → 客户端调度；若 wait 占主导 → target/传输。
+
+## D. 边界
+
+- **零环境操作**：不跑 bench、不动 target/master、不写任何文件；只读日志 + /tmp 脚本。
+- 回执只给汇总表、分位与 ≤20 行样例；不贴原始日志、不外传数据。
+
+## 回执必答（第一行）
+
+三类 breakdown 行数；vseg/plain 的各分项 p50（setup/submit/wait/QoS/worker）；**147µs/task 落在哪一段、vseg 为何约 2×**；有无缺失字段/失败。

@@ -5,7 +5,7 @@
 - 目录约定：**第二阶段所有内容（文档、代码补丁、测量数据）统一放在 `第二阶段/` 目录下**；本文件为总文档/索引
 - 数据来源：`../HANDOVER.md` 各单回执 + 第一阶段最终报告 `../工作汇总.md`
 - 相关文件：`../HANDOVER.md`（任务通道）、`../工作汇总.md`（第一阶段最终报告）
-- **当前状态（2026-11-23）**：M0/NOF-048 已完成；S0 诊断排除；S2 暂缓；**M1a-1 已打通（NOF-051：e12b7cb 不可编，改用同 wire v4 的 bd5ee124d 客户端，node3 本机握手成功并采到 vseg 参数）**；当前进入 **M1b（NOF-052：plain 同客户端对照）**。关键待答：plain 的 domain 是否不同、plain 的 target W9 是否仍 ~46–70（若也 ~250，则新客户端版本是混淆变量）。详见下方第 0 节（0.6/0.7）、「最小重建配方」与 `patches/README.md`。
+- **当前状态（2026-11-23）**：M0/NOF-048 已完成；S0 诊断排除；S2 暂缓；M1a-1 打通（bd5ee124d v4 客户端）；**M1b 已完成（NOF-052）：公平对照为 vseg 258.55 vs plain 132.77 = +125.8µs（1.95×），domain/客户端版本排除；发现 ≈147µs/task 客户端开销**；当前进入 **NOF-053（零环境解析客户端 breakdown 日志）**。详见下方第 0 节（0.6–0.8）、「最小重建配方」与 `patches/README.md`。
 - 一句话：**数据/盘无罪、target 看到的命令与顺序也与 plain 完全相同，但 vseg 每条 128KiB 读在 target 的 bdev 执行段多花 ~210µs。第二阶段的目标就是把这 210µs 找出来并消掉。**
 
 ---
@@ -54,7 +54,8 @@
 | **S2** | 构建 tip 4c0ea28 重测 | **暂缓** | diff 复核：be10be2→4c0ea28 的 `transfer_task.cpp` 仅 40 行诊断/UB 默认改动，**NoF 读提交/QoS/分块未变** ⇒ 对 210µs 预期收益低 |
 | **M1a** | 客户端 NoF 参数插桩（`patches/nof050_client_io_params.patch`）+ vseg 采集 | 构建成功，**被版本阻塞**（NOF-050） | 新 bench（SPDK 9a413a44）与 target（e12b7cb）握手失败；同事原 bench 正常 |
 | **M1a-1** | 构建 e12b7cb 客户端 SPDK，重链插桩 bench，node3 本机重试 | **已完成 2026-11-23（NOF-051）** | e12b7cb 不可编（UMDK 缺 is_gpu_seg）；改用 **bd5ee124d（wire v4）** 成功；vseg 采到 1056 task，**domain 非空**，W9 258.55 |
-| **M1b** | 切换 plain，同客户端同插桩 bench，node3 本机采集对比 | **进行中（NOF-052）** | plain 的 domain/W9/P50−W9 是否与 vseg 不同；若 plain W9 也 ~250 ⇒ 客户端版本是混淆变量 |
+| **M1b** | 切换 plain，同客户端同插桩 bench，node3 本机采集对比 | **已完成 2026-11-23（NOF-052）** | domain 与 vseg 完全相同；plain W9 **132.77**（旧客户端 133.29，版本无关）；**公平差距 vseg 258.55 vs plain 132.77 = 1.95×/+125.8µs**；P50−W9 311/147µs ⇒ ≈147µs/task 客户端开销 |
+| **M1c** | 零环境解析客户端 breakdown 日志（NOF-053） | 已下发 | 147µs/task 落在 setup/传输/QoS 哪一段；决定下一步是客户端优化还是 target 插桩 |
 | **M1c** | target 侧插桩（SGL/bdev 提交参数/分段 tick） | 需重编 target + 重启（用户批准） | 定位 210µs 在 raid0 队列/NVMe/回调哪一段 |
 
 - NOF-048（最小重建验证）已完成，配方已用于 M1a；构建基线是否升级 tip 视后续需要（S2 暂缓）。
@@ -82,6 +83,14 @@
 - **关键待答（NOF-052）**：
   1. plain 用**同一个 bd5ee124d 客户端**时，WORKER 的 `domain` 是否与 vseg 相同（都非空）或为空/不同？
   2. plain 的 target W9 是否仍 ~46–70µs？若也 ~250 ⇒ **新客户端版本是混淆变量**（历史 plain 46 来自旧客户端），210µs 的归因需重做；若 ~46–70 ⇒ vseg 差异真实，继续沿 domain/child 查 target 侧。
+
+### 0.8 NOF-052 公平对照结果（2026-11-23，**修正旧口径**）
+
+- **domain 排除**：plain 与 vseg 的 WORKER 参数完全相同——`buf_type=kHost`、`buf_device=-1`、`domain=0x143cd90`（非空）、ptr 注册域命中 100%、4 lane 均匀。memory domain 不是差异来源。
+- **客户端版本排除**：同一 plain 数据/环境/node3，新客户端（bd5ee124d）W9 **132.77µs**，旧客户端（59662a26，e12b7cb 时代）**133.29µs**（+0.4%，target n 完全一致）⇒ 客户端 SPDK 版本对 W9 无影响。
+- **公平差距 = 1.95×/+125.8µs**：vseg 258.55 vs plain 132.77。**历史 plain 46–68µs 是 slot=1024 口径**，而 vseg 一直是 slot=1；旧的 3.75×/+210µs 对照不可直接比。slot=1 下 plain 的 46–68 无法复现（133µs），原因未验证（slot/写入新鲜度/盘状态）。
+- **新发现：≈147µs/task 的客户端开销**：`P50 − W9` 在 vseg 为 **311µs**、plain 为 **147µs**，比值 2.11× ≈ task 数比 2.00× ⇒ 每个 transfer task 约 147µs 的客户端成本。它放大了端到端差异（P50 570 vs 280），但对"vseg 必须比 plain 快"而言，**target W9 的 1.95× 才是数据面核心**。
+- **下一步（NOF-053）**：零环境解析现有 breakdown 日志（setup/submit/wait/QoS/worker），分解这 147µs/task 的构成；再决定客户端优化 vs target 侧插桩（需重启批准）。
 
 ## 1. 与总目标的关系
 
