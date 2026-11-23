@@ -5,7 +5,7 @@
 - 目录约定：**第二阶段所有内容（文档、代码补丁、测量数据）统一放在 `第二阶段/` 目录下**；本文件为总文档/索引
 - 数据来源：`../HANDOVER.md` 各单回执 + 第一阶段最终报告 `../工作汇总.md`
 - 相关文件：`../HANDOVER.md`（任务通道）、`../工作汇总.md`（第一阶段最终报告）
-- **当前状态（2026-11-23）**：M0/NOF-048 已完成；S0 诊断排除；S2 暂缓；M1a-1 打通（bd5ee124d v4 客户端）；**M1b 已完成（NOF-052）：公平对照为 vseg 258.55 vs plain 132.77 = +125.8µs（1.95×），domain/客户端版本排除；发现 ≈147µs/task 客户端开销**；当前进入 **NOF-053（零环境解析客户端 breakdown 日志）**。详见下方第 0 节（0.6–0.8）、「最小重建配方」与 `patches/README.md`。
+- **当前状态（2026-11-23）**：M1b 完成（公平对照 1.95×）；**M1c 完成（NOF-053）：客户端 QoS/调度排除；master 元数据 RPC ≈110µs/key 是两臂共有的大头；vseg 的 2× 在子 IO drain 段（350 vs 110µs）**。**下一步必须换 target 进程**（当前 target 是 deleted e12b7cb）才能拿 target 侧逐 IO 解释：待用户在 **A（自编带打点 bd5ee124d v4）** 与 **B（磁盘 9a413a44 v6 + 已有 v6 bench）** 之间批准；两者均不可回退 e12b7cb。详见下方第 0 节（0.6–0.9）、「最小重建配方」与 `patches/README.md`。
 - 一句话：**数据/盘无罪、target 看到的命令与顺序也与 plain 完全相同，但 vseg 每条 128KiB 读在 target 的 bdev 执行段多花 ~210µs。第二阶段的目标就是把这 210µs 找出来并消掉。**
 
 ---
@@ -55,7 +55,8 @@
 | **M1a** | 客户端 NoF 参数插桩（`patches/nof050_client_io_params.patch`）+ vseg 采集 | 构建成功，**被版本阻塞**（NOF-050） | 新 bench（SPDK 9a413a44）与 target（e12b7cb）握手失败；同事原 bench 正常 |
 | **M1a-1** | 构建 e12b7cb 客户端 SPDK，重链插桩 bench，node3 本机重试 | **已完成 2026-11-23（NOF-051）** | e12b7cb 不可编（UMDK 缺 is_gpu_seg）；改用 **bd5ee124d（wire v4）** 成功；vseg 采到 1056 task，**domain 非空**，W9 258.55 |
 | **M1b** | 切换 plain，同客户端同插桩 bench，node3 本机采集对比 | **已完成 2026-11-23（NOF-052）** | domain 与 vseg 完全相同；plain W9 **132.77**（旧客户端 133.29，版本无关）；**公平差距 vseg 258.55 vs plain 132.77 = 1.95×/+125.8µs**；P50−W9 311/147µs ⇒ ≈147µs/task 客户端开销 |
-| **M1c** | 零环境解析客户端 breakdown 日志（NOF-053） | 已下发 | 147µs/task 落在 setup/传输/QoS 哪一段；决定下一步是客户端优化还是 target 插桩 |
+| **M1c** | 零环境解析客户端 breakdown 日志（NOF-053） | **已完成 2026-11-23** | 客户端 QoS/worker/dispatch 仅 3%；master 元数据 RPC 116µs/key（41%）两臂共有；vseg 2× 在 drain 350 vs 110µs ⇒ **客户端调度排除，转 target/传输** |
+| **M2-target** | 换 target 进程 + target 侧逐 IO 打点 | **待用户批准（A/B）** | A：自编 bd5ee124d(v4) 带打点 target；B：磁盘 9a413a44(v6) + 已有 v6 bench。均不可回退 e12b7cb |
 | **M1c** | target 侧插桩（SGL/bdev 提交参数/分段 tick） | 需重编 target + 重启（用户批准） | 定位 210µs 在 raid0 队列/NVMe/回调哪一段 |
 
 - NOF-048（最小重建验证）已完成，配方已用于 M1a；构建基线是否升级 tip 视后续需要（S2 暂缓）。
@@ -91,6 +92,30 @@
 - **公平差距 = 1.95×/+125.8µs**：vseg 258.55 vs plain 132.77。**历史 plain 46–68µs 是 slot=1024 口径**，而 vseg 一直是 slot=1；旧的 3.75×/+210µs 对照不可直接比。slot=1 下 plain 的 46–68 无法复现（133µs），原因未验证（slot/写入新鲜度/盘状态）。
 - **新发现：≈147µs/task 的客户端开销**：`P50 − W9` 在 vseg 为 **311µs**、plain 为 **147µs**，比值 2.11× ≈ task 数比 2.00× ⇒ 每个 transfer task 约 147µs 的客户端成本。它放大了端到端差异（P50 570 vs 280），但对"vseg 必须比 plain 快"而言，**target W9 的 1.95× 才是数据面核心**。
 - **下一步（NOF-053）**：零环境解析现有 breakdown 日志（setup/submit/wait/QoS/worker），分解这 147µs/task 的构成；再决定客户端优化 vs target 侧插桩（需重启批准）。
+
+### 0.9 NOF-053 客户端分解（2026-11-23，零环境）
+
+- **日志口径**：任务书点名的 `batch_get_data_breakdown`/`batch_get_nof_wait_breakdown` 只属于 BatchGet；本 bench 走单 key Get，实际字段在 `get_into_breakdown`、`query_rpc_breakdown`、`transfer_data_breakdown` 与 `nof_slow_task`（90+ 字段，覆盖 QoS/worker 全部指标）。
+- **plain 每 key 283µs 的构成**（keys 97+，历史日志）：
+
+| 段 | µs | 占比 |
+|---|---|---|
+| master 元数据 query（GetReplicaList） | **116** | **41%** |
+| transfer submit | 6 | 2% |
+| transfer wait（含 target W9 68，超出 88） | 156 | 55% |
+| 其他/残差 | ~5 | 2% |
+| QoS/worker/dispatch（nof_slow_task） | 8–11 | ~3% |
+
+- **vseg 的 2× 不是 setup/QoS**：query 103 vs 116（反而更低）；submit 19 vs 6；wait 439 vs 156；每 task total 391 vs 145。直接原因是 **drain 350 vs 110µs（3.2×）**、**max_subio 362 vs 112（3.2×）**；`qos_tasks_ahead` 全 0、fifo/credit 全 0、dispatch 11/8µs、worker_setup ≤1µs ⇒ **客户端调度排除**。
+- **口径提醒**：`wait_us` 包含 W9，`wait_us − W9` 只是客户端/传输开销的上界（随 W9 升高而缩小）；更干净的指标是 `max_subio_us − W9` = **44µs plain / 107µs vseg**（单子 IO 的客户端+传输往返）。
+- **结论**：
+  1. **客户端 QoS/调度不是杠杆**（~3%）；
+  2. **master 元数据 RPC ≈110µs/key 是两臂共有的固定大头**——它是 plain 绝对时延（P50 280µs）的最大单项，但与 vseg/plain 的相对差异无关；
+  3. **vseg 的 2× 全部落在子 IO 的 drain/目标执行段** ⇒ 下一步必须查 target/传输，而不是客户端。
+- **下一步（需用户批准 target 重启）**：当前 target 是 deleted e12b7cb，旧二进制不可恢复。二选一：
+  - **A**：自编**带打点的 bd5ee124d（v4）** target，保持现有 v4 客户端/参数（行为最接近当前 target；需 target 插桩+构建+重启）；
+  - **B**：直接用磁盘上的 **9a413a44（v6）** target + 已有 **v6 打点 bench**（`bench-io-params`）；无需 target 构建，但版本跳两代（wire v6、nvmf/urma.c +239 行），行为可能变化、需重测基线；重启前可先只读确认新版逐 IO 字段是否更丰富。
+  - 两者都需重放 RPC 配置、重新 register/mount、重测 vseg/plain 基线，且**不可回退到 e12b7cb**。
 
 ## 1. 与总目标的关系
 

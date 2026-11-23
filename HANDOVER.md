@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-053（第二阶段：解析现有客户端 breakdown 日志，分解每 key 客户端开销；零环境）**
+- 当前任务：**无（NOF-053 已关闭 2026-11-23；等待用户批准 target 重启路线：A 自编带打点的 bd5ee124d(v4) / B 磁盘 9a413a44(v6)）**
 
 ## 第二阶段（2026-11-23 起）
 
@@ -24,7 +24,11 @@
 - **vseg 参数（NOF-051）**：SUBMIT/WORKER 1056/1056；ptr 注册域 100%；child seg_lba 差 4096 blocks；lane 4 路均匀；buf_type=kHost、device=-1、**domain 全非空**；target W9 258.55µs、端到端 P50 569.78（node3 本机）。
 - **NOF-052 结果（公平对照，2026-11-23）**：plain 新客户端 W9 **132.77µs** / 旧客户端 **133.29µs**（+0.4%）⇒ **客户端版本对 W9 无影响**；plain/vseg 的 domain **完全相同**（非空 0x143cd90）⇒ **domain 排除**；**vseg 258.55 vs plain 132.77 = +125.8µs（1.95×）**。历史 plain 46–68µs 是 **slot=1024** 口径，在 slot=1 下不可复现 ⇒ **旧的 3.75×/210µs 对照不再成立，公平差距是 1.95×/+126µs**。
 - **新发现**：两臂 `P50 − W9` = vseg **311µs** / plain **147µs**，≈**147µs/task 的客户端开销**（vseg 2 task/key、plain 1 ⇒ 2.11× vs 2.00×）；它放大了端到端差异（570 vs 280），但 target W9 的 1.95× 仍是数据面核心。
-- **下一步（NOF-053）**：零环境解析现有客户端 breakdown 日志（`batch_get_data_breakdown`/`batch_get_nof_wait_breakdown`/`transfer_data_breakdown`，vseg NOF-040 与 plain NOF-039 均 node3 本机、诊断开），分解 setup/submit/wait/QoS/worker，定位 147µs/task 的构成；再决定 target 侧插桩（需重启批准）或客户端优化。
+- **NOF-053 客户端分解（2026-11-23）**：plain 每 key 283µs = **master 元数据 query 116µs（41%）** + submit 6 + wait 156（含 target W9 68，超出 88）+ 其他 5；**QoS/worker/dispatch 仅 8–11µs（~3%）**。vseg 的 2× **不是 setup/QoS**（query 103 vs 116 更低），而是 **drain 350 vs 110µs、max_subio 362 vs 112（3.2×）**、submit 19 vs 6 ⇒ **客户端调度排除**；vseg 2× 在 target/传输 drain 段。**master 元数据 RPC ~110µs/key 是两臂共有的固定大头**（与 vseg/plain 无关，是 plain 绝对时延的最大单项）。
+- **待用户批准：target 重启路线**（要拿 target 侧 1.95×/126µs 的逐 IO 解释，必须换 target 进程；当前 target 是 deleted e12b7cb，旧二进制不可恢复）：
+  - **A**：自编**带打点的 bd5ee124d（v4）** target，保持现有 v4 客户端/参数（行为最接近当前 target；需 target 侧代码插桩+构建+重启）；
+  - **B**：直接用磁盘上的 **9a413a44（v6）** target + 我们已有的 **v6 打点 bench**（`bench-io-params`）；无需 target 构建，但版本跳两代（wire v6、nvmf/urma.c +239 行），行为可能变化、需重测基线；可能自带更丰富的逐 IO 明细（重启前可先只读源码确认）。
+  - 两者都**不可回退到 e12b7cb**；均需重放 RPC 配置、重新 register/mount、重测 vseg/plain 基线。
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -142,7 +146,7 @@
 | NOF-049 | 已关闭 2026-11-23（**诊断排除**） | 同环境同 key T1 两臂：ON W9 **258.85** / OFF **251.75µs（−2.7%）**、端到端 P50 504.11→494.56（−1.9%）；OFF 日志 167KB 且 `URMA_SLOW_IO`/`nof_slow_task`/`nof_vsegment_operation`/`transfer_data_breakdown` 全 0（env 生效）；两臂 exec 占比 96.2–96.3% ⇒ **默认诊断/客户端背压不是 210µs 来源**。注意绝对 P50 494–504 与 NOF-040 274 不一致（疑 slot env/集群变化），后续固定口径 |
 | NOF-051 | 已关闭 2026-11-23（**通过；版本对齐成功**） | e12b7cb 因系统 UMDK 缺 `is_gpu_seg` 编不过；改用**同 wire v4 的紧邻后继 bd5ee124d**（GPU 注册 opt-in）构建成功（5 min、74 libs）；重链 `bench-io-params-e12`（md5 88ad3134…）在 **node3 本机握手成功**。vseg 采到 SUBMIT/WORKER **1056/1056**（400+128 keys ×2 child）；**ptr 注册域命中 100%**（2 个 ptr，child1=+2MiB）；child seg_lba 差恒 4096 blocks；lane/worker 各 264 均匀；buf_type=kHost、device=-1、**domain 全为非空 0x143cd90**；target W9 **258.55µs**（exec 97.2%）、端到端 P50 569.78（node3 本机） |
 | NOF-052 | 已关闭 2026-11-23（**公平对照：1.95×；domain/客户端版本排除**） | plain 同新客户端（bd5ee124d）W9 **132.77µs**、旧客户端（59662a26）**133.29µs**（+0.4%）⇒ 客户端版本无影响；plain/vseg 的 domain **完全相同**（非空 0x143cd90）⇒ domain 排除；**vseg 258.55 vs plain 132.77 = +125.8µs（1.95×）**；task 数 1056/528、P50−W9 311/147µs（≈147µs/task 客户端开销）。历史 plain 46–68µs 在 slot=1 不可复现（slot=1024 口径），3.75× 的旧对照不可直接比 |
-| NOF-053 | 已下发（2026-11-23） | 零环境：解析现有 `batch_get_data_breakdown`/`batch_get_nof_wait_breakdown`/`transfer_data_breakdown`（NOF-040 vseg、NOF-039 plain，均 node3 本机、诊断开），分解 setup/submit/wait/QoS/worker 开销，定位 ≈147µs/task 客户端成本的构成 |
+| NOF-053 | 已关闭 2026-11-23（**客户端分解；QoS 排除**） | 指定 `batch_get_*` 为 0（单 key Get 走 `get_into_breakdown`/`query_rpc_breakdown`/`transfer_data_breakdown`/`nof_slow_task`）。plain 每 key 283µs = **master 元数据 query 116µs（41%）** + submit 6 + wait 156（含 target W9 68，超出 88）+ 其他 5；**QoS/worker/dispatch 仅 8–11µs（~3%）**。vseg 2× **不是 setup/QoS**（query 103 vs 116 反而低），而是 **drain 350 vs 110µs、max_subio 362 vs 112（3.2×）**、submit 19 vs 6 ⇒ **客户端调度排除**，vseg 的 2× 在 target/传输 drain 段 |
 | NOF-050 | 已关闭 2026-11-23（**阻塞：SPDK 版本不兼容**） | 补丁/编译/链接成功（`bench-io-params` 530,162,656B / md5 fc2b5129…，strings 命中 3 条）；但新 bench 连 target 失败：客户端 SPDK **9a413a44** vs target 运行中 **e12b7cb**，握手 rc=-71/-104；同事原 bench（59662a26，匹配 e12b7cb）同 env/参数 rc=0、P50 473.52 / target W9 259.77。**口径修正**：该 P50 为 **node1 远端 reader**，与 NOF-040 本机 274 不可比（SLOT=1 未改变 P50）；target 现跑的是 **deleted 旧二进制 736a902f**，磁盘 d6c39465=9a413a44 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
@@ -3154,7 +3158,9 @@ plain 参数行数/domain/ptr 命中/child/lane/blocks；plain 的 target W9 与
 
 ---
 
-# NOF-053（待执行 · 第二阶段：解析现有客户端 breakdown 日志，分解每 key 客户端开销 · 零环境操作 · 2026-11-23）
+# NOF-053（已关闭 · 客户端分解：QoS 排除；元数据 RPC 116µs/key；vseg 2× 在 drain 段 · 2026-11-23）
+
+> 结果：plain 每 key 283µs = master 元数据 query 116µs（41%）+ submit 6 + wait 156（含 W9 68，超出 88）+ 其他 5；QoS/worker/dispatch 仅 8–11µs（~3%）。vseg 2× 不是 setup/QoS（query 103 vs 116），而是 drain 350 vs 110µs / max_subio 362 vs 112（3.2×）。⇒ 客户端调度排除；master 元数据 RPC ~110µs/key 是两臂共有的大头；vseg 的 2× 在 target/传输 drain 段。详见"第二阶段"上方决策说明。
 
 ## 背景
 
