@@ -6,14 +6,16 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-048（第二阶段 M1a-0：Mooncake 最小重建验证（未改源码））**
+- 当前任务：**NOF-049（第二阶段 S0：诊断开/关对照，判定 210µs 是否来自默认诊断/背压；零构建）**
 
 ## 第二阶段（2026-11-23 起）
 
 - **第一阶段（NOF-001~046）已收口**：单 target 下 vsegment 无读时延优势；核心未解问题已定位到 **vseg 读路径在 target 的 bdev 执行段多 ~210µs**（数据/盘无罪：裸 SPDK 同区 41µs；target 侧顺序/落核/命令与 plain 完全一致）。
 - **第二阶段目标**：消除这 210µs，让 vseg 的 target bdev 接近 plain（~70–100µs）、端到端不劣于 plain；之后再谈 300µs 与多 target 结构性优势。
 - **计划与假设（H1–H4）、里程碑（M0–M4）、验收与回退**：见 `第二阶段/README.md`（第二阶段所有内容统一放在 `第二阶段/`）。
-- **M0（NOF-047）**：只读取证构建/依赖配置，复制 Mooncake 与 SPDK 源码/build 到 `/home/l00955908/mooncake-nof-vsegment/build/`（不改同事原树、不构建、不跑服务）。
+- **M0（NOF-047）已完成**：复制并校验 Mooncake/SPDK 源码与 build（8.82GiB，md5 全 MATCH）。
+- **2026-11-23 复盘纠偏**：发现两处高价值线索——①构建基线 **be10be2 已落后远端 tip 4c0ea28**（含 `ff3e853` 诊断 opt-in/低时延默认、`13b7c19` 去重复校验等读路径修复）；②旧构建 `MC_HIFREQ_LOG_SAMPLE_RATE` **默认 1.0**，per-task 计时/breakdown 日志默认全开（tip 的提交明确说这会抬高读时延），而我们**从未测过"诊断全关"的 vseg**。
+- **修正后的顺序**：**S0 诊断开/关对照（NOF-049，零构建）** → S1 node3 本机裸 SPDK 定点读 → S2 构建 tip 4c0ea28 重测 → S3 仍无法解释才做代码插桩。详见 `第二阶段/README.md` 第 0 节（含源码证据与判据）。
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -127,7 +129,8 @@
 | NOF-045 | 已关闭 2026-11-23（**vseg 区数据无罪，慢在 vseg 路径**） | 裸 SPDK 顺序 QD1：A（vseg 区 1.6G）p50 **40.96**/W9 **91.57**；B（plain 区 3.2G）**41.28/91.28**；C（0.5G）**215.04/155.79**；D（0–0.5G）**212.48/153.92**；E（同 A 区随机）**220.16/188.90** ⇒ 高 LBA 的 vseg 数据裸读快（41µs）而 Mooncake-vseg 253µs ⇒ **慢在 vseg 路径（+~210µs）**；低 LBA [0,~1GiB) 盘本身慢；盘对顺序/随机极敏感（41 vs 220µs，vseg 253 正在"随机档"） |
 | NOF-046 | 已关闭 2026-11-23（**顺序假设证否**） | **q1 单 lane：rx/exec/submit 顺序逆序对全 0、位移 0、单 lcore、submit=exec 100%**，但 bdev 仍 **223–265µs**（plain 同 lcore 43–52）；q4 逆序 61/496 仅来自 4 lane×2 child 的 8 条顺序流交错，且 q4≈q1 ⇒ 顺序不是差异来源；bdev 随执行次序仅 +19–24%（三种读法一致，通用排队）⇒ **"盘看成随机档"解释不成立**，剩余只有 target bdev 提交侧参数（buffer/描述符/flags/stride）需代码插桩 |
 | NOF-047 | 已关闭 2026-11-23（第二阶段 M0） | 复制 8.82GiB（Mooncake 源/build、SPDK 源/build），HEAD/status/关键二进制与静态库 md5 全部 MATCH；配置：Release、USE_NOF/NOF_URMA/UB/ETCD=ON、SPDK 指 /usr/local（**纯静态 74 个 .a、0 .so**）；**正在跑的 target 是 deleted 旧二进制（736a902f），磁盘为 d6c39465**；补丁点：target `ctrlr_bdev.c:466-467`、client `nvme_urma.c:995-1056`、Mooncake `transfer_task.cpp:3047/1080-1106` |
-| NOF-048 | 已下发（2026-11-23，M1a-0） | 只读取证 compile/link 命令；用**最小重建**（只重编一个未改文件 + 重链新 bench）验证构建路径，`--help` 通过即停；不跑 bench、不动 target/master |
+| NOF-048 | **推迟（未执行；改为 S2 构建准备）** | 复盘发现构建基线应为 tip 4c0ea28（含 `ff3e853` 诊断 opt-in/低时延默认等读路径修复），be10be2 已过时；最小重建验证保留，等 S0/S1 结果后与 tip 构建合并 |
+| NOF-049 | 已下发（2026-11-23，第二阶段 S0） | 零构建对照：同环境同 key，vseg T1 读两臂（诊断开 vs **诊断全关**：`MC_HIFREQ_LOG_SAMPLE_RATE=0`/`VSEG_SLOW_IO_US=0`/`MC_NOF_SLOW_TRACE_THRESHOLD_US=0`/无 `VSEG_DIAGNOSTIC`），比较 target 读窗口 W9——判定 210µs 是否来自默认诊断/客户端背压 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
@@ -2930,3 +2933,49 @@ CMake 关键配置与源码/SPDK 基线；复制是否完成（路径/占用/校
 ## 回执必答（第一行）
 
 编译/链接命令是否取得；最小重建是否成功（新 bench md5/大小/`--help`）；依赖与路径是否可读；有无失败。
+
+---
+
+# NOF-049（待执行 · 第二阶段 S0：诊断开/关对照，判定 210µs 是否来自默认诊断/背压 · 2026-11-23）
+
+## 背景（复盘发现）
+
+- 旧构建（be10be2）的 `MC_HIFREQ_LOG_SAMPLE_RATE` **默认 1.0**：`ShouldSampleHiFreqLog` 控制的 per-transfer/per-task 计时与 breakdown 日志**默认对每条读开启**；vseg 还有额外的 per-key/per-child 日志。
+- tip 的 `ff3e853` 把这类 breakdown 日志改为显式 opt-in（`MC_STORE_TRANSFER_DIAG`），commit message 明确写："emitting it ... directly inflates caller-observed read latency"。
+- 我们的 NOF-035+ 还显式设了 `MC_HIFREQ_LOG_SAMPLE_RATE=1`、`VSEG_SLOW_IO_US=1`（逐 IO 29 字段日志）。
+- **"诊断全关后 vseg 的 target bdev/W9 是多少"从未被单独测过**；per-task 日志在 NoF 轮询线程的完成路径输出，有可能通过客户端背压抬高 target W9。
+
+## A. 预检（只读）
+
+1. vseg master 2077841、target 341038、4457、Keys=800；记录起点 target W 快照。
+2. keys 0/128/400/800 各 128KiB 已被 urma_perf preflight 覆盖 ⇒ 本单 **verify=false**，不做数据校验。
+3. reader 参数与 NOF-040 一致：`--num_keys=400 --num_threads=1 --batch_size=1 --nof_qpairs_per_segment=4 --warmup_keys=128 --verify=false`、vsegment flags（`--vsegment_nof_io=true --segment_write_vsegment=true --replica_num=1 --nof_replica_num=0`）。
+
+## B. 两臂（同环境、同 key、同参数，各 1 遍，先 ON 后 OFF）
+
+- **臂 ON（历史口径）**：`VSEG_DIAGNOSTIC=1`、`MC_HIFREQ_LOG_SAMPLE_RATE=1`、`VSEG_SLOW_IO_US=1`；日志 `run/nof049_diag_on.log`。
+- **臂 OFF（全关）**：**不设** `VSEG_DIAGNOSTIC`；`MC_HIFREQ_LOG_SAMPLE_RATE=0`；`VSEG_SLOW_IO_US=0`（或 unset）；`MC_NOF_SLOW_TRACE_THRESHOLD_US=0`（或 unset）；日志 `run/nof049_diag_off.log`。
+- 每臂记录：端到端 Min/Avg/P50/P90/P99/Max、failed；**结束后立即采 target 读窗口 W9**（n/avg/exec%/TOTAL）。
+- 记录两臂日志字节数；OFF 臂中 `URMA_SLOW_IO` / `nof_slow_task` / `nof_vsegment_operation` 的行数（应≈0，用于证明 env 生效）。
+- 若两臂 W 窗口 n 不同（warmup/verify 口径差异），以 W 块 n 为准并在回执说明；本单 verify=false，两臂应一致。
+
+## C. 回答与判决
+
+| 臂 | 日志大小 | target W9 | 端到端 P50 |
+|---|---|---|---|
+| ON（历史口径） | ? | ?（预期 ~250µs） | ? |
+| OFF（全关） | ? | ? | ? |
+
+- 明确回答：**诊断全关后 target W9 是否从 ~250 降到 ~70–100µs？**
+  - **是** ⇒ 默认诊断/客户端背压是 210µs 的主要来源；修复方向 = 生产关闭诊断 + 采用 tip 的 opt-in（ff3e853）。**不需要**继续深挖代码插桩。
+  - **否（仍 ~250）** ⇒ 诊断不是主因；按复盘顺序做 S1（node3 本机裸 SPDK 定点读）→ S2（构建 tip 4c0ea28 重测）。
+- 副回答：OFF 臂的日志是否确实降到很小（env 生效证据）；两臂 W 窗口 n 是否一致。
+
+## D. 边界
+
+- reader 只读；不动 target/master；不写盘数据（verify=false）；不删日志；失败停手。
+- 本单**不构建、不改代码**；两臂各 1 遍（W9 稳定；若臂间异常可加 1 遍，需说明）。
+
+## 回执必答（第一行）
+
+ON/OFF 两臂的 target W9、端到端 P50、日志大小与关键日志行数；**诊断全关是否显著降低 W9**；有无失败。

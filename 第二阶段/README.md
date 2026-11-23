@@ -5,7 +5,56 @@
 - 目录约定：**第二阶段所有内容（文档、代码补丁、测量数据）统一放在 `第二阶段/` 目录下**；本文件为总文档/索引
 - 数据来源：`../HANDOVER.md` 各单回执 + 第一阶段最终报告 `../工作汇总.md`
 - 相关文件：`../HANDOVER.md`（任务通道）、`../工作汇总.md`（第一阶段最终报告）
+- **当前状态（2026-11-23）**：M0 已完成；复盘后发现两个更便宜的假设（旧构建/默认诊断），执行顺序已修正为 **S0（NOF-049 诊断开/关对照，已下发）→ S1 本机裸读 → S2 构建 tip → S3 插桩**；NOF-048（最小重建验证）推迟并入 S2。详见下方第 0 节。
 - 一句话：**数据/盘无罪、target 看到的命令与顺序也与 plain 完全相同，但 vseg 每条 128KiB 读在 target 的 bdev 执行段多花 ~210µs。第二阶段的目标就是把这 210µs 找出来并消掉。**
+
+---
+
+## 0. 2026-11-23 复盘与纠偏（写于 M0 完成、M1 未开始时）
+
+方向判断：**"定位到 vseg 路径 → 再修"这个大方向是对的**，但执行顺序需要纠正——在投入代码插桩前，有三个更便宜、且有源码证据的假设没有排除。
+
+### 0.1 发现一：我们一直在用"旧构建"，远端 tip 已包含读路径/时延修复
+
+- 同事构建基线 **be10be2（11-17）**；远端分支 tip **4c0ea28（11-19）**，两者差 **75 文件 / +6057 / −473 行**。
+- tip 中与读时延直接相关的提交：
+  - `ff3e853 fix(store): restore low-latency UB read defaults` —— 把 NoF per-transfer breakdown 日志改为**显式 opt-in**（`MC_STORE_TRANSFER_DIAG`），并把 UB poll sleep 默认从 50µs 改为 **0（busy poll）**、增加 idle spin。**commit message 原文：该 breakdown 日志"directly inflates caller-observed read latency"**。
+  - `13b7c19 vsegment: skip duplicate view validation`（去掉每次读的重复校验扫描）
+  - `1712b68 vsegment: guard resolve loop...`
+  - `c0a3252 feat(bench): add key_order selection`（我们缺的随机读旗标）
+  - `9382888 fix(urma): 发送请求启用驱动扩展标志`
+  - `f3d39a2 / 343ba6f / e15da9d`：vsegment 写路径的持久化/分配器快照性能修复
+- **be10be2 不含以上任何一条**。我们在旧构建上研究 210µs，可能是在研究一个**已经在新代码里被修掉或缓解**的问题。
+
+### 0.2 发现二：诊断默认全开，且我们从未测过"诊断完全关闭"的 vseg
+
+- 旧构建 `MC_HIFREQ_LOG_SAMPLE_RATE` **默认 1.0（全采样）**；`ShouldSampleHiFreqLog` 控制的 per-transfer / per-task breakdown 与计时**默认对每条读都开启**。
+- vseg 路径额外有 `VSegmentOperationState`、逐 child 计时、`nof_vsegment_operation` per-key 日志；其 task 数还是 plain 的 2 倍（2 child/key）。
+- 我们的 NOF-035+ 还显式设了 `MC_HIFREQ_LOG_SAMPLE_RATE=1`、`VSEG_SLOW_IO_US=1`（逐 IO 29 字段日志）。
+- **per-task 日志在 NoF 轮询线程的任务完成路径上输出**；轮询线程停顿会推迟 target 完成回调，**有可能把 target 的 bdev/W9 抬高**（客户端背压）。
+- 结论：**"210µs 有多少是默认诊断造成的"从未被单独测过**。这条比代码插桩便宜得多。
+
+### 0.3 发现三：宿主位置是未控变量
+
+- 裸 SPDK 快基线（41µs）跑在 **node1（远端）**；所有 Mooncake plain/vseg 对比跑在 **node3（本机）**。
+- 本地/远端数据路径不同；plain 本机 bdev 46µs 甚至低于裸 SPDK 远端 W9 91µs，说明口径不能直接混用。
+- 需要补：node3 本机裸 SPDK 定点读（同区）和/或 node1 远端 Mooncake-vseg 读，才能把"vseg 路径慢"与"宿主/数据路径"彻底分开。
+
+### 0.4 目标再校准
+
+- 即使 210µs 全部消除，单 target 下 vseg 的上限是**追平 plain**；"vseg 必须更快"需要多 target/多成员或分层缓存（结构性方向）。
+- 第二阶段验收应定为：**机制定案 + 消除回归（追平）**；"反超"单列为后续结构性问题，不纳入本阶段验收。
+
+### 0.5 修正后的执行顺序（替代原 M1 直接插桩）
+
+| 步骤 | 内容 | 成本 | 判据 |
+|---|---|---|---|
+| **S0** | 同环境、同 key、T1、verify=false，跑两遍：诊断开 vs **诊断全关**（`MC_HIFREQ_LOG_SAMPLE_RATE=0`、`MC_NOF_SLOW_TRACE_THRESHOLD_US=0`、`VSEG_SLOW_IO_US=0`、`VSEG_DIAGNOSTIC=0`），比较 target 读窗口 W9 | 零构建，~10 min | 关诊断后 W9 若从 250 降到 ~70–100 ⇒ 默认诊断/背压是主因，修复=tip 的 opt-in 或生产配置 |
+| **S1** | node3 **本机**裸 urma_perf 定点读同一区（vseg/plain 区） | 零构建，~10 min | 关掉"远端 vs 本机"混淆 |
+| **S2** | 构建 **tip 4c0ea28**（或最小 cherry-pick `ff3e853`/`13b7c19`/`1712b68`）后重测 vseg vs plain（诊断开/关各一遍） | 构建，1–2 天 | 若 210µs 消失或大幅缩小 ⇒ 升级构建即修复；否则进入 M1 插桩 |
+| **S3** | 仍无法解释 ⇒ 原 M1 代码插桩（客户端 buffer/MR → target SGL/bdev 参数） | 天级 | —— |
+
+- NOF-048（最小重建验证）保留为 S2 的构建工具准备，但**构建基线改为 tip**，不再以 be10be2 为最终目标。
 
 ---
 
