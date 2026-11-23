@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**无（2026-11-23 已收口）**；最终报告见仓库 `工作汇总.md`（NOF-001~034 全部实测与结论）。若后续重启项目，按报告 §8.4 的两条备选路径另行立项。
+- 当前任务：**NOF-035（补 plain 的 LBA/IO 分布 + 同窗 W9，验证"命令相同/W9 差异为伪影"的推断）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -100,6 +100,7 @@
 | NOF-032 | 已关闭 2026-11-23（**布局二度否证**） | 全新 vseg-1 + 纯 T1 顺序写（2 次尝试后对象层 400 全齐）：T1 P50 **536.7**、16t **921.8**、target W9 **251.1**（plain 258.3/718.7/96.9）；分区/stripe/写序全部试完，W9 恒 250–252 ⇒ 每 IO 执行成本是 vsegment 路径自身；`VSEGMENT_CREATING` 第 3 次复现 |
 | NOF-033 | 已关闭 2026-11-23 | **LBA 完全连续**：key i 严格占 [i×8192,(i+1)×8192) 块、397/399 步长 8192、key 内相邻差 256 占 93.4%、0 次 >1MiB 跳变、覆盖 98.4% ⇒ 布局彻底洗清；期间 W9 仍 258.9µs（plain 96.9）。代码复核：plain 与 vsegment 最终都调用同一 `submitSpdkNofOperation`，target 端无 vsegment 概念 ⇒ 差异只能来自 IO 到达时序/缓存，不是"vsegment 寻址" |
 | NOF-034 | 已关闭 2026-11-23（**五个维度穷尽**） | vseg-1 + stripe=4MiB（单 child）+ 纯 T1 顺序写：T1 559.2（plain 258.3，2.17×）、16t **735.3（plain 718.7，+2.3%，最接近）**、W9 250.1–270.9；分区数/stripe/child/写序/物理连续性全部排除 ⇒ 配置层无剩余旋钮 |
+| NOF-035 | 已下发（收口后补证） | 切回 plain，按 NOF-025 同序写→立即读，用 NOF-033 同口径低阈值诊断：采 plain 的 LBA/IO 分布 + 同窗 W9，验证"命令相同、96.9 是否为窗口/缓存伪影" |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
@@ -1991,3 +1992,46 @@ vseg-1 读 IO 的 LBA 是否连续/顺序（每 key 内、key 间）；相邻差
 ## 回执必答（第一行）
 
 stripe=4MiB/partitions=1 是否生效；T1 顺序写是否补齐（committed/logical_used/vsegments）；vseg-1/4MiB 的 T1/16t P50 与 target W9；**是否追平 plain（258.3/96.9）**；有无失败。
+
+---
+
+# NOF-035（待执行 · 补 plain 的 LBA/IO 分布 + 同窗 W9 · 2026-11-23）
+
+## 目的（收口后的补证单）
+
+报告中的一个推断尚未被直接验证：**"plain 与 vsegment 发给 target 的命令相同（128KiB、连续 LBA），W9 的 2.6× 差异更像窗口/盘缓存造成的测量伪影"**。
+本单切回 plain，按 NOF-025 的**同序**（写 → 立即读），用 NOF-033 的**同口径**低阈值诊断，一次性拿到：
+1. plain 读的 **LBA 序列与 IO 大小分布**（与 vseg 对比）；
+2. plain 本轮的**同窗 W9**（与历史 96.9 对比）；
+3. plain 的写窗口 W9（识别写/读窗口是否被混算）。
+
+## A. 预检与切换（只动我方 master/cluster）
+
+1. 记录当前环境（vseg-1+stripe4 master PID 1676025、target 341038、端口、etcd 键）；node1 同事进程只记录不动。
+2. 停我方 master（按 PID）；清**仅我方**键 `/cvm/vseg_nofvseg/` + `/oplog/vseg_nofvseg/`。
+3. 启动 **plain master**（NOF-025 参数：无 vsegment，`--vsegment_auto_plan=false --cvm_segments_vsegment_exclusive=false`；50056/9006；env `udmac0d1e2`）；`nof_register` 同命令挂载；确认 leader/serving、无 quota。
+4. **plain writer**（NOF-025 同参：16 线程、batch16、`--replica_num=0 --nof_replica_num=1 --vsegment_nof_io=false --segment_write_vsegment=false`）：确认 400/0、master Keys=400；**记录 writer 后 target W 块**（写窗口基线）。
+
+## B. 同窗诊断读（T1，1 遍，低阈值）
+
+- writer 结束后 **10 秒内**启动 reader：T1、batch1、verify=true；`VSEG_DIAGNOSTIC=1`、`MC_HIFREQ_LOG_SAMPLE_RATE=1`、`VSEG_SLOW_IO_US=1`；日志 `run/nof035_lba_plain_t1.log`（若 >50MB → 停手，改用 50µs 阈值重试一次并说明）。
+- 记录：端到端 Min/Avg/P50/P90/P99/Max；读阶段 `URMA_SLOW_IO`（lba/blocks）；target W 块（**写窗口、读窗口各一块**：n / avg / TOTAL / exec%）。
+
+## C. 解析与对比（与 NOF-033 完全相同算法）
+
+1. 读阶段（opcode=2）IO 总数；`blocks` 直方图（256 / 4096 / 其他）；每 4MiB 窗口归组：相邻差=256 比例、>1MiB 跳变次数、key 起点步长分布与是否单调、覆盖率；
+2. 给 3 段原始序列样例（每段 ≤5 条 LBA+blocks）；
+3. 与 vseg NOF-033 对比：**plain 是否也以 128KiB 为主？是否也有 2MiB IO？LBA 连续性是否相同？**
+4. **W9 对比**：plain 本轮读窗口 W9 vs 历史 96.9；vseg-1 为 251.1；写窗口 W9（预期 ~27.8）。
+5. 明确回答：
+   - plain 与 vseg 的命令**是否真的相同**（尺寸分布 + LBA 连续性）？
+   - plain 的 **96.9µs 能否在干净窗口里复现**？若升到 ~250 ⇒ 历史值是窗口/缓存伪影；若仍 ~97 ⇒ 差异真实，需 target 逐 IO 明细（另一单，需重启 target）。
+
+## D. 边界
+
+- 只动我方 master/cluster；**不动 target**；共享机规则同 NOF-031（同事进程只记录）；失败停手。
+- plain 写入会覆盖此前 vsegment 数据（允许，后续可恢复）。
+
+## 回执必答（第一行）
+
+plain 读的 blocks 直方图与 LBA 连续性（与 vseg 是否相同）；本轮读窗口 W9（vs 历史 96.9）；写窗口 W9；**plain 与 vseg 命令是否相同、96.9 能否复现**；有无失败。
