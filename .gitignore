@@ -1,3 +1,5 @@
 _ref/
 *.log
 tmp/
+.workbuddy/
+对话记录.md
