@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-045（裸 SPDK 定点读 vseg/plain 数据区：判定数据/盘慢还是 vseg 路径/连接慢）**
+- 当前任务：**NOF-046（纯日志分析：target 侧到达/执行顺序 vs bdev，检验 vseg 流是否被盘视为"随机"）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -117,7 +117,8 @@
 | NOF-042 | 已关闭 2026-11-23（**时序/落核无差异**） | 每条 lane 内严格 LBA 递增（(key,qid) 逆序对 p50=0）；q1 全局单调；四核四 qpair 与 plain 相同且均匀（lcore3/4/5/6）；**四核 bdev 全线 218–261µs vs plain 47–48µs**（慢不集中某核）；大 IO 与下一 key 小 IO 基本不重叠（0.61% vs 0.08%）；**纠正日志事实**：此前"每 key 一条大 IO"是 `nof_slow_task` 行拼接所致，URMA_SLOW_IO 全为 128KiB（任务级：vseg 2×2MiB、plain 1×4MiB） |
 | NOF-043 | 已关闭 2026-11-23（**写 lane 排除**） | q1 串行写 400 新 key（自证 io_qpairs=1；Keys=800、logical_used 精确、写 W9 27.73µs）；读回三桶 bdev p50 **252 / 252 / 253µs**（慢窗口 / q4 写 / q1 写），慢占比 91.6/91.0/91.2% ⇒ **写侧 lane 交织不是主因**；六个维度全部排除，只剩 target/盘内部逐 IO 细节 |
 | NOF-044 | 已关闭 2026-11-23（**明细已有但退化，不重启**） | 现有 13,767 条 `URMA_BDEV_DETAIL`（8 计时字段），但 `submit_to_callback_us ≡ bdev_us`（全量）、其余子段≈0 ⇒ 拆不开 raid0/NVMe；无时间戳、trace_seq 每会话重置、LEGACY 只采 ≥40µs（plain 偏斜）；cmdline 仅 `-m [2-7] --wait-for-rpc`，重启需 RPC 重放 ⇒ 按 A4 不重启 |
-| NOF-045 | 已下发（2026-11-23） | 零重启：用 gap `urma_perf`（root）定点顺序读 LBA 1.6G（vseg 写区）/ 3.2G（plain 未覆盖区）/ 0.5G（vseg q4 区）/ 0（盘首慢窗口），比较 target W9——vseg 区裸读快 ⇒ 数据无辜、慢在 vseg 路径/连接；裸读慢 ⇒ 数据/盘状态慢 |
+| NOF-045 | 已关闭 2026-11-23（**vseg 区数据无罪，慢在 vseg 路径**） | 裸 SPDK 顺序 QD1：A（vseg 区 1.6G）p50 **40.96**/W9 **91.57**；B（plain 区 3.2G）**41.28/91.28**；C（0.5G）**215.04/155.79**；D（0–0.5G）**212.48/153.92**；E（同 A 区随机）**220.16/188.90** ⇒ 高 LBA 的 vseg 数据裸读快（41µs）而 Mooncake-vseg 253µs ⇒ **慢在 vseg 路径（+~210µs）**；低 LBA [0,~1GiB) 盘本身慢；盘对顺序/随机极敏感（41 vs 220µs，vseg 253 正在"随机档"） |
+| NOF-046 | 已下发（2026-11-23） | 纯日志分析：用 `target_rx_tick`/`target_exec_tick` 重建 target 侧到达/执行顺序，检查 vseg（q4/q1）的 LBA 在 target 看来是否仍严格顺序、与 bdev_us 是否相关；对照 plain |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
@@ -574,12 +575,32 @@
 - **重启代价更高**：target cmdline 只有 `-m [2-7] --wait-for-rpc`，子系统/RAID0/11 盘是启动后 RPC 下发，重启需完整 RPC 重放（NOF-016 脚本是否等价未验证）。
 - **判决**：按 A4"已有明细 ⇒ 不重启"；环境未动（target 341038、vseg master 2077841）。
 
-### 决策点（2026-11-23，NOF-044 后更新）
+### NOF-045 关键事实（vseg 区数据无罪；盘对模式极敏感，2026-11-23）
 
-- 现有逐 IO 明细拆不开 raid0/NVMe，BUFFER 模式也只多同样的阶段边界。在动代码之前，先用**裸 SPDK `urma_perf` 定点读同一批 LBA**（零重启）区分"数据/盘慢"与"vseg 客户端/连接路径慢"：
-  - 裸读 vseg 数据区（LBA 1.6G）若 ~30–46µs ⇒ **数据/盘无辜，慢在 vseg 路径/连接**；
-  - 若 ~190–250µs ⇒ **数据/盘状态慢**（需重新审视写路径结论）。
-- **NOF-045（本单）**：支 A 1.6G（vseg q1 区）、支 B 3.2G（plain 未覆盖区）、支 C 0.5G（vseg q4 区）、支 D 0（盘首慢窗口），顺序裸读 6s/支，采 target W9。
+- **裸 SPDK 顺序 QD1（node1→target，`-o 131072 -T1 -b1 -t6`）**：
+
+| 支 | 区域 | 客户端 p50 | target W9 | 备注 |
+|---|---|---|---|---|
+| A | [1.6,2.6)GiB，**vseg q1 写区** | **40.96µs** | **91.57µs** | n=56,381 |
+| B | [3.2,4.2)GiB，**plain 写区** | **41.28µs** | **91.28µs** | 与 A 几乎逐位相同 |
+| C | [0.5,1.0)GiB，vseg q4 区（低 LBA） | 215.04µs | 155.79µs | 裸读也慢 |
+| D | [0,0.5)GiB，盘首慢窗口 | 212.48µs | 153.92µs | 裸读也慢 |
+| E | 同 A 区，**随机** | 220.16µs | 188.90µs | seq→rand 41→220µs |
+
+- **判决（分区域）**：
+  - **高 LBA 的 vseg 数据裸读 41µs，而 Mooncake-vseg 读同批 key 是 253µs ⇒ 数据/盘无辜，慢在 vseg 路径，增量约 +210µs**；
+  - 低 LBA [0,~1GiB) 裸读也 212–215µs ⇒ 盘在该地址段本身慢（慢区上边界未知，介于 1.0–1.6GiB）；
+  - NOF-040 的"全部 400 key 慢"是两者叠加：低 LBA 盘慢 + 高 LBA vseg 路径慢。
+- **盘对访问模式极敏感**：同一区域顺序 41µs vs 随机 220µs（W9 91.6→188.9）；**vseg 的 253µs 正落在"随机档"** ⇒ 候选机制：vseg 的读流在 target/盘侧被看成非顺序（但 q1 仍 267µs，不能只归因 lane 数，需看 target 侧实际执行顺序）。
+- **preflight 偏差（重要）**：`urma_perf` 的 preflight 写在**每支的 `-l` 起始 LBA**（非固定 LBA0），已覆盖 keys **0 / 128 / 400 / 800** 各 128KiB ⇒ 这些 key 的 Mooncake verify 会失败；后续 Mooncake 测试需新集群/新 key。
+- 环境未变：target 341038 未重启、vseg master 2077841 在。
+
+### 决策点（2026-11-23，NOF-045 后更新）
+
+- 数据/盘（高 LBA）无罪已证实；vseg 路径 +210µs 是主因；盘对顺序/随机极敏感，vseg 落"随机档"。
+- **开发侧决定**：先做**零成本 NOF-046**——用现有日志里的 `target_rx_tick` / `target_exec_tick` 重建 **target 侧到达/执行顺序**：
+  - 若 vseg 的 LBA 在 target 执行顺序上已非严格顺序（或与 bdev_us 相关）⇒ 盘把它看成随机，机制找到，方向是让 target 看到顺序流；
+  - 若 target 执行顺序严格顺序 ⇒ "随机档"解释不成立，需 QD/并发或更深层打点。
 - 其余备选（暂缓）：
 1. **按现状交付**：报告已按 NOF-035 更正；遗留一个明确开放问题（每命令 2.5× 的机制）。
 2. **重启 target 开逐 IO 明细**（需用户批准；target 重启后需重新 register/mount，盘上数据不丢；预计 1.5–2 h）：用 `TARGET_TRACE_ENTRIES>0` 采 `URMA_BDEV_DETAIL`，对比 plain/vseg 的逐条 exec 时间、到达顺序与尺寸分桶。
@@ -2679,7 +2700,9 @@ q1 写是否落盘（master Keys/logical_used + target 写 n）；三桶的 bdev
 
 ---
 
-# NOF-045（待执行 · 裸 SPDK 定点读 vseg/plain 数据区：判定数据/盘慢还是 vseg 路径/连接慢 · 2026-11-23）
+# NOF-045（已关闭 · 裸 SPDK 定点读 vseg/plain 数据区 · 2026-11-23）
+
+> 结果：高 LBA 的 **vseg 数据裸读 41µs**（W9 91.6），Mooncake-vseg 却 253µs ⇒ **慢在 vseg 路径（+210µs）**；低 LBA [0,~1GiB) 盘本身慢（裸读 215µs）；盘对顺序/随机极敏感（41 vs 220µs）。preflight 写在各支起始 LBA（keys 0/128/400/800 各 128KiB 被覆盖）。详见"NOF-045 关键事实"。
 
 ## 背景与目的
 
@@ -2744,3 +2767,57 @@ q1 写是否落盘（master Keys/logical_used + target 写 n）；三桶的 bdev
 ## 回执必答（第一行）
 
 支 A/B/C/D 的裸 SPDK 延迟（avg/p50/p99）与 target W9；vseg 数据区裸读是快还是慢；**数据/盘慢还是 vseg 客户端/连接路径慢**；preflight LBA0 是否有写入；有无失败。
+
+---
+
+# NOF-046（待执行 · 纯日志分析：target 侧到达/执行顺序 vs bdev · 2026-11-23）
+
+## 背景与目的
+
+- NOF-045：高 LBA 的 vseg 数据裸 SPDK 顺序读 **41µs**，Mooncake-vseg 同区 **253µs** ⇒ 慢在 vseg 路径（+210µs）；同区**随机**裸读 **220µs** ⇒ 盘对访问模式极敏感，vseg 正落在"随机档"。
+- 本单只解析现有日志（**零环境操作**）：用 target 回传的 `target_rx_tick` / `target_exec_tick` 重建 **target 侧的到达/执行顺序**，检验 vseg 的 LBA 流在 target/盘看来是否仍是严格顺序。
+
+## A. 输入（node3 run/，只读）
+
+- vseg：`nof040_vseg_t1_q4.log`、`nof040_vseg_t1_q1.log`（可选 16t 作旁证）
+- plain：`nof039_read_t1_w400.log`
+- 字段：`lba blocks initiator_submit_tick target_rx_tick target_exec_tick target_bdev_cpl_tick target_lcore qid bdev_us roundtrip_us`（按日志实际名）。
+
+## B. 解析口径
+
+1. 仅 opcode=2、blocks=256、测量段；warmup/verify 剔除；拼接 torn 行按 NOF-042 口径剔除并计数。
+2. 每 4MiB key 窗口（32 条小 IO）：
+   - 按 `target_rx_tick` 排序：LBA 逆序对数、最大位移；给前 10 条的 LBA 序列样例；
+   - 按 `target_exec_tick` 排序：同样统计；
+   - 与 `initiator_submit_tick` 顺序对比（三者是否一致）；
+   - 相邻 `target_rx_tick` / `target_exec_tick` 间隔 p50/p90，>50µs 断点数。
+3. **bdev_us 与执行次序**：每 key 内按 exec 次序分 4 段（1–8/9–16/17–24/25–32）的 bdev_us p50/p90；以及"先执行的一半 vs 后一半"的差。
+4. **按 lcore/qid**：每 lcore 内 exec 顺序是否严格递增；全局 exec 顺序是否为多 lcore 交错（统计全局逆序对）。
+5. **重点对照**：vseg **q1（单 lane）** 的 target exec 顺序是否严格顺序；若 q1 顺序但仍慢，"盘看成随机"的解释不成立。
+
+## C. 回答与判决
+
+| 检查项 | vseg q4 | vseg q1 | plain T1 |
+|---|---|---|---|
+| rx 顺序逆序对 p50/max | ? | ? | ? |
+| exec 顺序逆序对 p50/max | ? | ? | ? |
+| 相邻 exec 间隔 p50 / >50µs 断点 | ? | ? | ? |
+| bdev_us：前 8 执行 / 后 8 执行 | ? | ? | ? |
+| 与 initiator 顺序是否一致 | ? | ? | ? |
+
+- 明确回答：
+  1. **target 执行顺序是否严格按 LBA 递增**（每 key、每 lane、全局）？
+  2. vseg 与 plain 的 target 侧顺序是否有可辨识差异？
+  3. bdev_us 是否随执行次序变化（排队/乱序相关）？
+  4. 判决：
+     - vseg 的 target 执行顺序**非严格顺序**（例如两 child 交错、多 lane 交错、乱序）⇒ 盘把它看成"随机档"（220µs）已可解释 253µs；方向是让 target 看到顺序流（串行化 children/单 task/单 lane）；
+     - q1（单 lane）**仍严格顺序**却仍慢 ⇒ "随机档"解释不成立，需另做裸 SPDK QD/模式扫描或更深打点（另行下发）。
+
+## D. 边界
+
+- **零环境操作**：不跑 bench、不动 target/master、不写任何文件；只读日志 + /tmp 脚本。
+- 回执只给汇总表、计数与 ≤20 行样例；不贴原始日志、不外传数据。
+
+## 回执必答（第一行）
+
+vseg q4/q1 与 plain 的 target rx/exec 顺序（逆序对/断点/样例）、bdev 与执行次序的关系；**target 侧是否严格顺序、vseg 是否不同**；有无失败。
