@@ -171,7 +171,7 @@
 | NOF-061 | 已关闭 2026-11-23（**判决：vseg 读路径/会话；数据二次无罪**） | 写 LBA 集合与 plain 逐值相同；**零写入**用 plain 元数据读同一批 LBA：plain P50 **308.37**（复测 330.41）/bdev **57**；vseg 同数据 P50 **573.03**（复测 601.09）/bdev **249**；**同 LBA 配对 12,324 条 246 vs 53（4.64×），plain 更快 85.1%**。vseg4 突发 **31（4MiB）与 plain 完全相同** ⇒ NOF-060 的 16 vs 32 不复存在；新增排除突发形态、target lcore（同核仍 4.3×）、顺序/预热。剩余唯一变量=会话/qpair 身份 ⇒ NOF-062 |
 | NOF-062 | 已关闭 2026-11-23（**gap 随并发强收敛 ⇒ 完成检测类**） | bdev p50 **T1 249/54（4.61×）→ T4 262/259（1.01×）→ T16 270/265（1.02×）**；vseg 恒 249→270、plain 单向追平 54→259 ⇒ 判据① + ③。**差异 100% 在 `bdev_us`**，其余段 0、`outside` 同 21µs、`wait/enomem` 为 0。同 qid 配对 T1 4.4–4.8×、T4/T16 1.0×。源码链到 `transport.c:932`（每 poll group 独立 buf_cache）与 `urma.c:2493`（bdev_cpl 在 poll 上下文取）；**target 无 vseg 语义**；两臂仅会话身份与 qpair→lcore 分配不同 ⇒ NOF-063 |
 | NOF-063 | 已关闭 2026-11-23（**无 50–500µs 常量；结构错配对称，不解释臂间差**） | 主链 `transport.c:777→779`→`urma.c:2303`（81 行）；`urma_poll_jfc` 无 timeout、`usleep/nanosleep/spdk_delay_us` 零命中 ⇒ **静态无该量级常量**。结构：`stride=worker_count=6` vs `send_jfc_count=2` ⇒ 仅 worker 0/1 轮询网络，qpair JFC=建连序 mod 2 与属主无对齐 ⇒ 跨线程投递；本地 NVMe 每轮不限量、无 defer。**复核：错配两臂对称（各 2 个轮询 + 2 个非轮询），且同臂 4 个 qid 时延均匀 ⇒ 不是 4.6× 原因，JFC_COUNT=6 不作判决实验** ⇒ 必须插桩 ⇒ NOF-064 |
-| NOF-064 | 已下发 2026-11-23（M3-4，**待用户批准改码/重编/重启**） | 逐 IO 插桩：① 子命令字段（nsid/lba/nbytes/iov_cnt/iov 分布/SQ/qpair/thread）② 轮询节奏（poll_round 增量、nvme_poll 轮与完成数、bdev_us）+ 一次性 worker/JFC 映射；两臂 T1 各 1 遍 + 反序复测；判 H1 没轮到 / H2 轮到但 CQ 空 / H3 两者均 1 而仍慢；回退=旧二进制 `979f5517…` |
+| NOF-064 | **已批准 2026-11-23（用户批准改码/重编/重启）· 待执行** | 逐 IO 插桩：① 子命令字段（nsid/lba/nbytes/iov_cnt/iov 分布/SQ/qpair/thread）② 轮询节奏（poll_round 增量、nvme_poll 轮与完成数、bdev_us）+ 一次性 worker/JFC 映射；两臂 T1 各 1 遍 + 反序复测；判 H1 没轮到 / H2 轮到但 CQ 空 / H3 两者均 1 而仍慢；回退=旧二进制 `979f5517…` |
 | NOF-053 | 已关闭 2026-11-23（**客户端分解；QoS 排除**） | 指定 `batch_get_*` 为 0（单 key Get 走 `get_into_breakdown`/`query_rpc_breakdown`/`transfer_data_breakdown`/`nof_slow_task`）。plain 每 key 283µs = **master 元数据 query 116µs（41%）** + submit 6 + wait 156（含 target W9 68，超出 88）+ 其他 5；**QoS/worker/dispatch 仅 8–11µs（~3%）**。vseg 2× **不是 setup/QoS**（query 103 vs 116 反而低），而是 **drain 350 vs 110µs、max_subio 362 vs 112（3.2×）**、submit 19 vs 6 ⇒ **客户端调度排除**，vseg 的 2× 在 target/传输 drain 段 |
 | NOF-050 | 已关闭 2026-11-23（**阻塞：SPDK 版本不兼容**） | 补丁/编译/链接成功（`bench-io-params` 530,162,656B / md5 fc2b5129…，strings 命中 3 条）；但新 bench 连 target 失败：客户端 SPDK **9a413a44** vs target 运行中 **e12b7cb**，握手 rc=-71/-104；同事原 bench（59662a26，匹配 e12b7cb）同 env/参数 rc=0、P50 473.52 / target W9 259.77。**口径修正**：该 P50 为 **node1 远端 reader**，与 NOF-040 本机 274 不可比（SLOT=1 未改变 P50）；target 现跑的是 **deleted 旧二进制 736a902f**，磁盘 d6c39465=9a413a44 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
@@ -3861,11 +3861,13 @@ vseg4 写/读是否成功与 Keys；vseg4 突发长度（32/16）与 submit 间�
 
 # NOF-064（待执行 · 第二阶段 M3-4：target 逐 IO 插桩——子命令字段 + 轮询节奏 · **需改码/重编/重启** · 2026-11-23）
 
-## 0. 授权与前置（**未获用户明确批准 → 整单停手，只做 A 段**）
+## 0. 授权与前置（**用户已于 2026-11-23 明确批准：改码 + 重编 + 重启 target**）
+
+> 授权范围：仅限本单 B 段的日志语句、`nvmf_tgt` 重编、以及按同 RPC 重启 target。超出范围（改控制流、改缓冲分配、改 RPC 默认值、动他人进程）仍需另行批准。
 
 - 本单要动运行中的 target，三步都必须先获用户当场批准：① 改 `$D/spdk-e12b7cb-src` 源码（**只加日志，不改行为**）；② 重编 `nvmf_tgt`（NOF-048 配方：改一个 .c → 61s 编译 + 4s `ar r` 换库成员 + 重链）；③ **重启 target 708167**（同 RPC 重放；11 盘 vfio 残留 ABORT 用 takeover `-r -y` 补救，NOF-055/059 已两次成功）。
 - **回退锚点（必须前后一致）**：旧二进制 md5 `979f5517…`（bd5ee124d）、旧 PID 708167、`/tmp/nvmf_tgt.log`（记录 offset 与大小）、当前 RPC 配置导出。回退 = 旧二进制 + 原 RPC + 同启动脚本。
-- 未批准就只做 A 段（只读核对），B/C/D 段一律不执行，回执写「待授权」。
+- 授权已获；若重启验收不通过（4457/RAID0/11 盘/transport 任一失败）→ **立即回退旧二进制并停手回报**，不得在未验收状态下继续 C 段。
 
 ## A. 预检（只读）
 
