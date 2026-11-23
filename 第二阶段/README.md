@@ -5,7 +5,7 @@
 - 目录约定：**第二阶段所有内容（文档、代码补丁、测量数据）统一放在 `第二阶段/` 目录下**；本文件为总文档/索引
 - 数据来源：`../HANDOVER.md` 各单回执 + 第一阶段最终报告 `../工作汇总.md`
 - 相关文件：`../HANDOVER.md`（任务通道）、`../工作汇总.md`（第一阶段最终报告）
-- **当前状态（2026-11-23）**：M2-1 完成（target 394826 = bd5ee124d + BUFFER）；**M2-2（NOF-056）在 B2 停手**：vseg 从零建集群后 T1 写触发 **23 次 `VSEGMENT_CREATING`**（已知机制），只写入 377/400 keys；未跑 reader、buffer 0B。**A2 NUMA 审计给出首要新线索：11 盘 5 块在 node0、6 块在 node2（距离 20），target 核全在 node0 ⇒ 6/11 跨 NUMA**。**NOF-057 已下发（选项 1）**：补写至 400 keys → vseg 读（trace）→ plain 写+读（trace）→ 优雅停 target 落盘 → 解析 24 字段并按 **disk/node 分组**，判断 126µs 是否由 NUMA/盘分组解释。**重启不可回退 e12b7cb**。详见下方第 0 节（0.10/0.11）、「最小重建配方」与 `patches/README.md`。
+- **当前状态（2026-11-23）**：M2-1 完成（target bd5ee124d + BUFFER）；M2-2 完成（NOF-057）：126µs **100% 落在 SSD 执行段**（`submit_return→callback`），其余 6 段为 0；**NUMA 排除**；命令完全相同（lba 集合/nlb/flags）；唯一剩余差异是**盘级访问流**（换盘率 79.7% vs 50.0%、每盘回退 31 vs 1）。与 NOF-034（单 child 仍慢）/ NOF-046（q1 顺序仍慢）存在张力 ⇒ **NOF-058 已下发**：纯离线判别"快/慢 IO 的局部条件"（同盘并发重叠 vs 同队列 LBA 局部性），零环境、不重启。**重启不可回退 e12b7cb**。详见下方第 0 节（0.10–0.12）、「最小重建配方」与 `patches/README.md`。
 - 一句话：**数据/盘无罪、target 看到的命令与顺序也与 plain 完全相同，但 vseg 每条 128KiB 读在 target 的 bdev 执行段多花 ~210µs。第二阶段的目标就是把这 210µs 找出来并消掉。**
 
 ---
@@ -58,7 +58,8 @@
 | **M1c** | 零环境解析客户端 breakdown 日志（NOF-053） | **已完成 2026-11-23** | 客户端 QoS/worker/dispatch 仅 3%；master 元数据 RPC 116µs/key（41%）两臂共有；vseg 2× 在 drain 350 vs 110µs ⇒ **客户端调度排除，转 target/传输** |
 | **M2-target** | 换 target 进程 + target 侧逐 IO 打点 | **A 已选；M2-0 完成** | **无需补丁**：bd5ee124d nvmf_tgt 自带 `URMA_STAGE_BUFFER`（24 字段：lba/nlb/hz/exec/enter/submit/submit_return/callback/wait/enomem/rx/buffer/bdev_cpl/data_post/data_cpl/rel0/lcore/flags），进程退出落盘 |
 | **M2-1** | 重启 target 到 bd5ee124d + BUFFER | **已完成 2026-11-23（NOF-055）** | target **394826**（bd5ee124d/md5 979f5517…），4457/RAID0(11 盘/BDF 升序/256K/online)/ns 正常；BUFFER 生效（`run/urma_stage_nof055.bin` 0B、O_EXCL、退出落盘）；旧日志备份 32,780,200B/d294d6ef…；**盘序 BDF 升序、旧序不可恢复 ⇒ 新旧数据不可按 LBA 对比** |
-| **M2-2** | vseg/plain 两阶段采集 + target 退出落盘 + 解析 | **NOF-056 停手（B2）→ NOF-057 续** | B2 触发 23 次 VSEGMENT_CREATING（377/400 keys）；**NUMA 审计：5 盘 node0 / 6 盘 node2、target 核 node0**；NOF-057 补写至 400 后完成两阶段采集与 disk/node 分组解析 |
+| **M2-2** | vseg/plain 两阶段采集 + target 退出落盘 + 解析 | **已完成 2026-11-23（NOF-056 停手 → NOF-057）** | 补齐 400 keys；**126µs 100% 在 `submit_return→callback`（SSD 执行段）**；其余 6 段 0（data 段 vseg 更短）；**NUMA 排除**（256/255 vs 59/61）；命令相同（lba 集合/nlb/flags）；盘级访问流：换盘率 **79.7% vs 50.0%**、每盘递增 98.0% vs 99.9%、回退 31 vs 1；与 NOF-034/046 有张力 |
+| **M2-3** | 离线判别"快/慢 IO 的局部条件"（零环境） | **NOF-058 已下发** | 用同一份 33,792 条 buffer：同盘在服务重叠 `ov` vs 服务时间、`ov=0` 子集、同 (disk,lcore) 紧接前驱交叉表；plain 快/慢自然实验 + params 每 lane 结构 ⇒ 定"并发 vs 局部性"与修复杠杆 |
 | **M1c** | target 侧插桩（SGL/bdev 提交参数/分段 tick） | 需重编 target + 重启（用户批准） | 定位 210µs 在 raid0 队列/NVMe/回调哪一段 |
 
 - NOF-048（最小重建验证）已完成，配方已用于 M1a；构建基线是否升级 tip 视后续需要（S2 暂缓）。
@@ -139,6 +140,31 @@
 - **续跑选择（选项 1）**：同参数 T1 writer 重复补写（≤3 次）至 400 keys；然后完成 vseg 读（trace）→ plain 写+读（trace）→ 优雅停 target 落盘 → 解析。补齐的 23 个 key 若非规范 LBA（在尾部），两阶段都排除这 23 个 key 窗口后比较。
 - **环境**：target 394826（bd5ee124d/BUFFER）、vseg master 2562417（377 keys）、buffer 0B；原地续跑，不重置集群。
 
+### 0.12 NOF-057 定案（2026-11-23）：126µs 全在 SSD 执行段，NUMA 排除，剩"盘级访问流"
+
+**采集**：vseg（slot=1、stripe=2MiB）与 plain 两阶段 T1 读（400 keys、warmup 128），target TERM 优雅退出落盘 **33,792 条、dropped=0**（`run/urma_stage_nof055.bin`，6,488,160 B = 72 + 33,792×192 + 24）。按 exec_tick 最大间隙 208.953 s 分段：vseg 16,896 / plain 16,896。
+
+| 项 | vseg | plain | 差 |
+|---|---|---|---|
+| 端到端 P50 / Avg | 551.22 / 559.93 | 277.50 / 347.45 | +273.7 / +212.5 |
+| W9（exec→bdev_cpl）p50 / mean | **256 / 261.1** | **61 / 136.5** | +195 / +124.6 |
+| `submit_return→callback` p50/p90/mean | **256 / 314 / 260.4** | **60 / 284 / 135.9** | **+196 / +124.5** |
+| 其余 6 段 | 0 | 0 | 0（data 段 vseg 6/10 vs plain 12/33，更快） |
+| 服务时间形状 | 128–256µs 49.9% + 256–512µs 49.7%（64–128 仅 12 条） | 32–64µs 49.9%，≥128µs 36.6% | — |
+
+**命令与 NUMA**：两段 `nlb` 全 256、唯一 lba 12,800、**lba 集合完全相同**、flags 全 3；lcore vseg 2/5/6/7 vs plain 2/3/4/7（各 4,224）。按 `disk=(lba/512)%11`（0–4=node0、5–10=node2）：vseg node0 p50 **256** / node2 **255**；plain **59/61** ⇒ **跨 NUMA 不是原因，彻底排除**。
+
+**唯一剩余差异（相关性，未证因果）**：盘级访问流——换盘率 **79.7%（13,462/16,895）vs 50.0%（8,447/16,895）**、每盘 LBA 递增 **98.0% vs 99.9%**、每盘回退 **31 vs 1**、每盘 IO 数 1,534–1,538（均匀）。与 NOF-045 的盘特性（同区顺序 41µs vs 随机 220µs）吻合：vseg 被打碎的盘内访问流落在"随机档"。
+
+**为什么还不能收口（张力）**：
+1. **NOF-034**：stripe=4MiB、每 key 单 4MiB child（与 plain 同构）时 W9 仍 **250.1–270.9**——若"child 数/两段流"是根因，单 child 应已恢复；
+2. **NOF-046**：q1 单 lane 的 rx/exec/submit 顺序与 plain 完全一致（0 逆序）仍 223–265µs——但该结论基于旧 target 的粗粒度 tick（同 tick 批量可能掩盖组内乱序），需以 NOF-057 的逐 IO 数据为准；
+3. 因此"表面顺序"或"换盘率"可能只是**代理变量**，真正的局部条件可能是"同盘/同队列的在途重叠（`ov`）"或"前一条命令是否紧接（gap/busy）"。
+
+**NOF-058（已下发，零环境）**：用同一份 buffer 做判别——(a) 每条 IO 执行时同盘在服务 IO 数 `ov` 与服务时间的关系、`ov=0` 子集是否仍慢；(b) 同 `(disk,lcore)` 前驱的 `gap`/`busy` 与服务时间的交叉表；(c) plain 段内快/慢 IO 的自然实验（命令/盘相同，判别变量必在 24 字段内）；(d) params 日志的每 lane 结构与 child 交错。输出"并发 vs 局部性"的判决与修复杠杆。
+
+**产物**：`run/urma_stage_nof055.bin`、`run/nvmf_tgt_bd5ee124d_20261123_163717.log`（193,272 B / md5 a8222276…）、`run/nof057_vseg_read.log`（10,843,883 B）、`run/nof057_plain_read.log`（10,570,443 B）、master/写日志。**末态：target down（4457 free）、两 master 已停、无 bench**；buffer 已完整落盘（后续再采须换新文件名，O_EXCL）。
+
 ## 1. 与总目标的关系
 
 ### 1.1 原始目标（交接文档）
@@ -184,12 +210,13 @@
   ⇒ 数据/盘无罪；慢在 vseg 这条路径。
 - **target 侧顺序证否（NOF-046）**：vseg q1（单 lane）在 target 的接收/执行/提交顺序与 plain **完全一致**（0 逆序、0 位移、单 lcore、submit=exec 100%），bdev 仍 223–265µs；plain 同 lcore 43–52µs。
   ⇒ 连"盘把 vseg 看成随机访问"也不成立。
+- **NOF-057 逐 IO 更新（2026-11-23，新 target/bd5ee124d + BUFFER，见 §0.12）**：126µs **100% 在 `submit_return→callback`（SSD 执行段）**，其余 6 段为 0；**NUMA 排除**；两臂 lba 集合/nlb/flags 完全相同。唯一剩余差异是**盘级访问流**（换盘率 79.7% vs 50.0%、每盘回退 31 vs 1）。NOF-046 的"q1 严格顺序"结论基于旧 target 的粗粒度 tick（同 tick 批量可能掩盖组内乱序），以 NOF-057 的逐 IO 数据为准；但 NOF-034（单 child 仍慢）说明**表面顺序/child 数不能直接当根因**。
 
-### 2.3 当前唯一未解矛盾
+### 2.3 当前唯一未解矛盾（NOF-057 后更新）
 
-> **target 看到的顺序、IO 大小（128KiB）、数量、盘区（裸 SPDK 该区 41µs）全部相同，bdev 执行时间却差 5 倍。**
+> **命令完全相同、NUMA 无关、126µs 全在 SSD 服务时间；同一 plain 段内既有 32–64µs 的快 IO（49.9%）也有 ≥128µs 的慢 IO（36.6%），而 vseg 几乎全慢（≥128µs 占 99.6%）。**
 
-现有遥测（客户端 `URMA_SLOW_IO`、target `URMA_BDEV_DETAIL`、W 块）能看的字段已经穷尽；差异只能落在**现有遥测看不到的、target 在提交 bdev 时携带/使用的参数**上。
+判别变量一定在现有 24 字段里，但"换盘率/表面顺序"只是代理：真正要区分的是 **(a) 同盘在途重叠（`ov`，队列深度）** 与 **(b) 同 (disk,lcore) 的 LBA 紧接性（`gap`/`busy`，盘内顺序流）**。NOF-058 用同一份 buffer 做这个判别；结果决定修复杠杆在"限制每盘在途/串行化子 IO"还是"按 LBA 排序/合并提交"。
 
 ### 2.4 已排除项总表
 
@@ -203,7 +230,11 @@
 | 写侧 lane | NOF-043 | q1 串行写的新数据仍 253µs |
 | 提交顺序 | NOF-042 | 每 lane 严格递增，q1 全局单调 |
 | target 落核 | NOF-042 | 四核与 plain 相同，vseg 四核全线慢 |
-| target 到达/执行顺序 | NOF-046 | q1 与 plain 完全一致，0 逆序 |
+| target 到达/执行顺序 | NOF-046 | q1 与 plain 完全一致，0 逆序（**粗粒度 tick，NOF-057 逐 IO 复测下存疑**） |
+| 命令内容（lba/nlb/flags） | NOF-057 | 两臂 lba 集合完全相同、nlb 全 256、flags 全 3 |
+| NUMA（盘/核/设备节点） | NOF-057 | vseg node0 256 / node2 255，plain 59/61 ⇒ 无关 |
+| 126µs 所在段 | NOF-057 | **100% 在 `submit_return→callback`（SSD 执行段）**，其余 6 段为 0 |
+| 盘级访问流 | NOF-057 | 两臂不同（换盘 79.7% vs 50.0%、回退 31 vs 1）；**因果待 NOF-058** |
 | 测量伪影 | NOF-035 | plain 96.9→99.14 可复现 |
 | 传输/客户端 | NOF-041 | data/outside 反而更小 |
 | 连接预热 | NOF-039 | warmup 不能跳过；慢区是固定段 |

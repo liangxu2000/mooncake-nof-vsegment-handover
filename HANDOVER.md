@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-057（第二阶段 M2-2 续：补齐 400 keys 后完成两阶段采集；解析含 NUMA 分组）**
+- 当前任务：**NOF-058（第二阶段 M2-3：离线判别 vseg 慢 IO 的局部条件；零环境、不重启 target）**
 
 ## 第二阶段（2026-11-23 起）
 
@@ -31,6 +31,7 @@
 - **NOF-056 在 B2 停手（2026-11-23）**：vseg 从零建集群后 T1 写触发 **23 次 `VSEGMENT_CREATING`**（每 64MiB vsegment 容 16 key，第 17 个 key 撞创建窗口；key 16,33,…,390 步长 17），只写入 **377/400** keys、logical_used 1,581,252,608；按规则未跑 reader、未切 plain、未停 target（BUFFER 仍 0B）。这是**已知机制**（NOF-028/029/032/034 已 4 次复现），不是随机故障。
 - **NUMA 审计结果（NOF-056 A2，关键新线索）**：4 节点 node0=cpu0–69、node1=70–153、node2=154–237、node3=238–307（0↔2 距离 20）；**11 块数据盘 5 块在 node0（21/22/28/29/2a）、6 块在 node2（91/92/a1/a2/a3/a4）**；**target 核 2–7 全在 node0** ⇒ 6/11 盘与 target 跨 NUMA；RAID0 每 256KiB 条带在 node0/node2 盘间交替，vseg 2MiB task=8 条带、plain 4MiB task=16 条带，跨节点比例/顺序不同。hugepages 各节点 1160、free 16/75/128/128。uburma 设备 numa `[未获取]`。**这成为 126µs 的首要候选；E 段解析必须按 disk/node 分组。**
 - **下一步（NOF-057，选项 1）**：同参数 T1 writer 重复补写（≤3 次）至 **400 keys**；然后 vseg 读（trace）→ plain 写+读（trace）→ 优雅停 target 落盘 → 解析 24 字段；新增 **NUMA 分组**（disk=(lba/512)%11，0–4=node0、5–10=node2），并检查补齐的 23 个 key 在 vseg 的 LBA 是否仍为规范窗口（若在尾部/非规范，则两阶段都排除这 23 个 key 窗口后比较）。
+- **NOF-057 完成（2026-11-23，M2-2 定案）**：补齐 **400 keys**（2 次尝试，VSEGMENT_CREATING 23→0；vsegments=26，补写多建 1 个尾卷，不影响 key/LBA）；vseg T1 P50 **551.22** / W9 **261.44**，plain P50 **277.50** / W9 **137.00**；target 优雅退出落盘 **33,792 条、dropped=0**；**126µs 100% 落在 `submit_return→callback`（bdev/SSD 执行段）**，其余 6 段为 0（data 段 vseg 反而更短 6 vs 12µs）；两段 `nlb=256`、**lba 集合完全相同**、flags 全 3；**NUMA 完全无关**（vseg node0 p50 256 / node2 255；plain 59/61）；唯一留下的差异是**盘级访问流**：换盘率 **79.7% vs 50.0%**、每盘 LBA 递增 **98.0% vs 99.9%**、每盘回退 **31 vs 1**（2MiB child 铺 8 盘、child1 从 disk8 绕回 disk0–4）。**但 NOF-034（stripe=4MiB 单 child 仍 W9 250）与 NOF-046（q1 顺序仍慢）与该解释有张力 ⇒ 不把"child 数"直接当根因**；下一步 NOF-058 用离线数据判别快/慢 IO 的局部条件（同盘并发重叠 vs 同队列 LBA 局部性）。
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -151,7 +152,7 @@
 | NOF-054 | 已关闭 2026-11-23（**A 路线无需补丁**） | 已构建的 bd5ee124d `nvmf_tgt`（`$D/spdk-e12b7cb-src/build/bin/nvmf_tgt`，md5 979f5517…）**本身带全套 target 打点**：URMA_BDEV_DETAIL 6 段 + **URMA_STAGE_BUFFER 逐 IO 24 字段**（lat/nlb/各段 tick/lcore/flags）+ W1–W10；无需写补丁。读提交点 `ctrlr_bdev.c:449/493`（`req->iov/iovcnt`、cdw10/11+cdw12）；BUFFER env：`SINK=buffer`+`PATH`(O_EXCL)+`CAPACITY=200000`（默认 3GiB 内存），**进程退出时落盘**；客户端须 `SPDK_URMA_STAGE_TRACE_US!=0`。重启预案/回退 B（9a413a44 v6）已取证；wrapper 实际在 `/home/yin/Vsegment/run_vesegment_target.sh` |
 | NOF-055 | 已关闭 2026-11-23（**通过**） | target 已切到 **bd5ee124d**（PID **394826**，md5 979f5517…）；4457/RAID0(11 盘/256K/online)/ns/transport 全部正常；BUFFER 模式（SINK=buffer、PATH=`run/urma_stage_nof055.bin`、CAPACITY=200000、DUMP_SEC=10）已生效，buffer 文件 0B（O_EXCL，退出时落盘）；旧日志备份 32,780,200B/md5 d294d6ef…；11 盘 nvme0–10 按 **BDF 升序**接回（每盘 7.15TiB；NOF-054 的 15,002,931,712 是 blocks）。**盘序可能与旧 target 不同（旧序未记录）⇒ 新旧数据不可按 LBA 直接对比**；vseg 元数据已清，NOF-056 重写 |
 | NOF-056 | 已关闭 2026-11-23（**B2 停手：VSEGMENT_CREATING 23 次；NUMA 审计完成**） | vseg 从零建集群后 T1 写触发 **23 次 VSEGMENT_CREATING**（key 16,33,…,390 步长 17），只写入 377/400 keys、logical_used 1,581,252,608；按规则未跑 reader/未切 plain/未停 target（buffer 0B）。**NUMA 审计**：4 节点（node0 cpu0–69、node2 cpu154–237，距离 20）；**11 盘 5 块 node0 / 6 块 node2**；target 核 2–7 全在 node0；hugepages 各节点 1160、free 16/75/128/128；uburma numa 不可读 |
-| NOF-057 | 已下发（2026-11-23，M2-2 续） | 选项 1：同参数 T1 writer 重复补写（≤3 次）至 **400 keys**；然后完成 vseg 读（trace）→ plain 写+读（trace）→ 优雅停 target 落盘 → 解析 24 字段；**新增 NUMA 分组**（disk=(lba/512)%11，0–4=node0、5–10=node2）并检查补齐的 23 key 是否非规范（必要时两阶段都排除后比较） |
+| NOF-057 | 已关闭 2026-11-23（**126µs 定位于 SSD 执行段；NUMA 排除；访问流差异**） | 补齐 400 keys（2 次尝试；VSEGMENT_CREATING 23→0；vsegments=26）；vseg T1 P50 **551.22**/W9 **261.44**，plain **277.50**/**137.00**；落盘 **33,792 条 dropped=0**；**126µs 100% 在 `submit_return→callback`（bdev/SSD）**，其余 6 段 0、data 段 vseg 更短；两段 `nlb=256`、**lba 集合完全相同**、flags 全 3；**NUMA 排除**（256/255 vs 59/61）；盘级访问流：换盘率 **79.7% vs 50.0%**、每盘递增 **98.0% vs 99.9%**、回退 **31 vs 1**。与 NOF-034/046 有张力，child 数不直接当根因；NOF-058 离线判别局部条件 |
 | NOF-053 | 已关闭 2026-11-23（**客户端分解；QoS 排除**） | 指定 `batch_get_*` 为 0（单 key Get 走 `get_into_breakdown`/`query_rpc_breakdown`/`transfer_data_breakdown`/`nof_slow_task`）。plain 每 key 283µs = **master 元数据 query 116µs（41%）** + submit 6 + wait 156（含 target W9 68，超出 88）+ 其他 5；**QoS/worker/dispatch 仅 8–11µs（~3%）**。vseg 2× **不是 setup/QoS**（query 103 vs 116 反而低），而是 **drain 350 vs 110µs、max_subio 362 vs 112（3.2×）**、submit 19 vs 6 ⇒ **客户端调度排除**，vseg 的 2× 在 target/传输 drain 段 |
 | NOF-050 | 已关闭 2026-11-23（**阻塞：SPDK 版本不兼容**） | 补丁/编译/链接成功（`bench-io-params` 530,162,656B / md5 fc2b5129…，strings 命中 3 条）；但新 bench 连 target 失败：客户端 SPDK **9a413a44** vs target 运行中 **e12b7cb**，握手 rc=-71/-104；同事原 bench（59662a26，匹配 e12b7cb）同 env/参数 rc=0、P50 473.52 / target W9 259.77。**口径修正**：该 P50 为 **node1 远端 reader**，与 NOF-040 本机 274 不可比（SLOT=1 未改变 P50）；target 现跑的是 **deleted 旧二进制 736a902f**，磁盘 d6c39465=9a413a44 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
@@ -3381,7 +3382,9 @@ target 是否成功切到 bd5ee124d（PID/版本/md5）；4457/RAID0/ns/transpor
 
 ---
 
-# NOF-057（待执行 · 第二阶段 M2-2 续：补齐 400 keys 后完成两阶段采集；解析含 NUMA 分组 · 2026-11-23）
+# NOF-057（已关闭 · 126µs 全在 SSD 执行段；NUMA 排除；两臂访问流不同 · 2026-11-23）
+
+> 结果：补齐 **400 keys**（2 次尝试：r1 398/2、r2 400/0；VSEGMENT_CREATING 23 次后清零；Keys=400、logical_used=1,677,721,600、vsegments=26）。两阶段读 **failed=0**：vseg Min/Avg/P50/P90/P99/Max = 468.54/559.93/**551.22**/644.84/769.59/863.98µs，W9 **261.44**；plain = 255.87/347.45/**277.50**/578.10/758.10/793.74µs，W9 **137.00**。target TERM 后 3s 优雅退出，`run/urma_stage_nof055.bin` **6,488,160 B**、magic `URMA3B01`、footer `URMA3END`、**count=33,792 dropped=0**（=72+33,792×192+24，严格吻合）。按 exec_tick 最大间隙 208.953s 分为 seg1 vseg 16,896 / seg2 plain 16,896。**各段**（µs，p50/p90/mean）：`submit_return→callback` vseg **256/314/260.4** vs plain **60/284/135.9**（+196/+124.5）；W9 **256/314/261.1** vs **61/285/136.5**；其余 6 段两阶段均 0（`data_post→data_cpl` vseg 6/10 vs plain 12/33，vseg 更快）。命令完全相同：`nlb` 全 256、唯一 lba 12,800、**两段 lba 集合相同**、flags 全 3；lcore vseg 2/5/6/7 vs plain 2/3/4/7（各 4,224）。**NUMA 排除**：vseg node0 p50 256（45.5%）/ node2 255（54.5%）；plain 59/61。**盘级访问流不同**：换盘率 **79.7%（13,462/16,895）vs 50.0%（8,447/16,895）**、每盘 LBA 递增 **98.0% vs 99.9%**、每盘回退 **31 vs 1**、每盘 IO 数 1,534–1,538（均匀）。23-key 排除无需做（LBA 集合一致且全部规范：400 唯一 key、范围 0–399）。vseg 分桶 128–256µs 49.9% + 256–512µs 49.7%（64–128 仅 12 条）；plain 32–64µs 49.9% + ≥128µs 36.6%。张力：NOF-034（stripe=4MiB 单 child 仍 W9 250.1–270.9）与 NOF-046（q1 严格顺序仍 223–265µs）说明"child 数/表面顺序"不能直接当根因 ⇒ NOF-058 离线判别快/慢 IO 的局部条件。产物：`run/urma_stage_nof055.bin`、`run/nvmf_tgt_bd5ee124d_20261123_163717.log`（193,272 B / md5 a8222276…）、`run/nof057_vseg_read.log`（10,843,883 B）、`run/nof057_plain_read.log`（10,570,443 B）、master/写日志、/tmp 脚本。末态：target down、4457 free、两 master 已停、无 bench。
 
 ## 起点状态（原地续跑）
 
@@ -3432,3 +3435,69 @@ target 是否成功切到 bd5ee124d（PID/版本/md5）；4457/RAID0/ns/transpor
 ## 回执必答（第一行）
 
 是否补齐 400 keys（尝试次数/最终 Keys/logical_used）；两阶段读是否成功；target 是否落盘（count/dropped）；两段 nlb/lba/lcore；各段 p50/p90 与 **126µs 所在段**；**NUMA 分组结果（node0 vs node2、vseg vs plain）**；有无失败。
+
+---
+
+# NOF-058（待执行 · 第二阶段 M2-3：离线判别 vseg 慢 IO 的"局部条件" · 零环境 · 2026-11-23）
+
+## 背景与目标
+
+- NOF-057 已把 126µs **100% 定位在 `submit_return→callback`（SSD 执行段）**，并证明命令完全相同（lba 集合/nlb/flags）、NUMA 无关；唯一留下的差异是盘级访问流（换盘率 79.7% vs 50.0%、每盘 LBA 回退 31 vs 1）与 **每个 IO 在盘上的"局部处境"**。
+- 但"访问流不同"≠"因果"：NOF-034（stripe=4MiB、每 key 单 child，W9 仍 250–271µs）与 NOF-046（q1 严格顺序仍 223–265µs）都提示不能把 child 数/表面顺序直接当根因。
+- **关键自然实验**：plain 同一段内同时存在快 IO（32–64µs 占 49.9%）与慢 IO（≥128µs 占 36.6%），命令/盘/会话完全相同 ⇒ **快/慢的判别变量一定在现有 24 字段里**。vseg 几乎 100% 是慢 IO。
+- 本单是**纯离线分析**：target 保持 NOF-057 末态（down），不重启、不起 master/bench、不写盘、不改任何配置；只读 `run/` 下既有产物。
+
+## A. 输入与方法审计（先做，必答）
+
+1. 读 `run/urma_stage_nof055.bin`：确认 header/footer/**count=33,792**；复现按 exec_tick 最大间隙分两段（16,896/16,896、间隙 208.953s）。
+2. **顺序重建口径**：记录是按 release（完成）顺序追加；"提交顺序"= 按 `exec_tick` 升序。报告：
+   - 每段 **exec_tick 相同（同 tick）的 IO 占比**、最大同 tick 组大小；
+   - 用 `(exec_tick, trace_seq)` 与 `(exec_tick, rx_tick, trace_seq)` 两种 tie-break 重算"换盘率 / 每盘递增比例 / 每盘回退"三指标，报告差异（若 >2% 视为顺序指标不稳，须说明）；
+   - `qid` 的取值分布与 `qid ↔ lcore` 映射（每 qid 对应几个 lcore）。
+3. **分离 warmup / 测量两遍**：每个 lba 出现 2 次（warmup 128 keys + 测量 400 keys，0–127 重合）。在提交顺序中找到"lba 从高值回落到 0"的边界（辅以时间间隙与客户端日志的阶段行），报告边界前后 IO 数/时间戳；**B/C 段默认只用测量遍**，同时给全段对照。
+
+## B. 并发重叠 vs 服务时间（区分"排队"与"访问局部性"）
+
+按盘 `disk=(lba/512)%11`，对每段（测量遍）：
+
+1. 对每条 IO i，计算执行时刻同盘的**在服务 IO 数** `ov_i = |{j : disk_j=disk_i, exec_j ≤ exec_i < callback_j, j≠i}|`；
+2. 报告 `ov` 分布（0/1/2/≥3 的比例）及每档的 `submit_return→callback` p50/p90；
+3. **关键子集**：取 `ov=0`（该盘在执行 i 时没有任何其他在服务 IO）的 IO，报告其服务时间分布（p50/p90/各桶计数）。
+   - 若 vseg 的 `ov=0` IO 仍 ~250µs ⇒ 并发不是主因，转 C；
+   - 若明显更快 ⇒ 并发/队列深度是主因，给出"从 ov=几开始进入 250µs 档"的拐点。
+
+## C. 同盘/同队列的 LBA 局部性（区分"顺序流"）
+
+对每段（测量遍），分两个口径：**同 disk** 与 **同 (disk, lcore)**（lcore = target reactor，近似 NVMe 队列）：
+
+1. 按提交顺序，为每条 IO 找同口径的前一条 j（`exec_j < exec_i`，同 tick 用 trace_seq），计算
+   - `gap = lba_i − (lba_j + nlb_j)`（blocks；0 表示严格紧接）、
+   - `dt = exec_i − exec_j`、`busy = (exec_i < callback_j)`（前一条是否仍在服务中）；
+2. 交叉表：服务时间桶（<32 / 32–64 / 64–128 / 128–256 / 256–512 / ≥512µs）× `gap` 桶（紧接 `|gap|≤512`、近距 `<8MiB`、远距 `≥8MiB` 或回退）× `busy`；
+3. 给两臂的**紧接前驱占比**（`|gap|≤512`）与对应服务时间 p50/p90；
+4. 明确回答：**plain 的快 IO 能否由"紧接前驱"和/或"ov=0"解释**（各命中率与 p50 对照）；**vseg 为什么几乎没有快 IO**（上述条件的命中率各是多少，差在哪一环）。
+5. 附：每段给 20 条连续 IO 的紧凑摘录（相对 exec_tick µs、disk、lba、qid、lcore、服务 µs），便于人工复核。
+
+## D. 客户端提交结构（params 日志，只读）
+
+1. 解析 `run/nof057_vseg_read.log` / `run/nof057_plain_read.log` 的 `NOF_IO_PARAMS_SUBMIT` / `NOF_IO_PARAMS_WORKER` 行（应为 vseg 1056/1056、plain 528/528）；先报告两种行的**字段全集与样例各 2 行**。
+2. 按 `lane`（或 `worker`）分组，依**文件行序**重建每 lane 的 `seg_lba` 序列；报告每 lane 的 LBA 回退次数/比例、blocks、以及 vseg 的 `child` 标记序列。
+3. 对 vseg：统计同一 key 的两个 child 是否**相邻提交**（SUBMIT 行相邻），以及每个 lane 上 child0/child1 的切换次数（衡量两 child 在同 lane 上的交错）。
+4. 对 plain：同样给每 lane 的 LBA 单调性（对照测量遍 target 序列）。
+5. 若行序不能可靠代表提交时序（例如无时间戳、跨线程写交错），明确写 `[未获取]` 并说明推断边界，**不要猜**。
+
+## E. 结论（必答）
+
+1. **最佳单一判别变量**：ov / 同队列紧接前驱 / 两者组合 / 都不是；给两臂命中率与 p50 数字；
+2. 机制判断（三选一并给证据强度）：(i) 同盘并发重叠；(ii) 盘内/队列内 LBA 局部性被打断；(iii) 都不是（需新维度）；
+3. **修复杠杆**：基于数据指出最可能有效的客户端改动（例：同 lane 子 IO 串行/相邻、限制每盘在途数、child 合并/按 LBA 排序提交），并给出该改动在当前数据上的**预期落点**（哪一档回落、预期 W9 量级）；若数据不支持任何杠杆，直说。
+
+## F. 边界与产物
+
+- 零环境：target 保持 down；不启动 master/bench；不重启、不改配置、不写盘；只读 `run/` 文件（不得修改 NOF-057 产物）。
+- 分析脚本放 `/tmp`；持久产物写 `run/nof058_*.txt`（≤5 个，每个 ≤1MB）；完整逐 IO CSV 可留 /tmp，不作为产物。
+- 输入缺失/损坏 → 停手回报，不重建环境。
+
+## 回执必答（第一行）
+
+重建方法审计（同 tick 占比/两种 tie-break 敏感性）；warmup→测量边界；`ov` 分布与 **ov=0 子集的服务时间（两臂）**；同队列紧接前驱占比与交叉表（两臂）；**plain 快 IO 的解释比例**与 **vseg 无快 IO 的原因**；客户端每 lane 单调性/child 交错；结论与修复杠杆。
