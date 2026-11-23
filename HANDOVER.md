@@ -6,7 +6,14 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**无（NOF-046 已关闭 2026-11-23；等待用户决定：收口交付 / 客户端或 target 代码级插桩）**
+- 当前任务：**NOF-047（第二阶段 M0：构建/依赖取证 + 复制源码与 build 到我们目录）**
+
+## 第二阶段（2026-11-23 起）
+
+- **第一阶段（NOF-001~046）已收口**：单 target 下 vsegment 无读时延优势；核心未解问题已定位到 **vseg 读路径在 target 的 bdev 执行段多 ~210µs**（数据/盘无罪：裸 SPDK 同区 41µs；target 侧顺序/落核/命令与 plain 完全一致）。
+- **第二阶段目标**：消除这 210µs，让 vseg 的 target bdev 接近 plain（~70–100µs）、端到端不劣于 plain；之后再谈 300µs 与多 target 结构性优势。
+- **计划与假设（H1–H4）、里程碑（M0–M4）、验收与回退**：见 `第二阶段/README.md`（第二阶段所有内容统一放在 `第二阶段/`）。
+- **M0（NOF-047）**：只读取证构建/依赖配置，复制 Mooncake 与 SPDK 源码/build 到 `/home/l00955908/mooncake-nof-vsegment/build/`（不改同事原树、不构建、不跑服务）。
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -119,6 +126,7 @@
 | NOF-044 | 已关闭 2026-11-23（**明细已有但退化，不重启**） | 现有 13,767 条 `URMA_BDEV_DETAIL`（8 计时字段），但 `submit_to_callback_us ≡ bdev_us`（全量）、其余子段≈0 ⇒ 拆不开 raid0/NVMe；无时间戳、trace_seq 每会话重置、LEGACY 只采 ≥40µs（plain 偏斜）；cmdline 仅 `-m [2-7] --wait-for-rpc`，重启需 RPC 重放 ⇒ 按 A4 不重启 |
 | NOF-045 | 已关闭 2026-11-23（**vseg 区数据无罪，慢在 vseg 路径**） | 裸 SPDK 顺序 QD1：A（vseg 区 1.6G）p50 **40.96**/W9 **91.57**；B（plain 区 3.2G）**41.28/91.28**；C（0.5G）**215.04/155.79**；D（0–0.5G）**212.48/153.92**；E（同 A 区随机）**220.16/188.90** ⇒ 高 LBA 的 vseg 数据裸读快（41µs）而 Mooncake-vseg 253µs ⇒ **慢在 vseg 路径（+~210µs）**；低 LBA [0,~1GiB) 盘本身慢；盘对顺序/随机极敏感（41 vs 220µs，vseg 253 正在"随机档"） |
 | NOF-046 | 已关闭 2026-11-23（**顺序假设证否**） | **q1 单 lane：rx/exec/submit 顺序逆序对全 0、位移 0、单 lcore、submit=exec 100%**，但 bdev 仍 **223–265µs**（plain 同 lcore 43–52）；q4 逆序 61/496 仅来自 4 lane×2 child 的 8 条顺序流交错，且 q4≈q1 ⇒ 顺序不是差异来源；bdev 随执行次序仅 +19–24%（三种读法一致，通用排队）⇒ **"盘看成随机档"解释不成立**，剩余只有 target bdev 提交侧参数（buffer/描述符/flags/stride）需代码插桩 |
+| NOF-047 | 已下发（2026-11-23，第二阶段 M0） | 只读取证 Mooncake/SPDK 构建配置、依赖与补丁上下文；把源码与 build 复制到我们目录（不改同事原树、不构建、不跑服务），为 M1 插桩构建做准备 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
@@ -2832,3 +2840,49 @@ q1 写是否落盘（master Keys/logical_used + target 写 n）；三桶的 bdev
 ## 回执必答（第一行）
 
 vseg q4/q1 与 plain 的 target rx/exec 顺序（逆序对/断点/样例）、bdev 与执行次序的关系；**target 侧是否严格顺序、vseg 是否不同**；有无失败。
+
+---
+
+# NOF-047（待执行 · 第二阶段 M0：构建/依赖取证 + 复制源码与 build 到我们目录 · 2026-11-23）
+
+## 背景与目标
+
+- 第二阶段计划见 `第二阶段/README.md`；M0 是插桩构建的前置。
+- 目标：**不改同事原树、不构建、不跑服务**，把构建所需信息取证齐全，并把 Mooncake 与 SPDK 的源码/build 复制到我们目录，为 M1 插桩做准备。
+
+## A. 只读取证（回执必须给）
+
+1. **Mooncake 构建配置**（`/home/yin/nof/mooncake-builds/mooncake-vesegment-sysurma-build/CMakeCache.txt`）：
+   - `CMAKE_HOME_DIRECTORY`、`CMAKE_BUILD_TYPE`、C/CXX 编译器、构建系统（Unix Makefiles？）；
+   - SPDK 路径、依赖库路径（glog/gflags/etcd 等）、`USE_NOF`/`USE_NOF_URMA`/`USE_UB` 等开关；
+   - 目标名与产物：`stress_cluster_bench` 路径/md5/大小（node3 的 59662a26… 与 node1 的 575d2151… 分别标注）。
+2. **源码状态**：`/home/yin/nof/mooncake-vesegment` 的 HEAD（应 be10be2）与 `git status --porcelain`（应只有 go.mod/go.sum）；`git log -1 --format=%cd`。
+3. **SPDK 两棵树**：
+   - yin `spdk-cpu`：HEAD/status、build 目录大小、`nvmf_tgt` 与 `libspdk*` 路径/md5；
+   - 客户端 SPDK 库与 Mooncake 的链接关系（CMakeCache 中 SPDK 库路径）。
+4. **target 启动与 RPC 配置来源**：cmdline 只有 `-m [2-7] --wait-for-rpc`；确认 NOF-016 用的 `run_vesegment_target.sh`/`target_nvme_takeover.sh` 的 RPC 序列与当前 target（URMA_RAID0/11 盘/4457）一致；记录脚本路径/md5。
+5. **依赖/工具链/空间**：cmake/gcc/go/python 版本；liburma 路径/版本；`/home` 剩余空间；两机无外网（确认）。
+6. **补丁上下文**（各给 `file:line` + ≤20 行原文；不贴整文件）：
+   - target：`lib/nvmf/urma.c` 中 bdev 读提交点（`spdk_bdev_read`/`spdk_bdev_readv` 调用附近）与解析后的数据 buffer/SGL 字段；
+   - 客户端 SPDK：`lib/nvme/nvme_urma.c` 中读请求构造 capsule/SGL 的位置（payload 指针/长度/MR/rkey/queue）；
+   - Mooncake：`mooncake-store/src/transfer_task.cpp` 的 `submitSpdkNofOperation` 与 worker 中 `buffer_info` 解析（公开源码可只给行号与函数名，不必贴文）。
+
+## B. 复制到我们目录（不构建、不运行）
+
+1. 在 `/home/l00955908/mooncake-nof-vsegment/build/` 下：
+   - `sudo -n cp -a /home/yin/nof/mooncake-vesegment` → `mooncake-src/`；`chown -R l00955908`；
+   - `sudo -n cp -a .../mooncake-vesegment-sysurma-build` → `mooncake-build-colleague/`（7.7G，保留作为构建参考/回退）；chown；
+   - `sudo -n cp -a /home/yin/nof/spdk-cpu` → `spdk-src/`；其 build 目录 → `spdk-build/`；chown。
+2. 校验：复制后源码 HEAD/status 与原件一致；二进制 md5 与原件一致；记录总占用。
+3. **不修改任何源码、不构建、不启动服务、不跑 bench、不动 target/master、不写盘数据。**
+4. 空间上限：复制总量 ≤ 15GB；若剩余空间不足或复制失败 → 停手回报。
+
+## C. 边界
+
+- 只读同事原树；所有写操作在我们目录；sudo 仅用于 cp/chown/读 root 文件。
+- 不贴大段源码/日志；补丁上下文每处 ≤20 行。
+- 长任务（复制 >10 min）每 ~15 min 一行进度。
+
+## 回执必答（第一行）
+
+CMake 关键配置与源码/SPDK 基线；复制是否完成（路径/占用/校验）；补丁上下文（bdev 提交点、capsule/SGL 构造点、Mooncake 行号）；构建配方建议（下一步怎么在我们的副本里构建）；有无失败。
