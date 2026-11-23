@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-044（零成本检查 target 逐 IO 明细；若无则按用户授权重启 target 开启）**
+- 当前任务：**NOF-045（裸 SPDK 定点读 vseg/plain 数据区：判定数据/盘慢还是 vseg 路径/连接慢）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -116,7 +116,8 @@
 | NOF-041 | 已关闭 2026-11-23（**全部落在 bdev 段**） | vseg T1（排除 0–96）**bdev_us p50 250 / p90 306** vs plain **46 / 58**（+204）；data_us **5 vs 14（更小）**、outside_us 16 vs 23（更小）；vseg bdev **单峰**（200–300 占 76.2%、<100µs 占 0.0%），plain 干净区**双簇**（<50 占 60.0%、50–100 占 39.9%）；**vseg 的 bdev 分布与 plain 盘首慢区（keys 0–96）逐桶吻合** ⇒ vseg 全部 400 keys 都处于同一"慢状态" |
 | NOF-042 | 已关闭 2026-11-23（**时序/落核无差异**） | 每条 lane 内严格 LBA 递增（(key,qid) 逆序对 p50=0）；q1 全局单调；四核四 qpair 与 plain 相同且均匀（lcore3/4/5/6）；**四核 bdev 全线 218–261µs vs plain 47–48µs**（慢不集中某核）；大 IO 与下一 key 小 IO 基本不重叠（0.61% vs 0.08%）；**纠正日志事实**：此前"每 key 一条大 IO"是 `nof_slow_task` 行拼接所致，URMA_SLOW_IO 全为 128KiB（任务级：vseg 2×2MiB、plain 1×4MiB） |
 | NOF-043 | 已关闭 2026-11-23（**写 lane 排除**） | q1 串行写 400 新 key（自证 io_qpairs=1；Keys=800、logical_used 精确、写 W9 27.73µs）；读回三桶 bdev p50 **252 / 252 / 253µs**（慢窗口 / q4 写 / q1 写），慢占比 91.6/91.0/91.2% ⇒ **写侧 lane 交织不是主因**；六个维度全部排除，只剩 target/盘内部逐 IO 细节 |
-| NOF-044 | 已下发（2026-11-23，用户已批准条件重启） | 先零成本检查 `/tmp/nvmf_tgt.log` 与 SPDK 源码（逐 IO 明细是否已有、需要哪些 env、含哪些字段）；若无，则按用户授权重启 target 开启逐 IO 明细并验收（不启 master、不读写） |
+| NOF-044 | 已关闭 2026-11-23（**明细已有但退化，不重启**） | 现有 13,767 条 `URMA_BDEV_DETAIL`（8 计时字段），但 `submit_to_callback_us ≡ bdev_us`（全量）、其余子段≈0 ⇒ 拆不开 raid0/NVMe；无时间戳、trace_seq 每会话重置、LEGACY 只采 ≥40µs（plain 偏斜）；cmdline 仅 `-m [2-7] --wait-for-rpc`，重启需 RPC 重放 ⇒ 按 A4 不重启 |
+| NOF-045 | 已下发（2026-11-23） | 零重启：用 gap `urma_perf`（root）定点顺序读 LBA 1.6G（vseg 写区）/ 3.2G（plain 未覆盖区）/ 0.5G（vseg q4 区）/ 0（盘首慢窗口），比较 target W9——vseg 区裸读快 ⇒ 数据无辜、慢在 vseg 路径/连接；裸读慢 ⇒ 数据/盘状态慢 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
@@ -564,13 +565,21 @@
 - **布局全连续**：三桶窗口步长恒 1、相邻差=256 占 99.4–99.6%、>1MiB 跳变 0。
 - **判决**：**写侧 lane 交织不是主因**。至此六个维度全部排除：IO 尺寸/数量、LBA 布局、写线程数、盘首慢区、qpair/lane 数、写侧 lane 数；加上时序/落核/重叠与传输/客户端，vseg 的 188µs 增量只能落在 **target/盘内部的逐 IO 执行细节**。
 
-### 决策点（2026-11-23，NOF-043 后更新）
+### NOF-044 关键事实（逐 IO 明细已有但退化；不重启，2026-11-23）
 
-- 已排除：测量伪影、写线程数/写模式、布局/分区/stripe/child/写序、连接预热、qpair/lane（读+写）、提交顺序/落核/大 IO 重叠、传输/客户端（data/outside 更小）；慢窗口是固定 LBA 段，与 vseg 无关。
-- **用户已决策（2026-11-23）**："先查，无则重启"——先零成本检查现有 target 日志/源码是否已有逐 IO 明细；若没有，**授权重启 target 加打点**。
-- **NOF-044（本单）**：Stage A 零成本检查（`/tmp/nvmf_tgt.log` 是否已有 `URMA_BDEV_DETAIL`、源码确认所需 env 与字段）；Stage A 无明细则按用户授权执行 Stage B（重启 target 开逐 IO 明细并验收；**不启 master、不读写**）。
-- 随后 NOF-045 再在带打点的 target 上做 vseg/plain 两段读并把逐 IO 明细采下来对比（届时再下发）。
-- 若明细不可得/不提供新信息：按现状收口（报告已含六维度排除与逐 IO 五段定位，遗留机制问题）。
+- **现有明细**：`/tmp/nvmf_tgt.log` 有 **13,767 条 `URMA_BDEV_DETAIL`**，字段：`trace_seq qid cid bdev_us exec_to_read_us read_to_submit_us submit_call_us submit_to_callback_us callback_to_complete_us enomem_wait_us enomem_count`。
+- **子段退化**：`submit_to_callback_us ≡ bdev_us`（13,767/13,767）；read_to_submit/enomem_wait 恒 0；submit_call 仅 620 条非零；exec_to_read 3 条、callback_to_complete 43 条 ⇒ 只能得出"时间在 submit→callback"，**拆不开 raid0 队列 vs NVMe 完成**。
+- **使用限制**：明细无时间戳；`trace_seq` 每客户端会话从 1 重置，不能跨会话 join（实测 60 条 T1 join 仅 17 条且数值不符，判为误匹配未采信）；LEGACY 模式只打印 `bdev_cpl−exec ≥ hz/2500 = 40µs` 的读 ⇒ plain（46µs）样本严重偏斜。
+- **源码（/home/yin/nof/spdk-cpu）**：打印点 `urma.c:2558`；触发需客户端 trace 请求 + READ + LEGACY ≥40µs；sink 模式 legacy/quiet/echo/buffer，未设置默认 legacy；buffer 模式需 `SPDK_URMA_STAGE_TARGET_PATH`，退出时 dump 24 字段二进制（仍无 raid0/NVMe 拆分）；`SPDK_URMA_TRACE_ENTRIES` 在 lib/nvmf 内无命中（当前 `TARGET_TRACE_ENTRIES=0`）。
+- **重启代价更高**：target cmdline 只有 `-m [2-7] --wait-for-rpc`，子系统/RAID0/11 盘是启动后 RPC 下发，重启需完整 RPC 重放（NOF-016 脚本是否等价未验证）。
+- **判决**：按 A4"已有明细 ⇒ 不重启"；环境未动（target 341038、vseg master 2077841）。
+
+### 决策点（2026-11-23，NOF-044 后更新）
+
+- 现有逐 IO 明细拆不开 raid0/NVMe，BUFFER 模式也只多同样的阶段边界。在动代码之前，先用**裸 SPDK `urma_perf` 定点读同一批 LBA**（零重启）区分"数据/盘慢"与"vseg 客户端/连接路径慢"：
+  - 裸读 vseg 数据区（LBA 1.6G）若 ~30–46µs ⇒ **数据/盘无辜，慢在 vseg 路径/连接**；
+  - 若 ~190–250µs ⇒ **数据/盘状态慢**（需重新审视写路径结论）。
+- **NOF-045（本单）**：支 A 1.6G（vseg q1 区）、支 B 3.2G（plain 未覆盖区）、支 C 0.5G（vseg q4 区）、支 D 0（盘首慢窗口），顺序裸读 6s/支，采 target W9。
 - 其余备选（暂缓）：
 1. **按现状交付**：报告已按 NOF-035 更正；遗留一个明确开放问题（每命令 2.5× 的机制）。
 2. **重启 target 开逐 IO 明细**（需用户批准；target 重启后需重新 register/mount，盘上数据不丢；预计 1.5–2 h）：用 `TARGET_TRACE_ENTRIES>0` 采 `URMA_BDEV_DETAIL`，对比 plain/vseg 的逐条 exec 时间、到达顺序与尺寸分桶。
@@ -2621,7 +2630,9 @@ q1 写是否落盘（master Keys/logical_used + target 写 n）；三桶的 bdev
 
 ---
 
-# NOF-044（待执行 · 零成本检查 target 逐 IO 明细；若无则按用户授权重启开启 · 2026-11-23）
+# NOF-044（已关闭 · 零成本检查 target 逐 IO 明细；按 A4 不重启 · 2026-11-23）
+
+> 结果：`URMA_BDEV_DETAIL` 已存在（13,767 条/8 字段），但 `submit_to_callback ≡ bdev_us`、其余子段≈0，拆不开 raid0/NVMe；无时间戳、trace_seq 每会话重置、LEGACY 只采 ≥40µs。按 A4 不重启，环境未动。详见"NOF-044 关键事实"。
 
 ## 背景与授权
 
@@ -2665,3 +2676,71 @@ q1 写是否落盘（master Keys/logical_used + target 写 n）；三桶的 bdev
 ## 回执必答（第一行）
 
 现有日志是否已有逐 IO 明细及字段清单；如无，target 是否已带 trace 重启成功（新 PID/4457/明细样例/rollback 命令）；有无失败。
+
+---
+
+# NOF-045（待执行 · 裸 SPDK 定点读 vseg/plain 数据区：判定数据/盘慢还是 vseg 路径/连接慢 · 2026-11-23）
+
+## 背景与目的
+
+- NOF-041~043：vseg 的 188µs 增量全在 bdev；写路径、布局、qpair/lane、时序/落核全部排除；NOF-044 现有逐 IO 明细子段退化，拆不开 raid0/NVMe。
+- 在改代码/重启 target 之前，用**裸 SPDK `urma_perf`**（gap 构建 md5 `c653c0a6…`，NOF-022/023 用过）直接读**同一批 LBA**：
+  - 裸客户端不经过 Mooncake/vseg，但读的是同一 target、同一 ns 上的数据；
+  - 若裸读 vseg 数据区 **快（~30–46µs）** ⇒ **数据/盘无辜，慢在 vseg 客户端/连接路径**；
+  - 若裸读 vseg 数据区 **慢（~190–250µs）** ⇒ **数据/盘状态慢**（需重新审视写路径结论）。
+- **零重启**；urma_perf 内置 preflight 会写 LBA0（已知，NOF-022 先例），本单接受该小范围覆盖（见 D）。
+
+## A. 预检（只读）
+
+1. target 341038、4457、`URMA_RAID0`/nsid1 在位；vseg master 2077841 保持运行（本单不驱动它）。
+2. 定位 node1 `~/gap/spdk/build/examples/urma_perf`，记录 md5；`--help` 确认：
+   - `-l` 是否为**起始 LBA**（NOF-022/023 用 `-l 0`）、单位（512B 块还是字节）、`--range-bytes` 语义；
+   - 可用参数组合：`-w read -o 131072 -T 1 -b 1 -t 6 -n 1 -g 0 -l <start> -M cpu`；
+   - `URMA_PERF_ADDR_MODE=seq` 生效。
+   - **若找不到起始 LBA/范围参数 ⇒ 停手回报 `--help`，不要从 LBA0 全盘扫。**
+3. LBA 地图（512B 块；以 NOF-043 读回布局为准）：
+   - vseg 写入区：keys 0–399 → [0, 1.6GiB)；keys 400–799 → [1.6GiB, 3.2GiB)；
+   - **plain 未覆盖区**：keys 800–1199 → [3.2GiB, 4.8GiB)（NOF-039 的 plain 16t 写，未被 vseg 覆盖）；
+   - 盘首慢窗口：前 ~388MiB。
+
+## B. 裸 SPDK 定点读（node1 → target，root；每支 6s；`-T1 -b1 -o 131072`；seq）
+
+| 支 | `-l` 起始 LBA | `--range-bytes` | 覆盖 | 含义 |
+|---|---|---|---|---|
+| A | 3,276,800（1.6GiB） | 1,073,741,824（1GiB） | [1.6,2.6GiB) | **vseg q1 写区（处置）** |
+| B | 6,553,600（3.2GiB） | 1,073,741,824 | [3.2,4.2GiB) | **plain 写区（对照）** |
+| C | 1,048,576（0.5GiB） | 536,870,912（512MiB） | [0.5,1.0GiB) | vseg q4 写区 |
+| D | 0 | 536,870,912 | [0,0.5GiB) | 盘首慢窗口（对照） |
+
+- env：`SPDK_URMA_DEV_NAME=udmac0d1e2`、`SPDK_URMA_CAPSULE_TRANSPORT=urma`。
+- 若 `-l` 单位是字节而非块，按 `--help` 换算并记录；不要自行扩大范围。
+- 每支：记录 avg/p50/p99、IOPS、bytes；**结束后立即采 target W 块**（W9/n/exec%）并记录 `/tmp/nvmf_tgt.log` 当时的 offset。
+- 可选支 E：`URMA_PERF_ADDR_MODE=rand URMA_PERF_RANDOM_SEED=20261115`，`-l 3276800 --range-bytes=1073741824`（随机读 vseg 区，6s）。
+
+## C. 判据与回答
+
+| 支 | 区域 | 若"数据/盘快" | 若"数据/盘慢" |
+|---|---|---|---|
+| A | vseg q1 写 | ~30–46µs | ~190–250µs |
+| B | plain 写 | ~30–46µs | ~190–250µs |
+| C | vseg q4 写 | ~30–46µs | ~190–250µs |
+| D | 盘首慢窗口 | 混合/慢 | 混合/慢 |
+
+- 明确回答：
+  1. 裸读 vseg 数据区（A/C）的 target W9 是多少？接近 vseg Mooncake 的 ~250µs，还是接近裸 SPDK 顺序的 ~30µs？
+  2. 裸读 plain 区（B）是多少？（数据状态对照）
+  3. 判决：**数据/盘慢** 还是 **vseg 客户端/连接路径慢**？
+     - A/C 快、B 快 ⇒ vseg 路径/连接是原因（数据无辜）；
+     - A/C 慢、B 快 ⇒ 数据状态不同（写路径结论需重审）；
+     - A/B/C 全慢 ⇒ 盘当前处于全局慢状态（与时间相关），需记录并复测一次确认。
+
+## D. 边界与安全
+
+- **零重启**、不动 target/master；只读为主。
+- **urma_perf 内置 preflight 会写 LBA0（≈128–256KiB，已知）**：本单接受该覆盖；**不要**在该状态上跑 Mooncake verify（key 0 会不一致）；如需后续 Mooncake 测试，按新 key/新集群处理。
+- root 必须；连接/ABI 失败 → 停手回报，不换二进制、不改源码。
+- 不拷二进制、不跑其他负载；不动 node1 同事进程。
+
+## 回执必答（第一行）
+
+支 A/B/C/D 的裸 SPDK 延迟（avg/p50/p99）与 target W9；vseg 数据区裸读是快还是慢；**数据/盘慢还是 vseg 客户端/连接路径慢**；preflight LBA0 是否有写入；有无失败。
