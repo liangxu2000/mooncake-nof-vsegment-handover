@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-056（第二阶段 M2-2：vseg/plain 两阶段逐 IO 采集 + target 退出落盘 + 解析；含 NUMA 审计）**
+- 当前任务：**NOF-057（第二阶段 M2-2 续：补齐 400 keys 后完成两阶段采集；解析含 NUMA 分组）**
 
 ## 第二阶段（2026-11-23 起）
 
@@ -28,7 +28,9 @@
 - **用户已批准 A 路线**（自编 bd5ee124d/v4 target）；**NOF-054 取证确认：A 无需写补丁**——已构建的 `$D/spdk-e12b7cb-src/build/bin/nvmf_tgt`（md5 979f5517…）自带全套 target 打点，尤其 **`URMA_STAGE_BUFFER` 逐 IO 24 字段**：`trace_seq qid cid lba nlb hz exec enter submit submit_return callback wait enomem rx buffer bdev_cpl data_post data_cpl rel0 lcore flags`；**进程退出时落盘**。BUFFER env：`SPDK_URMA_STAGE_TARGET_SINK=buffer` + `SPDK_URMA_STAGE_TARGET_PATH=<不存在文件>` + `SPDK_URMA_STAGE_TARGET_CAPACITY=200000`（默认 16.7M×192B≈3GiB）；客户端必须 `SPDK_URMA_STAGE_TRACE_US!=0` 才会请求 trace。
 - **重启预案（NOF-054 取证）**：停 plain master 2454260 → 停 target 341038（先备份 `/tmp/nvmf_tgt.log` 32.5MB 与 pid）→ 等 spdk.sock 消失 → 用 `TARGET_SPDK_ROOT=$D/spdk-e12b7cb-src` + `TARGET_DUMP_SEC=10` + BUFFER env 起 target；wrapper 实际路径 `/home/yin/Vsegment/run_vesegment_target.sh`（非 vseg_scripts/）。RAID0 `superblock=false` ⇒ 11 盘 BDF/顺序必须核对；nvme 名可能重排；node3 有第三方 `royi:mooncake_client`（109% CPU）与 load 14.4。回退 B = 磁盘 9a413a44（v6）nvmf_tgt + `bench-io-params`（需先把 `build.9a413a44` 改回 `build`）。
 - **NOF-055 完成（2026-11-23，M2-1）**：target 已切到 **bd5ee124d**（PID **394826**，md5 979f5517…）；4457/RAID0(11 盘/BDF 升序/256K/online)/ns/transport 正常；BUFFER 已生效（`run/urma_stage_nof055.bin` 0B、O_EXCL、退出落盘；CAPACITY=200000）；旧日志备份 32,780,200B/md5 d294d6ef…。**注意**：11 盘按 BDF 升序接回（每盘 7.15TiB；NOF-054 的 15,002,931,712 是 blocks），旧 target 的 -d 顺序未记录 ⇒ **新旧数据不可按 LBA 对比**；vseg 元数据已清，NOF-056 重写。
-- **下一步（NOF-056）**：用同一 v4 插桩 bench `bench-io-params-e12` 依次跑 **vseg**（slot=1/stripe2/T1 写+读）与 **plain**（T1 写+读），两阶段都开 `SPDK_URMA_STAGE_TRACE_US=1` 请求 trace；随后**优雅停 target** 触发 BUFFER 落盘，按 `exec_tick` 大间隙分两段，解析 24 字段各段耗时（重点：enter→submit、**submit_return→callback（bdev/SSD）**、callback→bdev_cpl、data_post→data_cpl、lba/nlb/lcore）。预检含 **NUMA 审计**（0.10 节清单）。
+- **NOF-056 在 B2 停手（2026-11-23）**：vseg 从零建集群后 T1 写触发 **23 次 `VSEGMENT_CREATING`**（每 64MiB vsegment 容 16 key，第 17 个 key 撞创建窗口；key 16,33,…,390 步长 17），只写入 **377/400** keys、logical_used 1,581,252,608；按规则未跑 reader、未切 plain、未停 target（BUFFER 仍 0B）。这是**已知机制**（NOF-028/029/032/034 已 4 次复现），不是随机故障。
+- **NUMA 审计结果（NOF-056 A2，关键新线索）**：4 节点 node0=cpu0–69、node1=70–153、node2=154–237、node3=238–307（0↔2 距离 20）；**11 块数据盘 5 块在 node0（21/22/28/29/2a）、6 块在 node2（91/92/a1/a2/a3/a4）**；**target 核 2–7 全在 node0** ⇒ 6/11 盘与 target 跨 NUMA；RAID0 每 256KiB 条带在 node0/node2 盘间交替，vseg 2MiB task=8 条带、plain 4MiB task=16 条带，跨节点比例/顺序不同。hugepages 各节点 1160、free 16/75/128/128。uburma 设备 numa `[未获取]`。**这成为 126µs 的首要候选；E 段解析必须按 disk/node 分组。**
+- **下一步（NOF-057，选项 1）**：同参数 T1 writer 重复补写（≤3 次）至 **400 keys**；然后 vseg 读（trace）→ plain 写+读（trace）→ 优雅停 target 落盘 → 解析 24 字段；新增 **NUMA 分组**（disk=(lba/512)%11，0–4=node0、5–10=node2），并检查补齐的 23 个 key 在 vseg 的 LBA 是否仍为规范窗口（若在尾部/非规范，则两阶段都排除这 23 个 key 窗口后比较）。
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -148,7 +150,8 @@
 | NOF-052 | 已关闭 2026-11-23（**公平对照：1.95×；domain/客户端版本排除**） | plain 同新客户端（bd5ee124d）W9 **132.77µs**、旧客户端（59662a26）**133.29µs**（+0.4%）⇒ 客户端版本无影响；plain/vseg 的 domain **完全相同**（非空 0x143cd90）⇒ domain 排除；**vseg 258.55 vs plain 132.77 = +125.8µs（1.95×）**；task 数 1056/528、P50−W9 311/147µs（≈147µs/task 客户端开销）。历史 plain 46–68µs 在 slot=1 不可复现（slot=1024 口径），3.75× 的旧对照不可直接比 |
 | NOF-054 | 已关闭 2026-11-23（**A 路线无需补丁**） | 已构建的 bd5ee124d `nvmf_tgt`（`$D/spdk-e12b7cb-src/build/bin/nvmf_tgt`，md5 979f5517…）**本身带全套 target 打点**：URMA_BDEV_DETAIL 6 段 + **URMA_STAGE_BUFFER 逐 IO 24 字段**（lat/nlb/各段 tick/lcore/flags）+ W1–W10；无需写补丁。读提交点 `ctrlr_bdev.c:449/493`（`req->iov/iovcnt`、cdw10/11+cdw12）；BUFFER env：`SINK=buffer`+`PATH`(O_EXCL)+`CAPACITY=200000`（默认 3GiB 内存），**进程退出时落盘**；客户端须 `SPDK_URMA_STAGE_TRACE_US!=0`。重启预案/回退 B（9a413a44 v6）已取证；wrapper 实际在 `/home/yin/Vsegment/run_vesegment_target.sh` |
 | NOF-055 | 已关闭 2026-11-23（**通过**） | target 已切到 **bd5ee124d**（PID **394826**，md5 979f5517…）；4457/RAID0(11 盘/256K/online)/ns/transport 全部正常；BUFFER 模式（SINK=buffer、PATH=`run/urma_stage_nof055.bin`、CAPACITY=200000、DUMP_SEC=10）已生效，buffer 文件 0B（O_EXCL，退出时落盘）；旧日志备份 32,780,200B/md5 d294d6ef…；11 盘 nvme0–10 按 **BDF 升序**接回（每盘 7.15TiB；NOF-054 的 15,002,931,712 是 blocks）。**盘序可能与旧 target 不同（旧序未记录）⇒ 新旧数据不可按 LBA 直接对比**；vseg 元数据已清，NOF-056 重写 |
-| NOF-056 | 已下发（2026-11-23，M2-2） | 同一 v4 插桩 bench（`bench-io-params-e12`）依次跑 **vseg**（slot=1/stripe2/T1 写+读）与 **plain**（T1 写+读），两阶段都开 `SPDK_URMA_STAGE_TRACE_US=1` 请求 target trace；随后**优雅停 target** 触发 BUFFER 落盘（24 字段/条，预期 ~33.8k 条），按 exec_tick 大间隙分段解析各段耗时，定位 126µs/1.95×；预检含 **NUMA 审计** |
+| NOF-056 | 已关闭 2026-11-23（**B2 停手：VSEGMENT_CREATING 23 次；NUMA 审计完成**） | vseg 从零建集群后 T1 写触发 **23 次 VSEGMENT_CREATING**（key 16,33,…,390 步长 17），只写入 377/400 keys、logical_used 1,581,252,608；按规则未跑 reader/未切 plain/未停 target（buffer 0B）。**NUMA 审计**：4 节点（node0 cpu0–69、node2 cpu154–237，距离 20）；**11 盘 5 块 node0 / 6 块 node2**；target 核 2–7 全在 node0；hugepages 各节点 1160、free 16/75/128/128；uburma numa 不可读 |
+| NOF-057 | 已下发（2026-11-23，M2-2 续） | 选项 1：同参数 T1 writer 重复补写（≤3 次）至 **400 keys**；然后完成 vseg 读（trace）→ plain 写+读（trace）→ 优雅停 target 落盘 → 解析 24 字段；**新增 NUMA 分组**（disk=(lba/512)%11，0–4=node0、5–10=node2）并检查补齐的 23 key 是否非规范（必要时两阶段都排除后比较） |
 | NOF-053 | 已关闭 2026-11-23（**客户端分解；QoS 排除**） | 指定 `batch_get_*` 为 0（单 key Get 走 `get_into_breakdown`/`query_rpc_breakdown`/`transfer_data_breakdown`/`nof_slow_task`）。plain 每 key 283µs = **master 元数据 query 116µs（41%）** + submit 6 + wait 156（含 target W9 68，超出 88）+ 其他 5；**QoS/worker/dispatch 仅 8–11µs（~3%）**。vseg 2× **不是 setup/QoS**（query 103 vs 116 反而低），而是 **drain 350 vs 110µs、max_subio 362 vs 112（3.2×）**、submit 19 vs 6 ⇒ **客户端调度排除**，vseg 的 2× 在 target/传输 drain 段 |
 | NOF-050 | 已关闭 2026-11-23（**阻塞：SPDK 版本不兼容**） | 补丁/编译/链接成功（`bench-io-params` 530,162,656B / md5 fc2b5129…，strings 命中 3 条）；但新 bench 连 target 失败：客户端 SPDK **9a413a44** vs target 运行中 **e12b7cb**，握手 rc=-71/-104；同事原 bench（59662a26，匹配 e12b7cb）同 env/参数 rc=0、P50 473.52 / target W9 259.77。**口径修正**：该 P50 为 **node1 远端 reader**，与 NOF-040 本机 274 不可比（SLOT=1 未改变 P50）；target 现跑的是 **deleted 旧二进制 736a902f**，磁盘 d6c39465=9a413a44 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
@@ -3310,7 +3313,9 @@ target 是否成功切到 bd5ee124d（PID/版本/md5）；4457/RAID0/ns/transpor
 
 ---
 
-# NOF-056（待执行 · 第二阶段 M2-2：vseg/plain 两阶段逐 IO 采集 + target 退出落盘 + 解析 · 2026-11-23）
+# NOF-056（已关闭 · B2 停手：VSEGMENT_CREATING 23 次；NUMA 审计完成 · 2026-11-23）
+
+> 结果：vseg 从零建集群后 T1 写触发 23 次 `VSEGMENT_CREATING`（key 16,33,…,390），仅 377/400 keys；按规则未跑 reader、未切 plain、未停 target（buffer 0B）。A2 NUMA 审计给出关键线索：11 盘 5 块 node0 / 6 块 node2，target 核全在 node0 ⇒ 6/11 跨 NUMA。续跑见 NOF-057。
 
 ## 背景
 
@@ -3373,3 +3378,57 @@ target 是否成功切到 bd5ee124d（PID/版本/md5）；4457/RAID0/ns/transpor
 ## 回执必答（第一行）
 
 两阶段是否成功（Keys/failed）；target 是否优雅退出且 buffer 落盘（记录数/magic/footer/dropped）；两段 nlb/lba/lcore；各段 p50/p90 与 **126µs 落在哪一段**；NUMA 审计摘要；有无失败。
+
+---
+
+# NOF-057（待执行 · 第二阶段 M2-2 续：补齐 400 keys 后完成两阶段采集；解析含 NUMA 分组 · 2026-11-23）
+
+## 起点状态（原地续跑）
+
+- target **394826**（bd5ee124d，BUFFER，4457，buffer `run/urma_stage_nof055.bin` 0B）
+- vseg master **2562417**（slot=1/stripe=2MiB，**377 keys**、vsegments=24、logical_used=1,581,252,608）
+- 无 reader、无 bench、master 端口在听
+
+## A. 预检（只读）
+
+1. 确认上述状态与起点 W 快照；记录 23 个缺失 key（16,33,50,67,84,101,118,135,152,169,186,203,220,237,254,271,288,305,322,339,356,373,390）。
+2. **NUMA 摘要（A2 已得，记录即可）**：node0=cpu0–69、node1=70–153、node2=154–237、node3=238–307（0↔2 距离 20）；11 盘 5 块 node0（21/22/28/29/2a）、6 块 node2（91/92/a1/a2/a3/a4）；target 核 2–7 全 node0；hugepages 各 1160、free 16/75/128/128。
+
+## B. 补齐 400 keys（选项 1；最多 3 次尝试）
+
+- 同参数 T1 writer（`--num_threads=1 --batch_size=1`、vseg flags、verify=false）；每次记录 `Write complete` 的 succeeded/failed、失败 key 列表、master `Keys/logical_used/vsegments`、写窗口 W9（仅记录）。
+- 直到 `Keys=400`、`logical_used=1,677,721,600`、vsegments=25；**3 次后仍 <400 → 停手回报**（不做第 4 次）。
+- 明确记录每次 `VSEGMENT_CREATING` 数（预期逐次减少；这是已知机制，不作为失败）。
+
+## C. 阶段 1：vseg 读（400 keys，请求 trace）
+
+- reader（node3 本机）：`bench-io-params-e12`、`--num_keys=400 --num_threads=1 --batch_size=1 --nof_qpairs_per_segment=4 --warmup_keys=128 --verify=false`、vseg flags；env：`SPDK_URMA_STAGE_TRACE_US=1`、`MC_NOF_IO_PARAMS_LOG=1`、`MC_STORE_PARTITION_SLOT_COUNT=1`、`VSEG_SLOW_IO_US=0`、`MC_HIFREQ_LOG_SAMPLE_RATE=0`、`MC_NOF_SLOW_TRACE_THRESHOLD_US=0`；日志 `run/nof057_vseg_read.log`。
+- 记录：端到端 Min/Avg/P50/P90/P99/Max、failed；target W9（n/avg/exec%）；params 行数；reader 的 `Allocated ... NUMA-aware, N sockets` 行。
+- **LBA 检查**：从 params 的 `seg_lba` 看补齐的 23 个 key 是否仍在 `[k×8192,(k+1)×8192)`；若在尾部/非规范，记录其 LBA 区间。
+
+## D. 阶段 2：plain（同 target、同客户端）
+
+1. 停 vseg master（2562417）；删我方键 `/cvm/vseg_nofvseg/`+`/oplog/vseg_nofvseg/`；启动 plain master（NOF-052 同参、slot=1）；register；验收 `enabled=0`、Keys=0。
+2. plain writer 16t/batch16、400 keys、verify=false；验收 Keys=400、logical_used；记录写窗口 W9。
+3. plain reader：同一 bench/参数；plain flags；同样的 trace/params env；日志 `run/nof057_plain_read.log`；记录同 C。
+
+## E. 停 target 落盘 + 解析（含 NUMA 分组）
+
+1. 备份 `/tmp/nvmf_tgt.log`；**优雅停 target 394826**（TERM）；验收 buffer：大小 >0、magic `URMA3B01`、footer `URMA3END`、count/dropped（预期 ~2×16,896 条，≤200,000）。失败 → 停手，不重启。
+2. 解析 24×u64：按 `exec_tick` 大间隙分 vseg/plain；每段 `lba/nlb/lcore/flags` 分布。
+3. **NUMA 分组**：strip=256KiB=512 blocks；`disk=(lba/512)%11`；BDF 升序成员 ⇒ disk 0–4=node0、5–10=node2。每段按 disk/node 分组统计各段 p50/p90（尤其 `submit_return→callback`、`bdev_cpl→exec`/W9），并统计 node0/node2 的 IO 比例与顺序。
+4. **23-key 处理**：若补齐 key 的 vseg LBA 非规范（在尾部），则两阶段都**排除这 23 个 key 的 LBA 窗口**后比较（给排除前/后两组数字）。
+5. 明确回答：
+   1. 两阶段 `nlb/lba` 是否一致（target 实际命令）；
+   2. **126µs 落在哪一段**（enter→submit / submit_return→callback / callback→bdev_cpl / data）；
+   3. **local(node0) vs remote(node2) 盘的 per-IO 差异，vseg/plain 是否不同；NUMA 能否解释 126µs**；
+   4. 下一步方向。
+
+## F. 边界
+
+- 只动我方 master/cluster；target 只**停止**不重启；写入允许；verify=false；buffer 200k；失败停手。
+- 每轮写/读记录 W 快照；不采信 bench 的写成功数（以 master Keys/logical_used 为准）。
+
+## 回执必答（第一行）
+
+是否补齐 400 keys（尝试次数/最终 Keys/logical_used）；两阶段读是否成功；target 是否落盘（count/dropped）；两段 nlb/lba/lcore；各段 p50/p90 与 **126µs 所在段**；**NUMA 分组结果（node0 vs node2、vseg vs plain）**；有无失败。

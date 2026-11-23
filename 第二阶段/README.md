@@ -5,7 +5,7 @@
 - 目录约定：**第二阶段所有内容（文档、代码补丁、测量数据）统一放在 `第二阶段/` 目录下**；本文件为总文档/索引
 - 数据来源：`../HANDOVER.md` 各单回执 + 第一阶段最终报告 `../工作汇总.md`
 - 相关文件：`../HANDOVER.md`（任务通道）、`../工作汇总.md`（第一阶段最终报告）
-- **当前状态（2026-11-23）**：M1b 完成（公平对照 1.95×）；M1c 完成（客户端 QoS/调度排除）；M2-0 完成（A 无需补丁，bd5ee124d 自带 BUFFER 打点）；**M2-1 完成（NOF-055）：target 已切到 bd5ee124d（PID 394826）+ BUFFER 模式，4457/RAID0/ns 正常，buffer 文件 0B 待退出落盘；盘序变为 BDF 升序（旧序不可恢复）**。**M2-2（NOF-056）已下发**：同一 v4 插桩 bench 依次跑 vseg/plain（开 `SPDK_URMA_STAGE_TRACE_US=1`），再优雅停 target 触发 24 字段落盘并解析 126µs 所在段；预检含 NUMA 审计。**重启不可回退 e12b7cb**。详见下方第 0 节、「最小重建配方」与 `patches/README.md`。
+- **当前状态（2026-11-23）**：M2-1 完成（target 394826 = bd5ee124d + BUFFER）；**M2-2（NOF-056）在 B2 停手**：vseg 从零建集群后 T1 写触发 **23 次 `VSEGMENT_CREATING`**（已知机制），只写入 377/400 keys；未跑 reader、buffer 0B。**A2 NUMA 审计给出首要新线索：11 盘 5 块在 node0、6 块在 node2（距离 20），target 核全在 node0 ⇒ 6/11 跨 NUMA**。**NOF-057 已下发（选项 1）**：补写至 400 keys → vseg 读（trace）→ plain 写+读（trace）→ 优雅停 target 落盘 → 解析 24 字段并按 **disk/node 分组**，判断 126µs 是否由 NUMA/盘分组解释。**重启不可回退 e12b7cb**。详见下方第 0 节（0.10/0.11）、「最小重建配方」与 `patches/README.md`。
 - 一句话：**数据/盘无罪、target 看到的命令与顺序也与 plain 完全相同，但 vseg 每条 128KiB 读在 target 的 bdev 执行段多花 ~210µs。第二阶段的目标就是把这 210µs 找出来并消掉。**
 
 ---
@@ -58,7 +58,7 @@
 | **M1c** | 零环境解析客户端 breakdown 日志（NOF-053） | **已完成 2026-11-23** | 客户端 QoS/worker/dispatch 仅 3%；master 元数据 RPC 116µs/key（41%）两臂共有；vseg 2× 在 drain 350 vs 110µs ⇒ **客户端调度排除，转 target/传输** |
 | **M2-target** | 换 target 进程 + target 侧逐 IO 打点 | **A 已选；M2-0 完成** | **无需补丁**：bd5ee124d nvmf_tgt 自带 `URMA_STAGE_BUFFER`（24 字段：lba/nlb/hz/exec/enter/submit/submit_return/callback/wait/enomem/rx/buffer/bdev_cpl/data_post/data_cpl/rel0/lcore/flags），进程退出落盘 |
 | **M2-1** | 重启 target 到 bd5ee124d + BUFFER | **已完成 2026-11-23（NOF-055）** | target **394826**（bd5ee124d/md5 979f5517…），4457/RAID0(11 盘/BDF 升序/256K/online)/ns 正常；BUFFER 生效（`run/urma_stage_nof055.bin` 0B、O_EXCL、退出落盘）；旧日志备份 32,780,200B/d294d6ef…；**盘序 BDF 升序、旧序不可恢复 ⇒ 新旧数据不可按 LBA 对比** |
-| **M2-2** | vseg/plain 两阶段采集 + target 退出落盘 + 解析 | **已下发（NOF-056）** | 同一 v4 插桩 bench；两阶段开 `SPDK_URMA_STAGE_TRACE_US=1`；优雅停 target 触发 24 字段落盘；按 exec_tick 间隙分段，拆 enter→submit / **submit_return→callback（SSD）** / callback→bdev_cpl / data 段，定位 1.95×；含 NUMA 审计 |
+| **M2-2** | vseg/plain 两阶段采集 + target 退出落盘 + 解析 | **NOF-056 停手（B2）→ NOF-057 续** | B2 触发 23 次 VSEGMENT_CREATING（377/400 keys）；**NUMA 审计：5 盘 node0 / 6 盘 node2、target 核 node0**；NOF-057 补写至 400 后完成两阶段采集与 disk/node 分组解析 |
 | **M1c** | target 侧插桩（SGL/bdev 提交参数/分段 tick） | 需重编 target + 重启（用户批准） | 定位 210µs 在 raid0 队列/NVMe/回调哪一段 |
 
 - NOF-048（最小重建验证）已完成，配方已用于 M1a；构建基线是否升级 tip 视后续需要（S2 暂缓）。
@@ -125,7 +125,19 @@
 - **未审计/未控制**：①11 块 NVMe 的 BDF `numa_node`；②URMA 设备 `udmac0d1e2` 的 numa_node；③target 的 4640 个 hugepages（旧记录 4×1160）及 8GiB iobuf 实际落在哪些节点；④每条 IO 的 iobuf/数据 buffer 节点（2MiB vs 4MiB task 可能选中不同池/节点）；⑤客户端 buffer 与设备/盘的节点距离。
 - **为什么重要**：target 的 iobuf 需求（~8GiB）大于单节点 hugepages（~2.3GiB），**必然跨节点**；若 vseg（2MiB task）与 plain（4MiB task）的 iobuf 分配落在不同 NUMA 节点，或盘/设备跨节点，可能贡献 target W9 的 1.95×。这是**尚未排除的混淆变量**。
 - **审计清单（加入 NOF-056 的预检，只读）**：`lscpu`/`numactl -H`；11 BDF + 系统盘 2b 的 `numa_node`；`/sys/class/uburma/*/device/numa_node`；`/sys/devices/system/cpu/cpu{2..7}/node*`；每节点 hugepages total/free；reader 的 `Allocated ... NUMA-aware, N sockets` 行。
-- 若审计显示 vseg/plain 的 buffer/盘/设备节点不同，再设计受控 NUMA 实验（pin 核/内存/设备）；在此之前不把 1.95× 归因于 NUMA。
+- **2026-11-23 实测（NOF-056 A2）**：
+  - 4 节点：node0=cpu0–69、node1=70–153、node2=154–237、node3=238–307；距离 0↔1=15、0↔2=**20**、2↔3=15。
+  - **11 块数据盘：5 块在 node0**（21/22/28/29/2a）、**6 块在 node2**（91/92/a1/a2/a3/a4）；系统盘 2b 在 node0。
+  - **target 核 2–7 全部在 node0** ⇒ **6/11 盘与 target 跨 NUMA**；RAID0 每 256KiB 条带在 node0/node2 盘间交替；vseg 2MiB task=8 条带、plain 4MiB task=16 条带，跨节点比例/顺序不同。
+  - hugepages 各节点 1160 页，free **16/75/128/128**（总 4640/free 347）；uburma 设备的 numa_node 读不到 `[未获取]`。
+- 若解析显示 vseg/plain 的盘节点比例/顺序或 per-node 时延不同，再设计受控 NUMA 实验（pin 核/内存/设备）；在此之前不把 1.95× 归因于 NUMA。
+
+### 0.11 NOF-056 在 B2 停手（VSEGMENT_CREATING；续跑 NOF-057，2026-11-23）
+
+- **停手点**：vseg 从零建集群后 T1 写 400 keys，触发 **23 次 `VSEGMENT_CREATING`**（每 64MiB vsegment 容 16 个 4MiB key，第 17 个 key 撞创建窗口且客户端不重试）；key 16,33,…,390（步长 17）；只写入 **377/400**、logical_used 1,581,252,608、vsegments=24；按规则未跑 reader、未切 plain、未停 target（buffer 0B）。
+- **定性**：这是**已知机制**（NOF-028/029/032/034 已 4 次复现），不是随机故障；之前"≤2"是因为读的是已提前长好的 800-key 集群。
+- **续跑选择（选项 1）**：同参数 T1 writer 重复补写（≤3 次）至 400 keys；然后完成 vseg 读（trace）→ plain 写+读（trace）→ 优雅停 target 落盘 → 解析。补齐的 23 个 key 若非规范 LBA（在尾部），两阶段都排除这 23 个 key 窗口后比较。
+- **环境**：target 394826（bd5ee124d/BUFFER）、vseg master 2562417（377 keys）、buffer 0B；原地续跑，不重置集群。
 
 ## 1. 与总目标的关系
 
