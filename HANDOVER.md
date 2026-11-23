@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-20
-- 当前任务：**NOF-030（vsegment stripe=4MiB：每 key 单 child，验证 child 拆分开销）**
+- 当前任务：**NOF-031（先只读探测共享环境 → 干净则继续 stripe=4MiB 实验；取代 NOF-030）**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -95,7 +95,8 @@
 | NOF-027 | 已关闭 2026-11-20（**分区数证否**） | 1024→64：T1 P50 539.9 vs 537.5（无变化，target W9 仍 250.8）；**16t 变差 854.3 vs 719.0（+18.8%）**；仍未赢 plain（T1 2.09×）。机制指向"读序与物理布局错位"，非分区数量 |
 | NOF-028 | 已关闭 2026-11-20（**写入受阻，读未测**） | slot=1 被接受（partitions=1、reconcile 0）；writer 16 线程 377/400，**23 个 VSEGMENT_CREATING**（每跨 64MiB 卷边界丢 1 key，不重试）；容量 24×64MiB=1.5GiB 不足 1.6GiB；reader 未跑 |
 | NOF-029 | 已关闭 2026-11-20（**布局假设否**） | vseg-1：T1 P50 543.0 vs plain 258.3（2.10×），W9 263.6–276.8（更高）；分区数 1/64/1024 的 T1 全在 537.5–543.0 窄带 ⇒ **布局无关**；差距在 vsegment 读路径（2MiB child×16×128KiB）。数据 400/400 verify 0 错 |
-| NOF-030 | 已下发 | vsegment **stripe=4MiB**（每 key 1 个 4MiB child，同构 plain）+ slot=1024；对比 plain 258.3/718.7（W9 96.9）与 vseg-2MiB 537.5/719（W9 250.5） |
+| NOF-030 | **已被 NOF-031 取代（未执行；若你已在跑则继续，回执按 NOF-030 登记）** | vsegment stripe=4MiB（每 key 单 child）实验；内容并入 NOF-031 |
+| NOF-031 | 已下发 | 只读环境探测（node1 共享、node3 独占）+ 干净则执行 stripe=4MiB 实验（同 NOF-030 口径） |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
 
 ### NOF-001 关键事实（供后续任务引用，2026-11-20）
@@ -1718,7 +1719,7 @@ T1 writer 是否 400/0（`logical_used`、vsegments）；VSegment-1 的 T1/16t P
 
 ---
 
-# NOF-030（待执行 · vsegment stripe=4MiB：每 key 单 child · 2026-11-20）
+# NOF-030（已被 NOF-031 取代 · 未执行 · vsegment stripe=4MiB：每 key 单 child · 2026-11-20）
 
 ## 背景与假设
 
@@ -1762,3 +1763,45 @@ T1 writer 是否 400/0（`logical_used`、vsegments）；VSegment-1 的 T1/16t P
 ## 回执必答（第一行）
 
 quota stripe_size 是否 4194304、partitions=1024、reconcile 0；writer 400/0；VSegment-4MiB 的 T1/16t P50 与 target W9；**是否追平 plain（258.3/96.9）**；有无失败。
+
+---
+
+# NOF-031（待执行 · 共享环境探测 + stripe=4MiB 实验 · 2026-11-20）
+
+> 本单**取代 NOF-030**。用户告知：**node1 现非独占**（另有同事在使用，但不跑测试）；**node3 由用户独占**。先探测环境，确认我方环境未被影响后再继续实验；若环境有变则停手回报。
+
+## A. 环境探测（只读；不碰任何非本方进程）
+
+1. **node1**
+   - 我方 vseg-1 master（PID 2667366）是否存活；50056/9006 是否仍由它监听；`VSegment Status`（预期 `enabled=1, partitions_installed=1, vsegments=26, logical_used=1,677,721,600`）。
+   - 是否有**新的非本方进程/端口占用**：`ps -eo pid,user,lstart,comm,args` 摘要 + `ss -ltnp` 摘要；重点核对 50056 / 9006 / 8086 / 2379；只记录，不处理。
+   - yin master（PID 151060）与 etcd 2379 健康；他人 client 进程仍在（记录 PID/属主）。
+   - 我方 etcd 前缀：`/cvm/vseg_nofvseg/`（预期约 6 键）、`/oplog/vseg_nofvseg/`（约 2,400 键）是否完整；yin 与 mooncake_cluster 键未变。
+   - node1 负载：`uptime`、`top -bn1 | head` 摘要（判断同事的使用是否带来明显负载）。
+2. **node3**
+   - 我方 target（PID 341038）是否存活；4457 是否 LISTEN 在 `192.168.84.149`；`/tmp/nvmf_tgt.log` 是否可写/仍在增长。
+   - 是否出现其它非本方进程；HugePages、磁盘空间现状。
+3. **判定**：若我方 master/target 任一缺失、50056/9006/4457 被他人占用、我方 etcd 键异常、或 node1 负载明显影响测试 → **停手回报，不执行实验**。
+
+## B. 实验（仅当 A 判定干净）：vsegment stripe=4MiB（内容同 NOF-030）
+
+1. 停我方 vseg-1 master（按 PID）；清**仅我方**键 `/cvm/vseg_nofvseg/` + `/oplog/vseg_nofvseg/`。
+2. 启动 master：NOF-004/007 同参数 + **`--vsegment_stripe_size=4194304`** + `MC_STORE_PARTITION_SLOT_COUNT=1024`。
+3. `nof_register` 同命令（192.168.84.149:4457、100GiB、base0、nsid1）；等 quota ≥20s；验证 quota `stripe_size=4194304`、partitions=1024、`reconcile_fail=0`、`partitions_installed=1024`。
+4. writer 400 keys × 4MiB（16 线程；vsegment flags 同 NOF-018；client slot env=1024）；确认 400/0、`logical_used=1,677,721,600`。
+5. reader：T1 × 3 遍 + 16t × 3 遍（verify=true、诊断关；client slot env=1024）；记录 Avg/P50/P90/P99/Max、failed/verify；target W 块按"下一次连接打印上一轮"对齐；`rpc_first_us` p50。
+6. 对比与回答：
+   - plain NoF：T1 258.3 / 16t 718.7（W9 96.9 / 194–196）；
+   - VSegment-2MiB：T1 537.5 / 16t 719.0（W9 250.5 / 259.6）；
+   - **VSegment-4MiB（本单）**：? / ?（W9 ?）
+   - 明确回答：W9 是否降到 ~100µs 量级？T1 是否接近 258µs？**是否追平 plain**？
+
+## C. 边界
+
+- 只动我方 master/cluster 与我方数据；**不碰同事进程、yin 进程/键、target 配置**；不重启 target；失败停手。
+- 共享机：node1 非独占——非本方进程只记录、不处理；node3 独占也需记录异常。
+- 回滚：vsegment 标准配置 = NOF-004/007 参数 + NOF-017 mount + NOF-018 writer。
+
+## 回执必答（第一行）
+
+环境是否干净（我方 master/target/键/端口状态；node1 是否有他人负载）；若干净：stripe-4MiB 的 T1/16t P50 与 target W9、是否追平 plain；若停手：原因与证据。
