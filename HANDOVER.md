@@ -6,7 +6,9 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-24
-- 当前任务：**NOF-085（口径整改阻塞诊断：定位 oplog 上限 · 待执行）**。
+- 当前任务：**NOF-086（真写 2000 keys · 待执行）**。用户 2026-11-24 17:26 授权「就写 2000」；开发侧决定先写后诊断。
+- **NOF-085 暂缓**：其 B 段要切 master，与本单「全程不重启 master」冲突；待 NOF-086 完成后再恢复。
+- **NOF-084 的「外推 >24MB 即停手」判据已撤销**（24.2MB 下限假设 1 entry/key，与实测 7 entries/key 矛盾）。
 - **NOF-084 已完成（主动停手，L0）**：2000 keys 未写入；100 keys 预检实测 84.8KB/key，2000 keys 外推 24.2–169.6MB 全部超 24MB 阈值。见该单顶部裁决块。
 - **口径整改目前阻塞**，方向（snapshot / 改共用 etcd / 分片 / 降 keys / 改码）待用户裁决；NOF-085 只做只读诊断，不改配置、不改码。
 - **NOF-083 暂缓**：其 C/D 段依赖 400-key cid，且「start ≥2048MiB 在数据区之外」边界在 2000 keys 下失效（卷 2048MiB → 盘内 186.18MiB，落在新的 0–727.27MiB 数据区内）。整改后重派或改写。
@@ -5169,7 +5171,7 @@ N 的不变量结论（按字节 / 按 IO / 按时间）；A3 三段定义与冲
 
 ---
 
-# NOF-085（待执行 · 口径整改阻塞诊断：精确定位 oplog 上限 + 核实治理开关 · 纯只读 / 零业务写入 / 零配置变更 · 2026-11-24）
+# NOF-085（**暂缓 · NOF-086 完成后恢复** · 口径整改阻塞诊断 · 2026-11-24）
 
 ## A. 精确定位 `33,554,432`（纯只读，不改任何配置）
 
@@ -5214,3 +5216,68 @@ N 的不变量结论（按字节 / 按 IO / 按时间）；A3 三段定义与冲
 - **物理覆盖已知**：NOF-084 的 100 keys = 每盘 **36.36MiB**（成员盘 offset 0–36.36MiB），已覆盖 `vseg_nof080` / `vseg_nofvseg` 数据区前段；旧 cid 内容维持「不可信」，后续对照一律 `verify=false` 或避开该区间。
 - 现役 master：`vseg_nof084`（slot=1，Keys=100，logical_used=419,430,400，`/oplog/vseg_nof084` 8.48MB）；旧 cid 元数据完好、未删改。
 - 产物 `run/nof085_*.txt`（≤3 个、每个 ≤1MB）；结论只写「观测 + 是否支持判据」并标等级。
+
+---
+
+# NOF-086（待执行 · **真写 2000 keys**：全文替换 NOF-084/085 的停手判据 · 用户 2026-11-24 17:26 授权「就写 2000」）
+
+## 0. 开发侧决定（覆盖此前所有相关约束）
+
+**结论：能写，直接写。** 三条依据：
+1. oplog 只在 **master 重启回放**时挡人，**不参与写入与读取**。本单全程不重启 master，墙就不存在。
+2. bench 原生支持 2000（`-num_keys` uint64，仅 size_t 溢出保护）。
+3. 空间够：2000 × 4MiB = **8,000 MiB = 8,388,608,000 B** 逻辑，ns 100 GiB。
+
+**撤销 NOF-084 的「外推 >24MB 即停手」判据**（那是开发侧拍的保守值，且 24.2MB 那个下限假设 1 entry/key，与实测 7 entries/key 矛盾）。NOF-085 暂缓——它的 B 段要切 master，与本单「全程不重启」冲突。
+
+**代价（必须书面接受）**：写完 2000 keys 后，该 cid 的 oplog 预计 **170–250MB**，**远超 32MiB 回放上限 ⇒ 该 cid 此后永久不能重启 master**。本单验收完成后它就是一个「只能活着用」的集群，直到另行处理 32MB 墙。**不得在本单内试图重启验证**。
+
+## A. 前置只读检查（5 分钟，不过则降级）
+
+1. etcd：`--quota-backend-bytes` 现值、当前 `dbSize`、`/oplog/` 各 cid 体积总和。
+2. 判据：**预估新增 oplog（250MB）+ 当前 dbSize 必须 < quota 的 70%**。
+   - 不过 ⇒ 降级写入目标：按余量算出能写的最大 keys（1000 / 500），在回执写明实际目标值，其余照本单执行。
+   - etcd 一旦 `NOSPACE` 变只读，会影响**所有人**（yin / mooncake_cluster / royi），这是本单唯一的高危项。
+3. 记录 target 状态（PID 905586 / md5 `3129641f…` / 4457），本单不动它。
+
+## B. 切到全新 cid（避免 key 冲突污染计数）
+
+1. **必须新建 cid `vseg_nof086`**，不得在 `vseg_nof084` 上续写。原因：`vseg_nof084` 已有 100 keys，bench 从 key 0 开始写会撞 `OBJECT_ALREADY_EXISTS`，而 `stress_cluster_bench` 会把它**计为成功**（NOF-036 已知缺陷）⇒ `Keys` 与 bench 报数对不上。
+2. 参数：`slot=1`、`stripe=2097152`、`member_extent=67108864`、其余同 NOF-084；`MC_STORE_PARTITION_SLOT_COUNT=1`。
+3. 停 `vseg_nof084` master（Keys=100 / oplog 8.48MB，**它能正常重启，所以随时可切回**），起 `vseg_nof086` master；`nof_register` + mount，验收 `50056 LISTEN` / `Keys=0` / `mount rc[0]`。
+
+## C. 写 2000 keys（多轮补写；**每 500 keys 一次 checkpoint**）
+
+1. writer：`--num_keys=2000`，`value_size=4MiB`、`batch=1`、`threads=1`（与 400-key 口径一致），`warmup_keys` 不用（writer 不涉及）。
+2. **多轮补写直到 `Keys=2000`**：`VSEGMENT_CREATING` 会在每 17 个 key 的卷边界漏 key（2000 keys ⇒ 125 个 vsegment、约 124 次边界穿越）。按 NOF-057 的方式重跑 writer 补齐，每轮记录：
+   `ROUND n: succeeded / failed / VSEGMENT_CREATING 次数 / master Keys / logical_used / vsegments / oplog entries / oplog bytes`
+3. **验收不信 bench 报数**（NOF-036 缺陷），只认 master 的 `Keys=2000` 且 `logical_used=8,388,608,000`。
+4. **checkpoint 止损**：每跨 500 keys 记录一次 oplog 体积；若 `dbSize + oplog 增量 > quota × 0.70` 或 etcd 报 `NOSPACE` ⇒ **立即停写**，用当前已写入的 keys 数执行 D 段，并在回执写明停在哪。
+5. 轮次上限 12 轮；到 12 轮仍未满 ⇒ 停手，用实际 Keys 做 D 段。
+
+## D. 写完立即读（趁 master 还活着）
+
+1. reader：`--num_keys=<实际 Keys>`、`batch=1`、`threads=1`、`warmup_keys=128`（记录：2000 keys 下只覆盖 6.4%，不擅自改）、`verify=false`（前 100 个 key 的内容可能被历史 preflight 覆盖，以 master 元数据为准）。
+2. **读 3 遍**，每遍给 `p50 / p90 / p99 / avg / failed / span`。
+3. 追加一遍 `--warmup_keys=0` 作对照（记录即可，不作结论）。
+4. 读全程**不写数据**，oplog 不应增长；读完复测 oplog，若增长 >1% 需说明原因。
+
+## E. 绝对禁止
+
+- **禁止在任何时刻重启 master**（写完后重启必然 `ResourceExhausted`，会毁掉本单成果）。
+- 禁止重启 target、禁止改 etcd 配置、禁止改码/重编、禁止删任何 `/oplog` 前缀。
+- 禁止在 `vseg_nof080`（oplog 22MB）上写入；`vseg_nof084` 只停不删。
+- 不碰他人进程（royi master 3463695 / yin 的任何进程）。
+- 若 master 中途意外退出 ⇒ **不要重启**，立即停手回报（重启会失败，且会丢本单结论）。
+
+## F. 回执必答（第一行）
+
+实际写入 `Keys`（是否 2000）/ `logical_used` / 补写轮次 / 每轮 `VSEGMENT_CREATING` 次数 / oplog 最终体积 / 读 3 遍 p50 / 是否触发 etcd 空间告警 / 有无失败 / **master 是否全程未重启**。
+
+另需逐项报口径基线：`num_keys / warmup_keys / io_size / QD / threads / slot / stripe / member_extent / cid / target PID+md5 / 客户端二进制 / 诊断开关 / 是否开 HA（读 `/proc/<master_pid>/cmdline`，本单补上这一项）`。
+
+## G. 产物与环境末态
+
+- `run/nof086_summary.txt`（≤1MB）+ 每轮 writer/reader 原始日志（≤5 个文件）。
+- 末态：`vseg_nof086` master 运行中（Keys=实际值）、target 未重启、trace mask 0x0、无残留 bench。
+- **明确写下**：该 cid 的 oplog 体积与「不可重启」状态，供后续接手人知悉。
