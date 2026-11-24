@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-065（第二阶段 M3-5：v3 零干扰插桩（环形缓冲 + delta + iov 字段）+ 新 cid 一次写入 + 两臂 T1 采集）**
+- 当前任务：**NOF-066（统一「排除盘首慢窗口」口径的离线重算 · 零环境 · 可先于 NOF-065 执行）**；NOF-065（M3-5 零干扰插桩）仍为待执行状态，两者互不依赖。
 
 ## 第二阶段（2026-11-23 起）
 
@@ -46,6 +46,7 @@
 - **NOF-064 已下发（M3-4，需改码/重编/重启——待用户批准后才执行）**：target 逐 IO 插桩两组信息——① **子命令字段**（`nsid/lba/nbytes/iov_cnt/iov[0]`+总长/SQ 位置/qpair/thread）以判定"设备收到的命令是否真的相同"；② **轮询节奏**（`urma.c:2303` 入口线程本地 `poll_round`、`bdev_nvme.c:1970` 的 `nvme_poll` 轮与完成数、`bdev_us`），把 H1/H2/H3 分开；附一次性映射打印（worker_index/worker_count/JFC 索引）。两臂同代码、开关 `NOF064_TRACE=1`、T1 各 1 遍，另加一次**反序复测**（plain 先、vseg 后）确认臂间差在插桩下仍成立。回退=旧二进制 md5 `979f5517…` + 原 RPC。
 - **NOF-064 结果（2026-11-23，M3-4：改码/重编/重启三步完成，两臂采集未完成 · 部分关闭）**：新 target **PID 1587271、md5 `21ced674…`**、4457/RAID0(11 盘)/transport 验收全通过、`NOF064_TRACE=1` 生效。三份二进制并存：`nof059`=`979f5517…`（原 bd5ee124d）、`nof064`=`21ced674…`（v1 插桩，在跑）、`nof064b`=`afe95672…`（v2，补读路径快照，已编译未运行）。编译坑：`nof064_*` 符号在 nvmf 库而 bdev 模块不链它 → 计数器改定义在 `bdev_nvme.c`、`urma.c` 弱引用。**一次性映射实测**：`worker_index 0→core3, 1→core4, 2→core5, 3→core6, 4→core7, 5→core2`。**两处硬阻塞**：① **重启使 target identity 变化**（raid0/nsid1 uuid `c697219c…`→`63a1e3cd…`，base bdev uuid 未变）⇒ `vseg_nof061` mount `rc[-300] INVALID_VERSION`、`SUBMIT=0`；**plain `vseg_nofvseg` 仍可挂载**（`[事实]` vseg 元数据跨 target 重启失效，plain 不受影响 —— 产品级缺陷）；② **v1 插桩位置错**：读路径走 `urma.c:1921`（C2H，no pull），v1 只插了 `2214`（PULLING）⇒ 读 IO 没取快照，`d_rounds=467,099,749` 是绝对值不是 delta。已采集只有 plain 臂 v1（client P50 317.44、400/0；target 4,000 条 `NOF064_IO`：bdev mean 248.8 / p50 225 / p90 312、≤70µs 占 16.6%）。**开发侧判定（关键）**：该 225µs **大概率是 per-IO printf 的观测者效应**——32 个 IO 在飞时每完成一条打印会推迟后续 IO，plain 无插桩口径是 54µs；同一污染也会让 `d_*` 计数失真、把 H1 伪装成成立 ⇒ **v1 数据不可用于任何 bdev/`d_*` 结论**。
 - **NOF-065 已下发（M3-5，沿用 2026-11-23 改码/重编/重启授权）**：① 插桩升级 **v3**——把 per-IO printf 换成**静态环形数组**（≥400k×96B，带 valid 标记，非 reactor pthread 每 3s 追加落盘），补 **iov 字段**（`nsid/lba/nbytes/iov_cnt/iov[0].base/len/total_iov_bytes`），并把 `d_rounds/d_nvme_poll/d_nvme_cpl` 改成**真 delta**；② 重启到 v3 后**新 cid `vseg_nof065` 写一次 400 keys**（重启后 vseg 旧元数据必失效，故必须重写）；③ 两臂 T1 各 2 遍 instrumented + 各 1 遍 **`NOF065_TRACE=0` 对照**（零干扰验证，差 >5% 则整轮作废）；④ 解析按 `bdev_us` 分桶给 `d_*` p50/p90，并用 `/proc/<target>/numa_maps` 把 `iov[0].base` 分 NUMA 桶（buffer 归属首次可查）。**判决前明确弃用两条旧假设**：v1 的 225µs、以及 JFC/stride 结构（`exec_tick` 在 `handle_completion` 内、跨线程投递在它之前 ⇒ 不进 bdev_us 窗口，`stride=1`/`JFC_COUNT=6` 不作为修复实验）。
+- **NOF-066 已下发（口径统一，零环境）**：现有日志（`run/nof062_{vseg,plain}_t{1,4,16}.log`、`run/urma_stage_nof055.bin`）都带 LBA，按 key i 占 `[i×8192,(i+1)×8192)` 的映射**离线剔除盘首慢窗口**（keys 0–97 / LBA < 802,816 块 ≈ 391.8 MiB）后重算，给「全量 / 排除」两列：逐 128KiB 的 roundtrip/target/bdev 与端到端每 key 的 p50/p90/p99/mean、同 LBA 配对比值、直方图分桶。**动机**：现状口径不一致——01/02 章主表是 400 keys 全量（含慢窗口），而早期部分分析（NOF-039/040）用的是另一轮 800–1200 keys 的干净口径，跨轮不可换算。**不启停服务、不跑 bench、零写入、不改码。**
 
 ## 项目背景（开发侧已知的全部信息）
 
@@ -175,6 +176,7 @@
 | NOF-063 | 已关闭 2026-11-23（**无 50–500µs 常量；结构错配对称，不解释臂间差**） | 主链 `transport.c:777→779`→`urma.c:2303`（81 行）；`urma_poll_jfc` 无 timeout、`usleep/nanosleep/spdk_delay_us` 零命中 ⇒ **静态无该量级常量**。结构：`stride=worker_count=6` vs `send_jfc_count=2` ⇒ 仅 worker 0/1 轮询网络，qpair JFC=建连序 mod 2 与属主无对齐 ⇒ 跨线程投递；本地 NVMe 每轮不限量、无 defer。**复核：错配两臂对称（各 2 个轮询 + 2 个非轮询），且同臂 4 个 qid 时延均匀 ⇒ 不是 4.6× 原因，JFC_COUNT=6 不作判决实验** ⇒ 必须插桩 ⇒ NOF-064 |
 | NOF-064 | 已关闭 2026-11-23（**部分：改码/重编/重启完成；采集受阻**） | 新 target **1587271 / `21ced674…`**、验收全过、`NOF064_TRACE=1`；三份二进制并存（`nof059` 979f5517 / `nof064` 21ced674 / `nof064b` afe95672）。`worker_index 0→core3,1→core4,2→core5,3→core6,4→core7,5→core2`。**阻塞①重启使 nsid1 uuid 变（c697219c→63a1e3cd）⇒ `vseg_nof061` mount rc[-300]，plain 元数据不受影响**（产品级缺陷）；**阻塞②v1 插在 2214 而非读路径 1921 ⇒ `d_*` 是绝对值**。plain v1：client P50 317.44、bdev p50 225（**判为 printf 观测者效应，不可用**）⇒ NOF-065 |
 | NOF-065 | 已下发 2026-11-23（M3-5，沿用改码/重编/重启授权） | v3 插桩：printf→**环形数组 + 非 reactor 线程落盘**、补 iov 字段、`d_*` 改真 delta；重启后**新 cid `vseg_nof065` 写一次 400 keys**；两臂 T1 各 2 遍 + 各 1 遍 `TRACE=0` 对照（差 >5% 作废）；解析按 `bdev_us` 分桶、`iov[0].base` 分 NUMA 桶 |
+| NOF-066 | 已下发 2026-11-23（**零环境 · 口径统一**） | 用既有日志（NOF-062 六份 trace + NOF-057 落盘）离线剔除盘首慢窗口（keys 0–97 / LBA<802,816 块 ≈391.8MiB）重算：逐 128KiB 的 rt/target/bdev 与端到端每 key 的 p50/p90/p99/mean、同 LBA 配对、直方图分桶；输出「全量 / 排除」两列，判结论是否改变 |
 | NOF-053 | 已关闭 2026-11-23（**客户端分解；QoS 排除**） | 指定 `batch_get_*` 为 0（单 key Get 走 `get_into_breakdown`/`query_rpc_breakdown`/`transfer_data_breakdown`/`nof_slow_task`）。plain 每 key 283µs = **master 元数据 query 116µs（41%）** + submit 6 + wait 156（含 target W9 68，超出 88）+ 其他 5；**QoS/worker/dispatch 仅 8–11µs（~3%）**。vseg 2× **不是 setup/QoS**（query 103 vs 116 反而低），而是 **drain 350 vs 110µs、max_subio 362 vs 112（3.2×）**、submit 19 vs 6 ⇒ **客户端调度排除**，vseg 的 2× 在 target/传输 drain 段 |
 | NOF-050 | 已关闭 2026-11-23（**阻塞：SPDK 版本不兼容**） | 补丁/编译/链接成功（`bench-io-params` 530,162,656B / md5 fc2b5129…，strings 命中 3 条）；但新 bench 连 target 失败：客户端 SPDK **9a413a44** vs target 运行中 **e12b7cb**，握手 rc=-71/-104；同事原 bench（59662a26，匹配 e12b7cb）同 env/参数 rc=0、P50 473.52 / target W9 259.77。**口径修正**：该 P50 为 **node1 远端 reader**，与 NOF-040 本机 274 不可比（SLOT=1 未改变 P50）；target 现跑的是 **deleted 旧二进制 736a902f**，磁盘 d6c39465=9a413a44 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
@@ -3981,3 +3983,50 @@ vseg4 写/读是否成功与 Keys；vseg4 突发长度（32/16）与 submit 间�
 ## 回执必答（第一行）
 
 零干扰对照结果（instrumented vs TRACE=0 的 P50 差）；两臂 iov 字段是否相同（含 `iov[0].base` 的 NUMA 桶）；`bdev_us` 分桶下的 `d_rounds/d_nvme_poll/d_nvme_cpl`（delta）；H1/H2/H3 判定；同臂 4 qid 是否同值；`qid→worker→core→jfc` 实测表；M3-6 修复方案；有无失败/回退。
+
+---
+
+# NOF-066（待执行 · 统一「排除盘首慢窗口」口径的离线重算 · 零环境 · 2026-11-23）
+
+## 背景与目的
+
+- 现状口径不一致：汇报主表用的是 **400 keys 全量**（含盘首慢窗口），而部分分析（NOF-039/040）用的是**另一轮 800–1200 keys 的干净口径**，跨轮不可换算。
+- 盘首慢窗口已实测确认：keys 0–97 / **LBA < 802,816 块（≈391.8 MiB）= 11 块盘各自开头约 37MB 的慢区**；plain 的慢 IO 全部落在此区（NOF-058），vseg 则是全程均匀慢（keys 97–399 慢占比 90.7%）。
+- 本单不测任何新东西，只用**已有日志**把同一轮的「排除慢窗口」口径算出来，给「全量 / 排除」两列并排。
+
+## A. 数据源（只读）
+
+1. `run/nof062_vseg_t{1,4,16}.log`、`run/nof062_plain_t{1,4,16}.log`（逐 128KiB `URMA_SLOW_IO`，含 `lba`、`bdev_us`、`roundtrip`、`target_us`）。
+2. `run/urma_stage_nof055.bin`（NOF-057 落盘，24 字段/条，含 `lba`、`bdev_us`、`exec_tick`）。
+3. 如日志含 per-key 完成时间（`SUBMIT` 行 dt 或 bench 每 key 输出），用其算端到端每 key 时延；**若确无 per-key 时延，则该项记 `[未获取]` 并说明**，不要用 IO 级数据冒充。
+
+## B. 排除规则（两条都算，报告以 LBA 规则为准）
+
+- 主规则：`lba >= 802,816` 块（严格按 LBA 剔除，等价 keys ≥98）。
+- 备规则：`key >= 98`（按 key 号剔除；两条结果若有差异，说明边界模糊并都列出）。
+- 口径必须写死在结果表头：`n`（剔除前后 IO 数）、剔除比例。
+
+## C. 重算项（每项都给「全量 / 排除」两列）
+
+1. 逐 128KiB（opcode=2、blocks=256）：`roundtrip / target / bdev` 的 **p50 / p90 / p99 / mean**，两臂 × T1/T4/T16。
+2. 端到端每 key：**p50 / p90 / p99 / mean**，两臂 × T1/T4/T16（若可得）。
+3. **同 LBA 配对**（vseg vs plain，同一 LBA 的 bdev 配对）：p50 比值、plain 更快占比——分别在全量、排除两种集合上算。
+4. **直方图分桶**：32–64 / 64–128 / 128–256 / 256–512 / ≥512 µs 的占比（两臂、T1）。
+5. 慢窗口内的样本单独汇总一张小表（keys 0–97 两臂各 p50），用于证明"该窗口是共有项"。
+
+## D. 判决（必答）
+
+1. 排除后两臂 T1 的 per-IO p50/p90/mean 与比值；与全量口径相比各变化多少。
+2. 排除后 16 并发是否仍打平（约 1.0×）。
+3. **结论是否改变**（vseg 更慢 → 是否仍成立；幅度是变大还是变小）。
+4. 汇报建议：主表应该用哪个口径，给一列推荐值。
+
+## E. 边界
+
+- **纯离线**：不启停任何服务、不跑 bench、不写盘、不改码、不删 etcd 键；只读 `run/` 下既有文件。
+- 脚本放 `/tmp`；产物 `run/nof066_excl_summary.txt`（≤1MB，另可加 2 个明细 txt）。
+- 数据缺失/格式不符 → 记 `[未获取]` 并写尝试路径，不猜、不用替代口径冒充。
+
+## 回执必答（第一行）
+
+两条排除规则各自的 n 与剔除比例；排除后两臂 T1/T16 的 per-IO p50/p90/mean 与比值；端到端每 key 是否可得；同 LBA 配对在两种集合下的比值；直方图分桶；结论是否改变；推荐的汇报口径；有无失败。
