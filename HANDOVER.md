@@ -7,6 +7,54 @@
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-24 19:52
 
+
+> ## 📌 代码来源链（2026-11-24 21:38 · 用户提供 + NOF-092 实测 · **所有源码判断的唯一依据**）
+>
+> ### 三条线，只有一条跟我们有关
+>
+> | 线 | 仓库 / 分支 | 状态 |
+> |---|---|---|
+> | **原始 nof-vsegment 开发线** | `wangyuqi0429/Mooncake` @ **`supercache-snapshot`**（同事 wangyuqi0429 开发） | **上游源头** |
+> | **我们实际在跑的** | `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ **`be10be29`**（2026-11-17 08:38） | **唯一有效基准** |
+> | 无关线 | `LeeJace993/Mooncake` @ `nof-urma-v2-bench-merge`（`d371e22`，2026-10-23） | **无 vsegment 代码，与本事无关，勿再引用** |
+>
+> ### 来源链
+>
+> ```
+> wangyuqi0429/Mooncake @ supercache-snapshot      ← 原始 vsegment 实现
+>          │
+>          │  yin 于 2026-11-17 基于它新建分支
+>          │  ★ 并加入了他自己的「光组网」改动
+>          ▼
+> LeeJace993/Mooncake @ mooncake-vesegment @ be10be29   ← 测试机实际编译运行的
+> ```
+>
+> ### 实测证据（NOF-092）
+>
+> - bench 二进制（md5 `59662a26…`，mtime 2026-11-17 19:48）**内嵌源码路径** = `/home/yin/nof/mooncake-vesegment/mooncake-store/src/client_service.cpp`
+> - 构建目录 `CMakeCache` 指向同一棵树 `/home/yin/nof/mooncake-vesegment`
+> - 该树 HEAD = `be10be29a126b31fdbb9292c7107a468ed50828f`，`2026-11-17 08:38:44` —— **与 yin「17 号新建」的说法一致**
+> - 该树 `status` 仅 2 条（`etcd/go.mod`、`go.sum`），**无 C++ 改动**
+> - 我方副本 `mooncake-src` 另有 1 条：`transfer_task.cpp` +31 行（`MC_NOF_IO_PARAMS_LOG` 日志插桩，不改逻辑）
+>
+> ### ⚠️ **一个尚未分离的变量：yin 的「光组网」改动**
+>
+> 我们测的**不是纯 wangyuqi0429 的 vsegment**，`be10be29` 里混了 yin 自己加的光组网定制。
+>
+> **⇒ 如果 2× 的代价来自这些光组网改动，而不是 vsegment 本身，那么 NOF-025→091 这一段把矛头对准 vsegment 的排查方向就是错的。**
+>
+> **这条必须在任何后续结论里显式标注为混淆变量。** 若要把责任判给 vsegment，前提是能排除它；排除的最小手段是拿 `supercache-snapshot` 的原始实现在同环境跑一次对照。
+>
+> ### 连带作废声明
+>
+> 开发侧 2026-11-24 全天基于 `_ref/Mooncake`（`706551a`，11-03）和 `D:\gds性能\repos\Mooncake`（`d371e22`，10-23）得出的所有源码级判断，**一律作废**：
+> - `Plan` 里「同一 view 校验两遍」只占 3–5µs
+> - `openSegment` 只是 map 查找
+> - 两臂提交方式均为一次性 batch
+> - `13b7c19` 去重复校验的价值评估
+>
+> **其中仅一条经实测复核后仍成立**：`be10be29` 的 `vsegment_transfer.cpp` 里，`ResolveTransfer` 调用**未传** `prevalidated` 参数 ⇒ **重复校验在实际版本里确实存在**（已用 GitHub raw 取原文确认）。但其耗时占比仍未实测，仅有 3–5µs 的估算，**不得当作定案**。
+
 > ## ⚠️ 口径决议（2026-11-24 19:52 · 用户批准 · **优先级高于一切任务书**）
 >
 > ### **bench 口径回到 400 keys。2000-key 口径封存。**
