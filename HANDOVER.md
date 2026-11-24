@@ -5553,7 +5553,7 @@ read_overhead_us = read_us - known_read_us    // read_us <= known 时为 0
 
 ## A. 前置核实（只读，30 分钟）
 
-0. **先算升级跨度**：0，并给 。**若跨度 >150 个提交或 >500 个文件变更 ⇒ 在 A0 停手**，回执写明跨度过大、不建议整体升级，改为只 cherry-pick A2 列出的四条。
+0. **先算升级跨度**：执行 `git log --oneline be10be2..HEAD | wc -l` 得提交数、`git diff --stat be10be2..HEAD | tail -1` 得文件变更数，两者都写进回执。**若跨度 >150 个提交或 >500 个文件变更 ⇒ 在 A0 停手**，回执写明跨度过大、不建议整体升级，改为只 cherry-pick A2 列出的四条。
 1. 记录当前**在用**的客户端二进制 md5、其 Mooncake git HEAD、SPDK 版本
 2. 去远端仓库列出 `be10be2..HEAD` 之间**涉及读路径**的提交（`mooncake-store/src/vsegment/`、`transfer_task.cpp`、`client_service.cpp`、`real_client.cpp`），逐条给 hash + 标题 + 一句话影响
 3. **关键约束核实**：**SPDK wire 版本必须保持 v4**（`e12b7cb` / `bd5ee124d` / `170cbb9`）。历史上 `9a413a44` / `91763b015` 是 wire **v6**，与运行中 target `e12b7cb` 握手失败（rc=-71/-104，NOF-050）。**若新版 Mooncake 强制要求 v6 SPDK，则本单在 A3 停手**，回执写明"升级被 wire 版本阻塞"，不要尝试重启 target
