@@ -4149,3 +4149,59 @@ vseg4 写/读是否成功与 Keys；vseg4 突发长度（32/16）与 submit 间�
 ## 回执必答（第一行）
 
 pilot 是否可解析/字段是否有值/是否溢出；tpoint 名称映射表；两臂 `t_cb−t_db` 与 `t_obs−last_empty` 的 p50/p90；H1/H2 判定与数字；`POLL_GAP` 统计；同 LBA 配对结果；M3-7 修复方案；有无回退。
+
+---
+
+# NOF-069（待执行 · NOF-068 C 段修复：新 cid + 先验 descriptor 再 mount + 源码定位 146µs 早退 · 2026-11-24）
+
+## 0. 判决与环境（开发侧决定）
+
+- **选选项 1**：用**新 cid `vseg_nof068b`** 重跑 C 段；**不删任何 etcd 键**（`vseg_nof068` 的键保留作证据）；不选选项 2、暂不判选项 4。
+- **根因方向（现有证据）**：`/cvm/vseg_nof068/` 只有 `cluster_meta`(62B) + `ring_slots/00000`，**没有 segment 描述符**；对照 NOF-008 成功轮 `/cvm/vseg_nofvseg/` = **8 键**（含 segment 描述符）。而 `MountNoFSegment` 只花 **146µs**、**没有走到 attach**（成功轮 206ms 且有 `Opened NoF segment ns=1 io_qpairs=4`）⇒ 极可能是 **register 没把描述符写进去**（C1/C2 在坏 env 下跑过 register，或随后被"已存在"判定幂等跳过），mount 在前置校验就早退了。
+- 因此本单把「**先验 descriptor、再 mount**」设为硬闸：**描述符不在就停手**，不允许反复 mount 试探。
+
+## A. 预检（只读）
+
+1. target **487638** alive、4457、11/11 operational、`--num-trace-entries 262144`、`tpoint_group_mask=0x0`、`/dev/shm/nvmf_trace.pid487638` 52,736,328 B。
+2. 记录现存 master（1431656，cluster `vseg_nof068`）状态后**停掉**（按 PID，不删键）。
+3. etcd 基线（**base64 下发脚本**，避开上层 shell 展开）：
+   - `/cvm/vseg_nof068/`、`/oplog/vseg_nof068/` 键数与键名；
+   - `/cvm/vseg_nofvseg/`（成功轮，**把键名清单打出来当模板**）；
+   - `/cvm/vseg_nof068b/`（预期不存在）。
+
+## B. 起新 master + register（env 单一来源）
+
+1. 用**同一个脚本**（`set -a`，全部 env 写在一处）启动 vseg master：`cluster_id=vseg_nof068b`、`MC_STORE_PARTITION_SLOT_COUNT=1`、`--vsegment_stripe_size=4194304`、50056/9006、`SPDK_URMA_DEV_NAME=udmac0d1e2`、`SPDK_URMA_CAPSULE_TRANSPORT=urma`，其余与 **NOF-059 B1 逐项一致**。
+2. **先验 master environ**（`/proc/<pid>/environ` 含全部 URMA 变量）**再** register；register 从同一脚本环境执行，**不嵌套 sudo**。
+3. **register 硬闸**：register 结束后立刻数 `/cvm/vseg_nof068b/` 键——
+   - 键数 < 3 或**缺少 segment 描述符键** ⇒ **停手回报**（不 mount、不重试、不删键），并把 register 的完整 stdout/stderr 与 rc 贴回；
+   - 键结构与 `/cvm/vseg_nofvseg/` 一致（含描述符）⇒ 进 C。
+4. 记录 register 耗时与输出，与 NOF-059 的 register 日志逐行对比（成功轮有 `Opened NoF segment`? 记录有无）。
+
+## C. mount（**只做一次**）
+
+1. 客户端 `MountNoFSegment`；记录 `elapsed_us` 与 `rc`。判据：
+   - **成功** = elapsed ≳ 200ms **且** master 日志出现 `Opened NoF segment ns=1 io_qpairs=4` **且** `rc[0]`；
+   - **146µs 级 + 无 `Opened NoF segment`** ⇒ 停手，直接进 D 段（**禁止重复 mount**）。
+2. 成功后：等 quota ≥20s，验收 `partitions=1`、`reconcile_fail=0`。
+
+## D. 源码定位（零环境，可与 B/C 并行）
+
+1. 在 `$D/mooncake-src` 定位 `MountNoFSegment` 处理链（`master_service.cpp:4914` 附近）与 `spdk_wrapper.cpp:768`。
+2. **列出所有"不打印日志就返回/计失败"的分支**，标出哪一条能在 **146µs** 内命中（前置校验类：描述符缺失/字段非法/device identity 不匹配/配额未就绪等），给 `文件:行号` 与判定条件。
+3. 检查 register 侧是否有「已存在即跳过」的幂等逻辑——若有，说明 C1/C2 坏 env 下的 register 如何留下坏状态。
+
+## E. 后续（仅当 C 成功）
+
+按 NOF-068 的 D/E/F 段继续：pilot 100 keys → 两臂 400 keys（vseg `vseg_nof068b` + plain `vseg_nofvseg` 读同一批 LBA）→ 每遍快照 ring → 解析 `t_submit/t_db/t_obs/t_cb/last_empty/poll_enter` → 判 H1/H2。
+
+## F. 边界
+
+- **不删任何 etcd 键**（含 `vseg_nof068`）；只新增 `vseg_nof068b`。
+- target **保持运行、不再重启**；不改码、不重编；tracepoint 仍不启用（等 C 成功再开）。
+- 写入仅 C 成功后的一次（400 keys）；失败则零写入。
+- 产物 `run/nof069_*.txt`（≤3 个，每个 ≤1MB）。
+
+## 回执必答（第一行）
+
+register 后 `/cvm/vseg_nof068b/` 的键清单与键数（是否含 segment 描述符、是否与 nofvseg 同构）；mount 的 `elapsed_us`/`rc`、是否有 `Opened NoF segment`；若失败：146µs 命中哪条无日志分支（`文件:行号`）；register 输出与 NOF-059 的差异；是否进入 D/E；有无失败。
