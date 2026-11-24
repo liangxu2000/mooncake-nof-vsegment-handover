@@ -49,7 +49,8 @@
 >
 > ⇒ **目前唯一「可重启且数据完好」的是 `plain_nof088`。任何新的 vseg 实验都必须新建 cid 重写数据。**
 
-- 当前任务：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
+- 当前任务：**两单并行** —— **NOF-091 续**（量 plan/submit/wait：允许重启 master 建 `vseg_nof091` 写 400 keys；不改全局 spdiag 配置，改连跑 ≥6 遍）与 **NOF-092**（只读取证：测试机源码的 remote/branch/HEAD/status，并判定 `d371e22` 是否为祖先）。**用户 21:02 确认 `d371e22` 为基准版本。**
+- 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
 - 历史：**NOF-091（拿 vsegment 的 plan/submit/wait 分解）**。用户 20:41 批准派任务。**优先零改码**：源码里三个 `SpDiag::PerfPoint` 埋点（`VSEGMENT_READ_PLAN/SUBMIT/WAIT`）已存在，若构建是 Layer 1 且 `spdiag` CLI 在，直接 `spdiag show` 拿数；否则才加 chrono 重编（65s）。
 - 历史（已暂停）：**NOF-090（版本对照：换掉 be10be2 看 2× 是否版本问题）**。实地核查确认：我们用的是 `LeeJace993/Mooncake` 的 **`nof-urma-v2-bench-merge`** 分支（HEAD `d371e22`，2026-10-23），**不是 kvcache-ai/Mooncake**；`be10be2` 不在我们的历史里；唯一可升的 1 个提交（`523256d`）只加 EID 配置，与性能无关。**这条线不存在「升一版拿回 2×」的选项。** 下一步待用户拍板（A 问同事 / B cherry-pick 上游修复 / C 接受现状）。
 - 历史（已作废）：**NOF-090（版本对照：换掉 be10be2 看 2× 是否版本问题）**。开发侧决策：60+ 轮已排除 IO 层/命令层/客户端结构层；唯一未排除项是**版本落后**（`be10be2` 缺 `ff3e853`/`13b7c19` 等读路径修复）。源码里那处「重复 view 校验」已量化仅 **3–5µs（约 1%）**，不构成主因、不值得单独重编。
@@ -5741,7 +5742,7 @@ read_overhead_us = read_us - known_read_us    // read_us <= known 时为 0
 
 ## A. 只读核查（5 分钟，决定走 B1 还是 B2）
 
-### A0. **先确认测试机上实际用的是哪份源码**（必做第一步）
+### A0. ~~先确认测试机上实际用的是哪份源码~~ · **【2026-11-24 21:03 已拆分为独立任务 NOF-092，本单跳过 A0、直接从 A1 开始】**
 
 > **开发侧的结论有缺口，必须由本单补上**：开发侧只核对了**本地副本** `D:\gds性能\repos\Mooncake` 的 git 元数据（`git branch --show-current` = `nof-urma-v2-bench-merge`，HEAD `d371e22`，origin = `LeeJace993/Mooncake`）。**但从未验证测试机上跑的那份源码/二进制是否来自同一个副本**。这是推断，不是实测。
 
@@ -5803,6 +5804,55 @@ read_overhead_us = read_us - known_read_us    // read_us <= known 时为 0
 - 400-key 口径，写入量 ≤ 400 keys；写入前查 etcd 余量（当前 150 MB）。
 - 不碰他人进程；产物 `run/nof091_*.txt`（≤3 个、每个 ≤1MB）。
 - 若 A 段发现 spdiag 不存在、且 B2 编译失败 3 次 ⇒ **停手如实回执**，给失败日志尾部 50 行，不要自行改方案。
+
+---
+
+# NOF-092（**只读取证：测试机源码的仓库 / 分支 / 版本** · 2026-11-24 21:03 派）
+
+## 0. 为什么单列一单
+
+**用户 2026-11-24 21:02 确认：`d371e22` 这个版本没问题，作为基准。**
+
+但 NOF-091 回执里报告的测试机源码版本是 **`be10be29`（dirty=3）**，与 `d371e22` 不是同一个 hash。**这件事必须查清，否则开发侧基于本地源码得出的一切判断（`Plan` 重复校验占比、`openSegment` 开销、两臂提交方式是否一致）都没有立足点。**
+
+本单**只做取证**：不跑性能测试、不写任何数据、不动任何进程。与 NOF-091 并行，互不干扰。
+
+## A. 只读采集（5 分钟）
+
+1. 找 bench 二进制及其所属源码目录：
+   - `find / -maxdepth 5 -name "stress_cluster_bench*" -type f 2>/dev/null | head`
+   - `ls -l <bench路径>`、`md5sum <bench路径>`
+2. 进入源码目录，**四条命令全执行、原文贴出**：
+   ```
+   git remote -v
+   git branch --show-current
+   git log -1 --format="%H %ci %s"
+   git status --short
+   ```
+3. **关键判据命令**（决定开发侧源码分析能否直接引用）：
+   ```
+   git merge-base --is-ancestor d371e22 HEAD && echo "d371e22_is_ancestor" || echo "NOT_ancestor_or_missing"
+   ```
+4. 若提示对象缺失：先 `git fetch --all` 再判一次；仍缺失则记 `[未获取]`，不要猜。
+
+## B. 判定（两边都写）
+
+| 结果 | 结论与后续 |
+|---|---|
+| **`d371e22` 是 HEAD 的祖先** | 测试机是在基准上往前走的版本。**再给 `git log --oneline d371e22..HEAD` 全表**，并逐条标出是否改了 `client_service.cpp` / `transfer_task.cpp` / `real_client.cpp` / `mooncake-store/src/vsegment/`。**若这些文件都没动 ⇒ 开发侧源码分析可直接引用**；若动了 ⇒ 列出改了什么 |
+| **`d371e22` 不是祖先** | 两条线已分叉。给 `git merge-base HEAD d371e22` 的结果，说明分叉点在哪个提交之后 |
+| **对象缺失且 fetch 不到** | 记 `[未获取]`，只报 remote / branch / HEAD / status 四个值，**不做任何推断** |
+
+## C. 回执必答（第一行）
+
+`remote` / `branch` / `HEAD 全 hash` / `status 条数` / **`d371e22` 是否为祖先**；若在其后，列出 `d371e22..HEAD` 的提交清单与其中被改动的读路径文件；bench 二进制的 md5 与 mtime；有无失败；**新增写入 = 0**。
+
+## D. 边界
+
+- **纯只读**：零写入、零重启、不跑 bench、不跑 urma_perf、不动任何 cid / master / target。
+- 不碰他人进程（royi master 3463695 / yin 的 `vseg_yin_bonding`）。
+- 只产出 `run/nof092_summary.txt`（1 个文件，≤100 KB）。
+- **不做性能判断**，本单只回答「测试机上跑的是哪份代码」。
 
 ---
 
