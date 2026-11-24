@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-23
-- 当前任务：**NOF-067（只读取证：同事的 SQE/CQE/SQHD 拆解能力与 `--target-trace-entries` · 零环境）**。执行顺序建议：**NOF-067 → NOF-065 视 067 结论决定是否执行**；NOF-066（口径重算）可并行、不动环境。
+- 当前任务：**NOF-068（M3-6：改用 SPDK 原生 tracepoint 采两臂 · 零改码 · 含一次干净重启 · 2026-11-24）**
 
 ## 第二阶段（2026-11-23 起）
 
@@ -178,9 +178,10 @@
 | NOF-062 | 已关闭 2026-11-23（**gap 随并发强收敛 ⇒ 完成检测类**） | bdev p50 **T1 249/54（4.61×）→ T4 262/259（1.01×）→ T16 270/265（1.02×）**；vseg 恒 249→270、plain 单向追平 54→259 ⇒ 判据① + ③。**差异 100% 在 `bdev_us`**，其余段 0、`outside` 同 21µs、`wait/enomem` 为 0。同 qid 配对 T1 4.4–4.8×、T4/T16 1.0×。源码链到 `transport.c:932`（每 poll group 独立 buf_cache）与 `urma.c:2493`（bdev_cpl 在 poll 上下文取）；**target 无 vseg 语义**；两臂仅会话身份与 qpair→lcore 分配不同 ⇒ NOF-063 |
 | NOF-063 | 已关闭 2026-11-23（**无 50–500µs 常量；结构错配对称，不解释臂间差**） | 主链 `transport.c:777→779`→`urma.c:2303`（81 行）；`urma_poll_jfc` 无 timeout、`usleep/nanosleep/spdk_delay_us` 零命中 ⇒ **静态无该量级常量**。结构：`stride=worker_count=6` vs `send_jfc_count=2` ⇒ 仅 worker 0/1 轮询网络，qpair JFC=建连序 mod 2 与属主无对齐 ⇒ 跨线程投递；本地 NVMe 每轮不限量、无 defer。**复核：错配两臂对称（各 2 个轮询 + 2 个非轮询），且同臂 4 个 qid 时延均匀 ⇒ 不是 4.6× 原因，JFC_COUNT=6 不作判决实验** ⇒ 必须插桩 ⇒ NOF-064 |
 | NOF-064 | 已关闭 2026-11-23（**部分：改码/重编/重启完成；采集受阻**） | 新 target **1587271 / `21ced674…`**、验收全过、`NOF064_TRACE=1`；三份二进制并存（`nof059` 979f5517 / `nof064` 21ced674 / `nof064b` afe95672）。`worker_index 0→core3,1→core4,2→core5,3→core6,4→core7,5→core2`。**阻塞①重启使 nsid1 uuid 变（c697219c→63a1e3cd）⇒ `vseg_nof061` mount rc[-300]，plain 元数据不受影响**（产品级缺陷）；**阻塞②v1 插在 2214 而非读路径 1921 ⇒ `d_*` 是绝对值**。plain v1：client P50 317.44、bdev p50 225 —— **判为采样偏差，不可用**：4,000 条预算按到达序≈前 125 个 key，其中 keys 0–97（78%）落在盘首慢窗口，与 83.4% >70µs 吻合；反证是客户端 P50 317.44 与 NOF-062 plain T1 307.51 基本一致 ⇒ 225 是子集统计假象。**早前归因为 printf 观测者效应，已撤回** ⇒ NOF-065 |
-| NOF-065 | 已下发 2026-11-23（M3-5，沿用改码/重编/重启授权）· **暂缓：先看 NOF-067 结论** | v3 插桩：printf→**环形数组 + 非 reactor 线程落盘**、补 iov 字段、`d_*` 改真 delta；重启后**新 cid `vseg_nof065` 写一次 400 keys**；两臂 T1 各 2 遍 + 各 1 遍 `TRACE=0` 对照（差 >5% 作废）；解析按 `bdev_us` 分桶、`iov[0].base` 分 NUMA 桶 |
+| NOF-065 | **已取消 2026-11-24（被 NOF-068 取代）**：NOF-067 证明现役二进制已具备所需 tracepoint，C 代码插桩不再必要 | v3 插桩：printf→**环形数组 + 非 reactor 线程落盘**、补 iov 字段、`d_*` 改真 delta；重启后**新 cid `vseg_nof065` 写一次 400 keys**；两臂 T1 各 2 遍 + 各 1 遍 `TRACE=0` 对照（差 >5% 作废）；解析按 `bdev_us` 分桶、`iov[0].base` 分 NUMA 桶 |
+| NOF-068 | 已下发 2026-11-24（M3-6，**零改码 · 一次干净重启**） | 回到原始 `nof059`(979f5517) + `--num-trace-entries 262144`、**不设 NOF064_TRACE**；新 cid `vseg_nof068` 写 400 keys；开 `nvme_pcie`/`urma_p99`/`bdev*` 组；pilot 100 keys 验解析 → 两臂 400 keys 各一遍 + 每遍快照 `/dev/shm` ring；解析 `t_submit/t_db/t_obs/t_cb/last_empty/poll_enter`，按 `t_cb-t_db`（盘+队列）与 `t_obs-last_empty`（静置）判 H1/H2；溢出即作废 |
 | NOF-066 | 已关闭 2026-11-24（**排除慢窗口后差距放大，结论更硬**） | 落盘 33,792 条按 `exec_tick` 最大间隙 208.953s 切为 seg1=vseg / seg2=plain 各 16,896（与 NOF-057 逐位吻合）。排除（lba≥802,816）vs 全量：vseg 256/314/261.1→256/314/250.9；plain 61/285/136.5→**50/67/50.0**；**比值 p50 4.197×→5.120×、mean 1.912×→5.015×**。NOF-062 trace 同结论：T1 p50 4.611×→5.511×、mean 2.046×→5.463×；T16 仍 1.030×。**排除后 vseg 100% 落在 128–512µs（<128µs 为 0），plain 90.5% 落在 32–64µs** ⇒ vseg 全程均匀慢、与慢窗口无关。推荐口径＝排除口径 + 慢窗口小表 |
-| NOF-067 | 已下发 2026-11-24（**零环境 · 纠偏取证**） | 同事称 SQE/CQE/SQHD 可继续拆 `submit_return→callback`：读 `run_exp.sh -F 3`（裸 SPDK）与 `vsegment_cluster.sh --target-trace-entries 2097152`（Mooncake 侧）的字段与传递链；查源码里 24 字段哪些是时间戳、哪些是队列索引，是否存在 SQ 位置/doorbell/CQ head；核现役二进制是否支持；判「用同事这套（零改码）」还是「仍需 poll 计数 + iov 插桩」 |
+| NOF-067 | 已关闭 2026-11-24（**判决走 A：零改码，现役二进制字段齐全**） | `nvme_pcie`(6 tpoints) + `urma_p99`(4) 均在、`mask=0x0` 未开；`NVME_PCIE_CQ_OBSERVE` 带 `{req,qpair,cid,last_empty,poll_enter,prev_poll_end}`、`SQ_RING` 带 `{qpair,tail,mmio}`（写 tdbl 后）、`SUBMIT` 带 `dw10/dw11/dw12` ⇒ lba/nlb，可做 per-LBA 归因；**H1/H2 三分支判别可落地**。纠错：`-F 3` 是**慢事件阈值因子**（latency>3×avg）非格式开关；`--target-trace-entries` 落到二进制是 **`--num-trace-entries`**（2 的幂、默认 32768/核、0 关闭）。24 字段**无**队列索引/SQHD；`sq_head=cpl->sqhd` 读入但未落 trace。硬阻塞：同事 `analyze_p99_slow.py` 写死 `SQ_PUBLISH/SQ_NOTIFY`，我方 v7 命名是 `SQ_RING/POLL_GAP/REQ_QUEUED` ⇒ 需改约 20 行 Python（不碰 C）。产物 `run/nof067_recon.txt`（15,611 B） ⇒ NOF-068 |
 | NOF-053 | 已关闭 2026-11-23（**客户端分解；QoS 排除**） | 指定 `batch_get_*` 为 0（单 key Get 走 `get_into_breakdown`/`query_rpc_breakdown`/`transfer_data_breakdown`/`nof_slow_task`）。plain 每 key 283µs = **master 元数据 query 116µs（41%）** + submit 6 + wait 156（含 target W9 68，超出 88）+ 其他 5；**QoS/worker/dispatch 仅 8–11µs（~3%）**。vseg 2× **不是 setup/QoS**（query 103 vs 116 反而低），而是 **drain 350 vs 110µs、max_subio 362 vs 112（3.2×）**、submit 19 vs 6 ⇒ **客户端调度排除**，vseg 的 2× 在 target/传输 drain 段 |
 | NOF-050 | 已关闭 2026-11-23（**阻塞：SPDK 版本不兼容**） | 补丁/编译/链接成功（`bench-io-params` 530,162,656B / md5 fc2b5129…，strings 命中 3 条）；但新 bench 连 target 失败：客户端 SPDK **9a413a44** vs target 运行中 **e12b7cb**，握手 rc=-71/-104；同事原 bench（59662a26，匹配 e12b7cb）同 env/参数 rc=0、P50 473.52 / target W9 259.77。**口径修正**：该 P50 为 **node1 远端 reader**，与 NOF-040 本机 274 不可比（SLOT=1 未改变 P50）；target 现跑的是 **deleted 旧二进制 736a902f**，磁盘 d6c39465=9a413a44 |
 | NOF-026 | 已关闭 2026-11-20 | **750 只是目标句里的近似值**（L12），非实测；文档唯一 VSegment 实测 = 662/669/913µs（6盘/8MiB/单线程）；**300 无任何推导**；资料**没有**"不开 vsegment 的 Mooncake 读时延"数字（仅裸 SPDK 236µs 与写吞吐 12.89 vs 13.07） |
@@ -4085,3 +4086,66 @@ vseg4 写/读是否成功与 Keys；vseg4 突发长度（32/16）与 submit 间�
 ## 回执必答（第一行）
 
 `-F 3` 与 `--target-trace-entries` 分别输出/控制了哪些字段；24 字段里哪些是时间戳、哪些是队列索引；是否存在 SQ 位置 / SQHD / CQE / CQ head；能否直接量化「CQE 早于回调」；现役二进制是否支持；判决走 A（零改码）还是 B（仍需插桩）与理由；有无失败。
+
+---
+
+# NOF-068（待执行 · 第二阶段 M3-6：改用 SPDK 原生 tracepoint 采两臂 · **零改码** · 含一次干净重启 · 2026-11-24）
+
+## 0. 授权与前置
+
+- 沿用 2026-11-23 用户批准范围（重启 target + 一次 400 keys 写入）。本单**不改码、不重编**：直接回到原始二进制 `nof059`（`979f5517…` = bd5ee124d，无任何自建打点），同时清掉当前"deleted inode + `NOF064_TRACE=1` 打印"的污染状态。
+- 依据 NOF-067：现役二进制已内置 `nvme_pcie`(6 tpoints) 与 `urma_p99`(4)，`mask` 只是没开；H1/H2 判别所需的 `poll_enter / last_empty / prev_poll_end / POLL_GAP / CQ_OBSERVE` 齐全。
+- 术语纠正（写死在回执里）：`-F 3` 是**慢事件阈值因子**（latency > 3×avg），不是格式开关；`--target-trace-entries` 是 node1 脚本的参数名，落到二进制是 **`--num-trace-entries`**（2 的幂，默认 32768/核，0 关闭）。
+
+## A. 预检（只读）
+
+1. target 1587271：`/proc/<pid>/exe`（应为 deleted）、`environ`、`cmdline`、`/dev/shm/nvmf_trace.pid*` 大小。
+2. 四份二进制 md5；**核验 `nof059` 也带 `--num-trace-entries` 与 `NVME_PCIE_CQ_OBSERVE`**（`--help` + `strings`）；若 `nof059` 不带 → **停手回报**（改用 `nof064b` + 不设 `NOF064_TRACE` 作为替代并说明）。
+3. etcd 键数（**用 base64 下发脚本**，避开上层 shell 展开）：`/cvm|/oplog` 下 `vseg_nofvseg`、`vseg_nof061`、`vseg_nof068`。
+
+## B. 切到干净 target（一次重启）
+
+1. 停 1587271；用 `nof059` + **同 RPC 重放** + `SPDK_URMA_TRACE_ENTRIES=262144`（→ `--num-trace-entries 262144`）；**不设 `NOF064_TRACE`**。
+2. 验收：4457 LISTEN / nsid1=URMA_RAID0 / 11 base 11 operational strip256K online / transport urma / `--num-trace-entries` 生效（`/dev/shm/nvmf_trace.pid<new>` ≈ 262144×32B×cores）/ `trace_get_tpoint_group_mask` 可查且为 0x0。
+3. 记录新的 nsid1 uuid（复现 NOF-064 判决 3）。
+
+## C. 写入（一次，新 cid）
+
+- 起 vseg master `vseg_nof068`（slot=1、`--vsegment_stripe_size=4194304`、其余同 NOF-059 B1）；register；quota；验收 `partitions=1`、`reconcile_fail=0`。
+- T1 写 400 keys（`--num_threads=1 --batch_size=1`、verify=false、`VSEGMENT_CREATING` ≤3 次补齐）；验收 `Keys=400`、`logical_used=1,677,721,600`；记录写 params 的 `seg_lba` 集合（预期 0..3268608 步长 8192）。**此后禁止再写。**
+
+## D. 两臂采集（tracepoint）
+
+1. 运行期开组：`trace_enable_tpoint_group nvme_pcie`、`urma_p99`，另加 `bdev`(0x8) / `bdev_raid`(0x20000) / `bdev_nvme`(0x4000)（NOF-067 建议，用于 bdev_io 时延）；记录 `trace_get_tpoint_group_mask`。
+2. **pilot（先做，验解析）**：vseg 臂 `--num_keys=100 --warmup_keys=0`，其余同正式参数；跑完 `trace_clear` 前后各快照一次；确认字段有值、无溢出、可解析。
+3. **正式 vseg 臂**：`trace_clear` → `--num_keys=400 --warmup_keys=128 --num_threads=1 --batch_size=1 --nof_qpairs_per_segment=4 --verify=false`；客户端 env 含 `SPDK_URMA_STAGE_TRACE_US=1`（`URMA_P99_BEGIN` 要求 `trace_seq != 0`）；跑完**立即**把 `/dev/shm/nvmf_trace.pid*` 复制到 `run/nof068_vseg.bin`（ring 静默回绕，必须每遍快照）。
+4. **plain 臂**：停 vseg master、起 plain master（`vseg_nofvseg`，不清键不写），`trace_clear` → 同一批 LBA 读 400 keys（plain flags，同 env）→ 快照 `run/nof068_plain.bin`。
+5. 收尾：`trace_disable_tpoint_group`；停两 master；**target 保持运行**。
+
+## E. 解析（**只改 `/tmp` 下的 Python，不碰 C**）
+
+1. 先出**名称映射表**：`SQ_PUBLISH→?`、`SQ_NOTIFY→SQ_RING`、`CQ_OBSERVE`、`COMPLETE`、`SUBMIT`、`REQ_QUEUED`、`POLL_GAP`；不确定项按语义最小改动，并把差异写进回执（同事脚本写死旧名，直接跑会退出）。
+2. **溢出判定**：每核条数 vs 容量；`trace_seq` 不连续或达上限 ⇒ 该遍**作废重跑**（缩小 keys 数），不得拿截断数据出结论。
+3. 每 IO 提取：`t_submit(SUBMIT)`、`t_db(SQ_RING, 写 tdbl 后)`、`t_obs(CQ_OBSERVE)`、`t_cb(COMPLETE)`、`last_empty`、`poll_enter`、`prev_poll_end`、`lba`、`nlb`、`qid`、核。
+4. 计算四个量：`t_cb − t_db`（盘+队列）、`t_obs − t_db`、**`t_obs − last_empty`（CQE 静置时长上界）**、`POLL_GAP` 次数。
+5. 按 NOF-067 三分支判：`last_empty > t_db 且 poll_enter − t_db 大` ⇒ **H1 没轮到**；`last_empty > t_db 且 poll_enter ≈ t_db 而 t_obs − poll_enter 大` ⇒ **H2 轮到但 CQ 空**；`last_empty < t_db` ⇒ CQE 落在 (t_db, t_obs)。
+6. 归因：按 `lba` 与客户端 `URMA_SLOW_IO` 配对，给**同 LBA** 两臂的 `t_cb − t_db` 与 `t_obs − last_empty`；按核/盘/桶分组。
+
+## F. 判决（必答）
+
+1. pilot 是否可解析、字段是否都有值、是否溢出。
+2. 两臂 `t_cb − t_db` 的 p50/p90（"盘+队列"口径）与 `t_obs − last_empty` 的 p50/p90（"静置"口径）；两者能否解释 ~195µs（给加总关系）。
+3. **H1 还是 H2**（带数字）；若 H1，静置发生在哪（`POLL_GAP` 次数、`poll_enter` 间隔分布、是否跨核）。
+4. 若 H2 ⇒ `t_cb − t_db` 即盘时间，转设备/队列侧，给出下一步取证点。
+5. M3-7 修复方案：唯一假设 + 改哪一行/哪个参数 + 预期（target bdev 250 → 60µs 量级）+ 验证口径。
+
+## G. 边界
+
+- **不改码、不重编**；只改 `/tmp` 下 Python；不启用 `NOF064_TRACE`。
+- 一次重启 + 一次写入；之后零写入；不删 `/cvm|/oplog/vseg_nofvseg`。
+- 每遍必须快照 ring；溢出即作废；任何"看起来能解释但溢出了"的数据一律不认。
+- 验收不过 → 回退到 1587271 的等价配置（`nof059` + 原 RPC + `TRACE_ENTRIES=0`）并停手回报。
+
+## 回执必答（第一行）
+
+pilot 是否可解析/字段是否有值/是否溢出；tpoint 名称映射表；两臂 `t_cb−t_db` 与 `t_obs−last_empty` 的 p50/p90；H1/H2 判定与数字；`POLL_GAP` 统计；同 LBA 配对结果；M3-7 修复方案；有无回退。
