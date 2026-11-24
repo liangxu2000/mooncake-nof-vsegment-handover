@@ -6,7 +6,7 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-24
-- 当前任务：**无（主线已收敛，待用户决定是否补 plain 2000-key 对照）**。NOF-087 判定：**慢程在端到端不可见（1.043×，四遍一致）⇒ 对业务无影响，这条线关闭**。**主线结论：vsegment 本身不引入性能代价（C03 L3）；5.91×/2.08× 是跨 cid 的数据状态差异，与 vsegment 无关。**
+- 当前任务：**NOF-088（补 2000-key 的 plain 对照 · 用户 19:26 批准「补」）**。**优先方案 A：同 cid 两读取方式交替读（零写入/零重启/零 etcd）**；只有 bench 不支持切方式时才走方案 B（新建 plain cid，但引入布局混淆、且 vseg_nof086 会永久报废）。NOF-087 判定：**慢程在端到端不可见（1.043×，四遍一致）⇒ 对业务无影响，这条线关闭**。**主线结论：vsegment 本身不引入性能代价（C03 L3）；5.91×/2.08× 是跨 cid 的数据状态差异，与 vsegment 无关。**
 - **NOF-085 已被 NOF-086 裁决取代**：A 段的 `--max-request-bytes` 定位**已被源码证否**（见 NOF-086 裁决 §7），真正的墙是 Mooncake 客户端 `storeMaxMsgSize = 32MiB`。原单作废，改由 NOF-087 核版本常量。
 - **NOF-084 的「外推 >24MB 即停手」判据已撤销**（24.2MB 下限假设 1 entry/key，与实测 7 entries/key 矛盾）。
 - **NOF-084 已完成（主动停手，L0）**：2000 keys 未写入；100 keys 预检实测 84.8KB/key，2000 keys 外推 24.2–169.6MB 全部超 24MB 阈值。见该单顶部裁决块。
@@ -5282,6 +5282,67 @@ NOF-083 C 段证明 **Mooncake 侧有慢程**（NEW080 fast 0.0%、OLD 62.9% 快
 - 不碰他人进程（royi master 3463695 / yin 的 `vseg_yin_bonding`）。
 - 产物 `run/nof087_*.txt`（≤3 个、每个 ≤1 MB）；**不要重传 21 MB 原始日志**，只传分档汇总表。
 - 若 A 段发现日志完全不含 key 维度信息、且 B 段重跑也拿不到 ⇒ **就此停手如实回执**，禁止自造解析、禁止猜字段、禁止用别的 cid 补数据。
+
+---
+
+# NOF-088（**补 2000-key 的 plain 对照** · 优先零写入方案 · 2026-11-24 19:27 派）
+
+## 0. 为什么派这单
+
+主线结论 C17「vsegment 本身不引入性能代价」目前只建立在 **400-key 口径**（C03：同 cid 两 flags 交替 6 遍差 0.00%/0.14%）。**2000-key 口径只有 vseg，没有 plain 对照。**
+
+本单补这个缺口。**但优先方案不是新建 cid**——新建要重启 master，会让 `vseg_nof086` 永久报废（942MB oplog），还引入布局混淆。**先看能不能在同一批数据上换读取方式。**
+
+## A. 先核实 bench 能否在同 cid 切读取方式（只读，10 分钟）
+
+依据：NOF-086 日志里有 `type[vsegment] mode[full]` 字段，说明 `type` 是可变的。
+
+1. `stress_cluster_bench --help` 全文检索与读取方式相关的开关，关键词：`vsegment` / `use_vsegment` / `storage_type` / `nof` / `plain` / `type` / `--mode`
+2. 源码只读确认：`type` 字段有哪几个取值，切换是否需要重写数据
+3. **判据：**
+   - 存在「同一 cid、同一批 key，只换读取方式」的开关 ⇒ **走 B 段（优先，零写入零重启）**
+   - 不存在 ⇒ **走 C 段（备选，新建 plain cid）**
+
+## B. 方案 A：同 cid 两方式交替读（**优先；零写入、零重启、零 etcd**）
+
+1. 对象固定 `vseg_nof086`（Keys=2000，勿动数据）
+2. 口径**与 NOF-086 D 段逐项一致**：`num_keys=2000`、`io_size=4MiB`、`QD=batch=1`、`threads=1`、`slot=1`、同宿主、`warmup_keys=128`
+3. 交替 4 遍：**vseg → plain → vseg → plain**（每遍独立进程，跑前确认残留=0）
+4. 每遍记录：`Total / failed / Min / P50 / P90 / P99 / Max / Avg / MiB-s / keys-s`
+5. **判据（两边都写）：**
+   - 两方式 P50 差 **< 20%** ⇒ **vsegment 无代价，2000-key 口径确认 C17**
+   - 差 **≥ 2×** ⇒ **vsegment 有代价**，C03 的 400-key 结论需重审，回执必须写明
+   - 20%–2× ⇒ 给过渡值并标 `口径待细化`
+6. **必须同时给**：两方式各自的 `type` 字段值（证明切换生效），以及 `read_us` / `query_us` 分解
+
+## C. 方案 B（仅当 A 判据为「不存在」时执行）：新建 plain cid
+
+1. **A 段判「不存在」才执行**，不得主动选这条路
+2. 新 cid `plain_nof088`，`slot=1`，其余配置与 `vseg_nof086` 一致，**但关闭 vsegment**
+3. 写 2000 keys：**plain 预计 1 轮写完**（无 `VSEGMENT_CREATING`），预计 oplog **< 2 MB**
+4. 写前记录 etcd `dbSize` 与 `/oplog` 总体积；**余量只有 150.4 MB**（1,345,523,712 / 2GiB = 62.7%，70% 线余 157,714,841 B），**每 500 keys 复测一次，超 140 MB 增量立即停写**
+5. 读 4 遍，口径同 B 段
+6. **必须写明**：这是两批数据，**存在布局混淆**（plain 连续堆放 vs vseg 散在 vsegment 里），结论等级最高只能到 **L2**，不得与被 C03 排除的 NOF-025 混用
+
+## D. 若走 C 段：切 cid 前先固化 vseg_nof086（不可逆前置）
+
+1. 记录并写入回执：`Keys`、`logical_used`、`vsegments`、`/oplog/vseg_nof086/` 条目数与字节数、`dbSize`
+2. 明确记录 NOF-086 / NOF-087 已采完的 4 遍读数据（P50 538.88/577.86/525.87/544.28、per-key 分档表）
+3. **切 cid 后 `vseg_nof086` 永久不可重启**（942MB > 客户端 32MiB recv 上限），以上数据不可重测 —— 这一点已由开发侧源码确认：新 cid 的 `master_id` / `cluster_id` 不同 ⇒ 回放走新前缀，**不会误读旧 cid 的 942MB**（`master_service.cpp:212` `master_id_(config.master_id)`；前缀 `/oplog/<cluster_id>/<source_id>/`）
+
+## E. 回执必答（第一行）
+
+bench 能否同 cid 切读取方式（A 段判据命中哪条）；走了 B 还是 C；**两方式的 P50 与比值**；两方式 `type` 字段值；`read_us` / `query_us` 分解；有无失败；**新增写入 LBA 清单**（B 段应为 0）；oplog 与 dbSize 前后值。
+
+## F. 边界
+
+- **零改码、零重编**；**B 段零写入、零重启、零切 cid**。
+- **禁止写 `vseg_nof080` / `vseg_nof086`**；**B 段禁止切 cid、禁止重启 master**。
+- C 段才允许切 cid，且必须先完成 D 段固化。
+- 不碰他人进程（royi master 3463695 / yin 的 `vseg_yin_bonding`）。
+- **不要删任何 `/oplog` 前缀**（删除可释放 899MB，但属不可逆操作，须用户单独授权，本单不做）。
+- 产物 `run/nof088_*.txt`（≤3 个、每个 ≤1MB）。
+- 若 A 段判「不存在」且 C 段 etcd 增量逼近 140MB ⇒ **停手如实回执**，不得为凑数降 keys 或改口径。
 
 ---
 
