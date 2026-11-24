@@ -5695,6 +5695,20 @@ read_overhead_us = read_us - known_read_us    // read_us <= known 时为 0
 
 ## A. 只读核查（5 分钟，决定走 B1 还是 B2）
 
+### A0. **先确认测试机上实际用的是哪份源码**（必做第一步）
+
+> **开发侧的结论有缺口，必须由本单补上**：开发侧只核对了**本地副本** `D:\gds性能\repos\Mooncake` 的 git 元数据（`git branch --show-current` = `nof-urma-v2-bench-merge`，HEAD `d371e22`，origin = `LeeJace993/Mooncake`）。**但从未验证测试机上跑的那份源码/二进制是否来自同一个副本**。这是推断，不是实测。
+
+1. 找 bench 二进制：`find / -maxdepth 5 -name "stress_cluster_bench*" -type f 2>/dev/null | head`
+2. 看它的来源线索：`ls -l <路径>`（mtime）、`strings <路径> | grep -iE "mooncake-store/src|/repos/Mooncake" | head -5`
+3. 在它所属的源码目录执行：`git branch --show-current`、`git log -1 --format="%h %ci %s"`、`git remote -v`、`git status --short | head`
+4. **判据：**
+   - 分支 = `nof-urma-v2-bench-merge` 且 HEAD ≥ `d371e22` ⇒ **与开发侧一致，继续 A1**
+   - **分支或 HEAD 不同** ⇒ **回执第一行必须写明实际值**，并说明该分支上是否存在 vsegment 读路径相关改动 ⇒ **开发侧的版本结论需要整体重算**
+   - 找不到源码目录（只有预编译二进制）⇒ 记 `[未获取]`，从**二进制 mtime + md5** 推断，不要猜分支
+
+### A1 起的核查
+
 1. **SpDiag 运行时是否存在**：`which spdiag`；`ls /usr/lib*/libspdiag* /usr/local/lib*/libspdiag* 2>/dev/null`；`ls /usr/lib*/cmake/SpDiag* 2>/dev/null`
 2. **当前 bench 是什么层**：在构建目录 `grep -i "MOONCAKE_ENABLE_SPDIAG" CMakeCache.txt`；再 `ldd <bench二进制> | grep -i spdiag`（有 `libspdiag.so` = Layer 1）
 3. **判据：**
