@@ -49,7 +49,8 @@
 >
 > ⇒ **目前唯一「可重启且数据完好」的是 `plain_nof088`。任何新的 vseg 实验都必须新建 cid 重写数据。**
 
-- 当前任务：**无 —— NOF-090 已暂停（版本目标搞错，见该单顶部红框）**。实地核查确认：我们用的是 `LeeJace993/Mooncake` 的 **`nof-urma-v2-bench-merge`** 分支（HEAD `d371e22`，2026-10-23），**不是 kvcache-ai/Mooncake**；`be10be2` 不在我们的历史里；唯一可升的 1 个提交（`523256d`）只加 EID 配置，与性能无关。**这条线不存在「升一版拿回 2×」的选项。** 下一步待用户拍板（A 问同事 / B cherry-pick 上游修复 / C 接受现状）。
+- 当前任务：**NOF-091（拿 vsegment 的 plan/submit/wait 分解）**。用户 20:41 批准派任务。**优先零改码**：源码里三个 `SpDiag::PerfPoint` 埋点（`VSEGMENT_READ_PLAN/SUBMIT/WAIT`）已存在，若构建是 Layer 1 且 `spdiag` CLI 在，直接 `spdiag show` 拿数；否则才加 chrono 重编（65s）。
+- 历史（已暂停）：**NOF-090（版本对照：换掉 be10be2 看 2× 是否版本问题）**。实地核查确认：我们用的是 `LeeJace993/Mooncake` 的 **`nof-urma-v2-bench-merge`** 分支（HEAD `d371e22`，2026-10-23），**不是 kvcache-ai/Mooncake**；`be10be2` 不在我们的历史里；唯一可升的 1 个提交（`523256d`）只加 EID 配置，与性能无关。**这条线不存在「升一版拿回 2×」的选项。** 下一步待用户拍板（A 问同事 / B cherry-pick 上游修复 / C 接受现状）。
 - 历史（已作废）：**NOF-090（版本对照：换掉 be10be2 看 2× 是否版本问题）**。开发侧决策：60+ 轮已排除 IO 层/命令层/客户端结构层；唯一未排除项是**版本落后**（`be10be2` 缺 `ff3e853`/`13b7c19` 等读路径修复）。源码里那处「重复 view 校验」已量化仅 **3–5µs（约 1%）**，不构成主因、不值得单独重编。
 - 历史任务位：**无 —— 口径已回 400 keys（见上方口径决议），待用户定向下一单**。NOF-089 已完成：`read_us` 内部无 breakdown 埋点，**拆解失败**（offload 三子项恒 0，`read_overhead_us` ≡ `read_us` 是恒等式），要细分需新增插桩（改码）。
 - 原任务位记录：**NOF-089（把 `read_us` 的 2.58× 拆成 4 子项 · 纯离线）**。用户 19:39 把决策权交开发侧，决定**先拆解定位、暂不做升 L3 实验**——理由：① C18 的 2.07× 已与 NOF-025 的 2.08× 独立吻合 0.5%，「是不是真的」把握已较高；② 升 L3 需同 cid 双副本，但 bench 的 flag 不控制路径（NOF-088 已证），可能根本做不到；③ 先把 261µs 的差值拆到具体子项，才知道该往哪查。
@@ -5672,6 +5673,76 @@ read_overhead_us = read_us - known_read_us    // read_us <= known 时为 0
 - 400-key 口径，**不得超过 400 keys**；写入前必查 etcd 余量。
 - 不碰他人进程；产物 `run/nof090_*.txt`（≤4 个、每个 ≤1MB）。
 - 若构建失败 3 次仍不通 ⇒ 停手回执，给失败日志尾部 50 行。
+
+---
+
+# NOF-091（**拿 vsegment 内部分解：plan / submit / wait** · 优先零改码 · 2026-11-24 20:42 派）
+
+## 0. 为什么派这单（开发侧已查到的关键事实）
+
+`execute_ranged_read` 的 `read_us`（vseg 426µs / plain 165µs）**内部没有 breakdown 埋点**（NOF-089 已证），所以 `offload_rpc/transfer_data/release_buffer` 三个字段恒 0。
+
+**但源码里已经有三个正确的埋点位置**（`client_service.cpp`，vsegment 分支）：
+
+| 点位 | 行 | 覆盖什么 |
+|---|---|---|
+| `PerfKey::VSEGMENT_READ_PLAN` | 2246-2252 | `vsegment_transfer_planner_->Plan()` —— layout 校验 + 按 stripe 拆分 |
+| `PerfKey::VSEGMENT_READ_SUBMIT` | 2257-2262 | `transfer_submitter_->submitVSegment(plan, READ)` —— 含每个子请求的 `openSegment` |
+| `PerfKey::VSEGMENT_READ_WAIT` | 2312-2314 起 | 等 `TransferFuture` 完成 |
+
+**关键前提（`docs/spdiag_integration_guide.md`）**：这些 `SpDiag::PerfPoint` 只有在 **`MOONCAKE_ENABLE_SPDIAG=ON`（Layer 1）** 时才真正计时；**默认 `OFF`（Layer 0）会把 `Start()`/`End()` 编译成空实现**。
+⇒ **这解释了为什么 60+ 轮没人用过这份数据：很可能构建时它就是关的。**
+
+## A. 只读核查（5 分钟，决定走 B1 还是 B2）
+
+1. **SpDiag 运行时是否存在**：`which spdiag`；`ls /usr/lib*/libspdiag* /usr/local/lib*/libspdiag* 2>/dev/null`；`ls /usr/lib*/cmake/SpDiag* 2>/dev/null`
+2. **当前 bench 是什么层**：在构建目录 `grep -i "MOONCAKE_ENABLE_SPDIAG" CMakeCache.txt`；再 `ldd <bench二进制> | grep -i spdiag`（有 `libspdiag.so` = Layer 1）
+3. **判据：**
+   - **`spdiag` CLI 存在 且 bench 链接了 `libspdiag.so`** ⇒ **走 B1（零改码）**
+   - 否则 ⇒ **走 B2（改码加 chrono）**
+
+## B1. 优先：零改码，直接用 spdiag（**若能走这条，不动任何代码**）
+
+1. `spdiag clear`（清零）；若提示未初始化则 `spdiag start`
+2. 用**现有 bench 二进制**跑一遍 vseg reader：`--num_keys=400 --num_threads=1 --batch_size=1 --warmup_keys=128`，同宿主 node3 本机
+3. 跑完立刻 `spdiag show`（或 `spdiag show --top 50`），把 **`VSEGMENT_READ_PLAN` / `VSEGMENT_READ_SUBMIT` / `VSEGMENT_READ_WAIT`** 三个点位的 `count / avg / p50 / p99 / max` 原样贴出
+4. **对账**：三个点位之和应与该遍 `read_us` 同量级；若对不上，说明还有未覆盖的段，如实写明
+5. 额外：同时贴 plain 臂（`nof_remote`）的 `GET_INTO_INTERNAL_NOF_READ` 等相邻点位，用于对照
+
+> **注意**：vseg 数据已被覆写（`vseg_nof080` / `vseg_nofvseg` / `vseg_nof084` 均不可用，见顶部 cid 现状表）。**本单若需 vseg 数据，须新建 `vseg_nof091` 写 400 keys**（约 22 MB oplog）；plain 臂可读 `plain_nof088` 前 400 个。**写入顺序：先测 plain，再写 vseg。**
+
+## B2. 备选：改码加 chrono（**仅在 A 段判「Layer 0 / 无 spdiag」时执行**）
+
+1. 只改 `mooncake-store/src/client_service.cpp` 的 vsegment 分支，**只加计时，不改任何逻辑、不改控制流、不改返回码**：
+   - `submitVSegment` 前后各取一次 `steady_clock::now()`，求差记 `vseg_submit_us`
+   - `future` 等待前后各取一次，求差记 `vseg_wait_us`
+   - `Plan()` 前后各取一次，求差记 `vseg_plan_us`（已有 `pt_vsegment_plan`，无 spdiag 时再手工取一次）
+   - 用 `LOG(INFO)` 输出到与 `get_into_breakdown` 同一份日志，字段名 `vseg_plan_us` / `vseg_submit_us` / `vseg_wait_us`
+2. 编译走已验证路径：`cmake --build` 该目标 → `ar r` 换库成员 → 重链（NOF-048：约 65s/轮）
+3. **必须保留原文件副本**（`client_service.cpp.orig`），测完回滚；回执写明是否已回滚
+4. 跑 400 keys，取这三个字段的 `p50 / p90 / mean`
+
+## C. 判据（两边都写，对账 vseg `read_us` ≈ 426µs）
+
+| 结果 | 判定 | 下一步 |
+|---|---|---|
+| **`wait` ≥ 70%** | 时间花在**等设备** | 结合 target W9 的 1.95×（NOF-052）⇒ 设备侧确实慢；而 IO 命令已被证完全一致（NOF-073）⇒ **只剩「IO 到达时序」，继续查提交节奏** |
+| **`submit` ≥ 30%** | **提交本身有开销** | 查 `submitVSegment` 内的 `openSegment` 循环与 lane 分配 |
+| **`plan` > 30µs** | 开发侧「3–5µs」的估算**错了** | 重新评估 `13b7c19` 那条修复的价值 |
+| 三者之和远小于 `read_us` | 还有未覆盖段 | 如实写明差额，不要硬凑 |
+
+## D. 回执必答（第一行）
+
+走了 B1 还是 B2；三个点位的 `p50`（或均值）与占比；`wait` 是否 ≥70%；三者之和 vs `read_us` 的对账；SpDiag 层（Layer0/1）与 `spdiag` 是否存在；有无失败；**新增写入 LBA 与 oplog 增量**；若走 B2，源码是否已回滚。
+
+## E. 边界
+
+- **禁止改 target、禁止重启 target**（PID 905586 / md5 `3129641f…` 不变）。
+- **禁止改共用 etcd、禁止删任何 `/oplog` 前缀、禁止重启 master。**
+- B1 **零改码、零重编**；B2 允许改 `client_service.cpp` 一个文件，**必须备份并回滚**，不得改其他文件。
+- 400-key 口径，写入量 ≤ 400 keys；写入前查 etcd 余量（当前 150 MB）。
+- 不碰他人进程；产物 `run/nof091_*.txt`（≤3 个、每个 ≤1MB）。
+- 若 A 段发现 spdiag 不存在、且 B2 编译失败 3 次 ⇒ **停手如实回执**，给失败日志尾部 50 行，不要自行改方案。
 
 ---
 
