@@ -5553,6 +5553,7 @@ read_overhead_us = read_us - known_read_us    // read_us <= known 时为 0
 
 ## A. 前置核实（只读，30 分钟）
 
+0. **先算升级跨度**：0，并给 。**若跨度 >150 个提交或 >500 个文件变更 ⇒ 在 A0 停手**，回执写明跨度过大、不建议整体升级，改为只 cherry-pick A2 列出的四条。
 1. 记录当前**在用**的客户端二进制 md5、其 Mooncake git HEAD、SPDK 版本
 2. 去远端仓库列出 `be10be2..HEAD` 之间**涉及读路径**的提交（`mooncake-store/src/vsegment/`、`transfer_task.cpp`、`client_service.cpp`、`real_client.cpp`），逐条给 hash + 标题 + 一句话影响
 3. **关键约束核实**：**SPDK wire 版本必须保持 v4**（`e12b7cb` / `bd5ee124d` / `170cbb9`）。历史上 `9a413a44` / `91763b015` 是 wire **v6**，与运行中 target `e12b7cb` 握手失败（rc=-71/-104，NOF-050）。**若新版 Mooncake 强制要求 v6 SPDK，则本单在 A3 停手**，回执写明"升级被 wire 版本阻塞"，不要尝试重启 target
@@ -5567,6 +5568,14 @@ read_overhead_us = read_us - known_read_us    // read_us <= known 时为 0
 > |---|---|---|
 > | `4c0ea28` | 「远端 tip，含 ff3e853 / 13b7c19 等读路径修复」 | **只是一个测试提交**：`test(vsegment): cover nof_logical_used gauge and RETIRED exclusion`，改 `vsegment_test.cpp`，+55 行 |
 > | 「远端 tip」 | `4c0ea28` | **`bf3b95a`（2026-11-24）**，比 4c0ea28 新得多 |
+>
+> **分支归属（已用 `git ls-remote` 核实，2026-11-24 20:35）**：
+> - `bf3b95a` = **`refs/heads/main` 的 HEAD**（仓库共 93 个分支，无 `master`，默认分支就是 `main`）
+> - `be10be2` **也在 main 上**（没有任何分支的 HEAD 指向它，说明它是 main 历史中的一个提交，不是侧分支）
+> - ⇒ **升级路径干净：就是沿 `main` 从 be10be2 往前走，不需要跨分支合并**
+> - 唯一相关侧分支是 `codex/segment-pool-nof-placement-cleanup`（`fd93f9f`），**不是我们用的，不要去那个分支**
+>
+> **一个很有说服力的细节**：`be10be2` 自己的标题是 `[Bugfix] Register NoF VSegment benchmark buffers`，它引入了 `--vsegment_nof_io` 这个 flag（NOF-088 用的就是它）。**⇒ 我们的基线版本恰好是「为了让 vsegment bench 能跑」而打的那个提交**，功能刚打通，未必经过性能优化。
 >
 > **⇒ 本单目标版本定为 `bf3b95a`（main HEAD，2026-11-24）。** 若拉取时 HEAD 已前进，**允许取最新 HEAD，但必须在回执写明实际用的 hash**。
 >
