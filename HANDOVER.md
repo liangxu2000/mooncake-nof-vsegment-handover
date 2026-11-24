@@ -118,7 +118,7 @@
 - **计划与假设（H1–H4）、里程碑（M0–M4）、验收与回退**：见 `第二阶段/README.md`（第二阶段所有内容统一放在 `第二阶段/`）。
 - **M0（NOF-047）已完成**：复制并校验 Mooncake/SPDK 源码与 build（8.82GiB，md5 全 MATCH）。
 - **最小重建（NOF-048）已验证**：改一个 .cpp → 编译 61s → `ar r` 换库成员 → 重链 4s，产物 `--help` 正常；M1/S2 的代码迭代成本约 65s/轮。
-- **2026-11-23 复盘纠偏**：发现两处高价值线索——①构建基线 **be10be2 已落后远端 tip 4c0ea28**（含 `ff3e853` 诊断 opt-in/低时延默认、`13b7c19` 去重复校验等读路径修复）；②旧构建 `MC_HIFREQ_LOG_SAMPLE_RATE` **默认 1.0**，per-task 计时/breakdown 日志默认全开（tip 的提交明确说这会抬高读时延），而我们**从未测过"诊断全关"的 vseg**。
+- **2026-11-23 复盘纠偏**：发现两处高价值线索——①构建基线 **be10be2 落后于上游**（**2026-11-24 20:31 更正**：原文「tip 4c0ea28」有误 —— `4c0ea28` 只是一个 vsegment 单测提交；实际 main HEAD 已是 `bf3b95a`(11-24)。读路径相关提交含 `ff3e853` 诊断 opt-in、`13b7c19` 去重复校验、**`3838892` submit watermark 用错 channel 数**、**`f3b8101` 批量状态查询改非阻塞**、**`d3fd032` SSD prefetch**）；②旧构建 `MC_HIFREQ_LOG_SAMPLE_RATE` **默认 1.0**，per-task 计时/breakdown 日志默认全开（tip 的提交明确说这会抬高读时延），而我们**从未测过"诊断全关"的 vseg**。
 - **S0 结果（NOF-049，已完成）**：诊断全关 W9 仅 **258.85→251.75µs（−2.7%）** ⇒ 默认诊断/客户端背压排除。
 - **S2 复核（2026-11-23）**：be10be2→4c0ea28 的 `transfer_task.cpp` 仅 40 行改动（诊断 gating/UB poll 默认），**NoF 读提交/QoS/分块未变**；其余为客户端/写路径 ⇒ 构建 tip 对 210µs 的预期收益低，暂缓。S1（本机裸读）降为可选参照（vseg/plain 对比都在本机，宿主混淆不改变结论）。
 - **M1a（NOF-050）已构建成功但被版本阻塞**：补丁/编译/链接全部成功（`bench-io-params` md5 fc2b5129…），但新 bench 的客户端 SPDK 是 **9a413a44**，运行中 target 是 **e12b7cb**，握手失败（rc=-71/-104）；同事原 bench（匹配 e12b7cb）同参数正常（P50 473.52 / W9 259.77，**reader 在 node1 远端**，与 NOF-040 本机 274 不可比）。
@@ -5557,6 +5557,31 @@ read_overhead_us = read_us - known_read_us    // read_us <= known 时为 0
 2. 去远端仓库列出 `be10be2..HEAD` 之间**涉及读路径**的提交（`mooncake-store/src/vsegment/`、`transfer_task.cpp`、`client_service.cpp`、`real_client.cpp`），逐条给 hash + 标题 + 一句话影响
 3. **关键约束核实**：**SPDK wire 版本必须保持 v4**（`e12b7cb` / `bd5ee124d` / `170cbb9`）。历史上 `9a413a44` / `91763b015` 是 wire **v6**，与运行中 target `e12b7cb` 握手失败（rc=-71/-104，NOF-050）。**若新版 Mooncake 强制要求 v6 SPDK，则本单在 A3 停手**，回执写明"升级被 wire 版本阻塞"，不要尝试重启 target
 4. 记录 target 现状：PID 905586 / md5 `3129641f…` / 4457。**本单全程不重启 target**
+
+
+> **【2026-11-24 20:31 版本目标修正 · 覆盖本单任何「含上述修复的版本」表述】**
+>
+> **开发侧查证 GitHub（kvcache-ai/Mooncake），两处必须更正：**
+>
+> | 项 | 原记录（错） | 实际 |
+> |---|---|---|
+> | `4c0ea28` | 「远端 tip，含 ff3e853 / 13b7c19 等读路径修复」 | **只是一个测试提交**：`test(vsegment): cover nof_logical_used gauge and RETIRED exclusion`，改 `vsegment_test.cpp`，+55 行 |
+> | 「远端 tip」 | `4c0ea28` | **`bf3b95a`（2026-11-24）**，比 4c0ea28 新得多 |
+>
+> **⇒ 本单目标版本定为 `bf3b95a`（main HEAD，2026-11-24）。** 若拉取时 HEAD 已前进，**允许取最新 HEAD，但必须在回执写明实际用的 hash**。
+>
+> **从 `be10be2` 到现在，与读延迟直接相关的提交（按可疑度排序，A 段必须逐条核实是否影响我们的路径）：**
+>
+> | commit | 标题 | 为什么可疑 |
+> |---|---|---|
+> | **`3838892`** | `[Bugfix][TransferEngine] Fix UB transport submit watermark using wrong per-endpoint channel count` | **提交水位用错 channel 数 ⇒ 限流计算错误 ⇒ 直接影响 IO 提交节奏**。这是我们 60+ 轮都碰不到的层，且完全能解释「整体右移而非长尾」 |
+> | **`f3b8101`** | `[Integration][TE] Support non-blocking whole-batch and vectorized status checks with BatchID validation` | 批量状态查询改非阻塞 ⇒ 直接影响 `read_us`（我们的 `read_us` 就是「提交 + 等完成」） |
+> | **`d3fd032`** | `[Store] Enable SSD prefetch for standalone mooncake_client` | SSD 预取，直接关系读延迟 |
+> | `13b7c19` | `vsegment: skip duplicate view validation` | 已量化仅 **3–5µs（约 1%）**，不是主因，但顺手带上 |
+>
+> **A 段必答**：上述四条各自的改动文件与函数；`3838892` 改的 transport 是否覆盖 **URMA**（我们用的），还是仅 UB；`f3b8101` 改的是否是我们走的 `get_into` → `execute_ranged_read` 路径。
+> **若 `3838892` 限定 UB-only、且其余三条都不作用于 `get_into`** ⇒ **本单价值大幅下降，允许在 A 段停手**，回执写明理由。
+
 
 ## B. 构建新版客户端（不改 target）
 
