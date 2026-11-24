@@ -4406,3 +4406,55 @@ A 段用哪条路径解阻（及是否发生 A3 写入）；B 段四遍交错的
 ## 回执必答（第一行）
 
 A 段 `opc/FUA/NLB/LBA` 是否完全相同；是否进入 B；若进入 B，命令字节差异在哪一位/哪种描述符形态；到达时序分布；差异的确切载体与产生层；M3-11 方向；有无失败。
+
+---
+
+# NOF-074（待执行 · M3-11：命令描述符插桩（PRP/SGL + 缓冲地址）· **需改码+重编+重启+一次写入** · 2026-11-24）
+
+## 0. 前置判决与唯一剩余候选
+
+- **命令 dword 层已比空**（NOF-073）：两臂 `opc=2` 100%、`dw12 bit14 (FUA)=0` 100%、`NLB=256`、`dw10/dw11` 的 1,164 个盘内 offset **元素级完全一致**（only_A=only_B=0）⇒ 命令的 **LBA/NLB/opcode/FUA 全同**。
+- 已排除（累计）：数据与写历史（NOF-061 同数据 plain 读 57µs）、时间/设备漂移（四遍 1.01× spread）、设备冷稳两态（各臂零漂移）、qd/在飞/访问流/父 IO 长度/轮询/回调。
+- ⇒ **唯一剩余：`cmd[0]` 的 PSDT（PRP vs SGL）/描述符形态（PRP1/PRP2、SGL 段数与首地址、缓冲地址本身）或到达时序。**
+- 附带事实（NOF-073 免费挖到，可用于交叉验证）：同 LBA 比值 p50 4.31×，**ratio<1.5× 的 LBA 恰占 24.4%**（283–284/1,164），与盘首慢窗口占比（392MiB/1.6GiB=24.5%）吻合；plain 慢 LBA 相邻步长 256 块 ×241 ⇒ 慢区连续（每盘 ~30MiB）；11 块盘逐盘均值 plain 95.8–100.1 / vseg 231.6–235.9 ⇒ **无盘级差异**。
+
+## A. 前置（只读，全部通过才进 B）
+
+1. **共用机核查**：`ss -tnp | grep 4457` 列出所有连到 target 的客户端；**若有非我方客户端挂着，停手回报**（重启会中断他人）。记录 `royi` 的 master(50151/18080) 与 client(8975) 是否与我们 4457 有关系。
+2. 记录 target 487638 的 md5/pid/cmdline/environ、`/tmp/nvmf_tgt.log` offset、当前 RPC 全量、11 盘 BDF 顺序。
+3. 回退锚点：`nof059` = `979f5517…` + 原 RPC 文本；确认 `spdk-e12b7cb-src` 源码树干净（无遗留 nof064 补丁；若 .nof064orig 存在需说明以哪份为基线）。
+
+## B. 插桩（**只加日志**，环形数组，非 reactor 线程落盘）
+
+1. 点位：`lib/nvme/nvme_pcie_common.c` 写 SQ 之前（与 `NVME_PCIE_SUBMIT` 同处）。
+2. 每条记录（定长，≤96B）：`submit_tick, lcore, qpair, cid, nsid, lba, nlb, cmd[0] 原 4 字节, psdt, prp1, prp2, sgl_addr/sgl_cnt(若 SGL), iov_cnt(若可得), buf_va`。
+3. 环形数组 ≥200,000 条；**禁止 per-IO printf**（NOF-064 教训）；独立 pthread 每 3s 追加落盘 `/tmp/nof074_desc.bin`。
+4. 采样：全量（400 keys × 32 = 12,800 IO/遍，够）；开关 `NOF074_DESC=1`，关闭时零开销。
+5. 编译产物 `build/bin/nvmf_tgt.nof074`；**保留 nof059**。
+
+## C. 重编 + 重启 + 写入（各一次）
+
+1. NOF-048 配方重编（改一个 .c → ~61s 编译 + 4s 重链）。
+2. 重启 target：同 RPC 重放 + `--num-trace-entries 262144` + `NOF074_DESC=1`；验收同 NOF-068 B4（4457/RAID0 11 盘/transport/tracepoint）；**11 盘 vfio 残留 ABORT 用 takeover `-r -y` 还原**（已知路径）。若不通过 → 回退 `nof059` 停手。
+3. 新 cid `vseg_nof074` 写 400 keys（**唯一一次写入**，≤3 轮补齐）；验收 Keys=400、logical_used=1,677,721,600。
+4. 两臂**同宿主 node3** 各 1 遍 T1（400 keys、warmup=128、batch=1、verify=false）：vseg(`vseg_nof074`) + plain(`vseg_nofvseg`，读同一批 LBA)；每遍结束快照。
+
+## D. 解析与判决（必答）
+
+1. **`cmd[0]` 原始 4 字节**逐位比对（opcode/PSDT/FUSE/CID 类型）；`psdt` 分布。
+2. **描述符形态**：PRP（`prp1` 指向缓冲还是 PRP list、list 条目数）vs SGL（段数、首地址、是否 inline）；两臂分布对比。
+3. **缓冲地址**：`buf_va` 分布；用 `/proc/<target>/numa_maps` 分 **NUMA 节点 + 页大小（2MiB/4KiB）** 桶；两臂对比。
+4. **到达时序**：相邻 submit 间隔分布、瞬时并发（每盘/每 qpair）。
+5. **判决**：差异的确切载体（PSDT / PRP list / SGL 段数 / 缓冲物理归属 / 时序 / 全同）；若全同 ⇒ 明确写"命令与描述符全同，则只能是设备内部对同一输入的不同响应，需厂商侧介入"。
+6. M3-12 修复方向：改哪一层（客户端 buffer 分配 / target iobuf / SGL 组装），预期收益，验证口径。
+
+## E. 边界
+
+- 改码**仅限** B 段日志；禁改控制流/缓冲分配/SGL 策略/RPC 默认。
+- 写入仅 C3 一次；D 段零写入；不删 etcd 键。
+- 共用机：A1 若有他人客户端挂 4457 → 停手；重启只动我方 target。
+- 产物 `run/nof074_*.txt`（≤3 个、每个 ≤1MB）；完整 trace 放 `/tmp/nof074_desc.bin`。
+
+## 回执必答（第一行）
+
+是否获授权；A1 租户核查结果（4457 是否只有我方）；`cmd[0]`/`psdt` 两臂是否相同；PRP vs SGL 形态与段数差异；缓冲地址的 NUMA/页大小桶对比；到达时序；差异确切载体；M3-12 方向；有无回退。
