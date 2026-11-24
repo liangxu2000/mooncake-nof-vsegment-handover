@@ -97,7 +97,7 @@
 >
 > ⇒ **目前唯一「可重启且数据完好」的是 `plain_nof088`。任何新的 vseg 实验都必须新建 cid 重写数据。**
 
-- 当前任务：**两单并行** —— **NOF-091 续**（量 plan/submit/wait：允许重启 master 建 `vseg_nof091` 写 400 keys；不改全局 spdiag 配置，改连跑 ≥6 遍）与 **NOF-092**（只读取证：测试机源码的 remote/branch/HEAD/status，并判定 `d371e22` 是否为祖先）。**用户 21:02 确认 `d371e22` 为基准版本。**
+- 当前任务：**NOF-091 第三轮（用 `--warmup_keys=0` 绕过 SpDiag 的 128 样本配额）**。前两轮结论：B1 路线可行但每个点位只记前 128 样本，而 warmup 正好 128 个把配额吃满 ⇒ 抓到的全是冷启动数据。**推断 128 即配额，故用 warmup=0 让前 128 个样本落在测量段。** 判据看数值是否从 554µs 降到 ~300µs 量级。**同时必须建 `vseg_nof091`（400 keys），vseg 臂前两轮一轮都没跑。** NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
 - 历史：**NOF-091（拿 vsegment 的 plan/submit/wait 分解）**。用户 20:41 批准派任务。**优先零改码**：源码里三个 `SpDiag::PerfPoint` 埋点（`VSEGMENT_READ_PLAN/SUBMIT/WAIT`）已存在，若构建是 Layer 1 且 `spdiag` CLI 在，直接 `spdiag show` 拿数；否则才加 chrono 重编（65s）。
 - 历史（已暂停）：**NOF-090（版本对照：换掉 be10be2 看 2× 是否版本问题）**。实地核查确认：我们用的是 `LeeJace993/Mooncake` 的 **`nof-urma-v2-bench-merge`** 分支（HEAD `d371e22`，2026-10-23），**不是 kvcache-ai/Mooncake**；`be10be2` 不在我们的历史里；唯一可升的 1 个提交（`523256d`）只加 EID 配置，与性能无关。**这条线不存在「升一版拿回 2×」的选项。** 下一步待用户拍板（A 问同事 / B cherry-pick 上游修复 / C 接受现状）。
@@ -5772,6 +5772,58 @@ read_overhead_us = read_us - known_read_us    // read_us <= known 时为 0
 > ### 5. 回执必答补充
 >
 > 除原任务书 D 段外，追加：**测试机源码 HEAD 与 `git status` 是否仍为 `be10be29` dirty=3**；`client_service.cpp` L2170–2340 原文；两臂各跑了几遍、Ticks 是否随遍数增长；`vseg_nof091` 的 oplog 增量与 `Keys`。
+
+> **【2026-11-24 21:48 开发侧裁决 · 不改码，换 warmup=0 绕过 128 配额】**
+>
+> **本单的 L1 排除成立**：层（Layer 1）、CLI（`/usr/bin/spdiag`）、门控（`level_gate=0`）、点位（MODULE 级确有记录）已逐一排除；`SetupReal Ticks=1` / `RegisterBuffer Ticks=2` 证明**不是全局截断**；头文件里 `MAX_PERF_SLOTS=256`、`maxTopN=100` 都不是 128 ⇒ **128 是库内部按点位计的固定窗口**，无源码可查。**在「400 keys + warmup=128」这个用法下，spdiag 确实给不出测量段数据。**
+>
+> ### 1. 关键线索：128 = warmup_keys = 128，不是巧合
+>
+> `GetIntoInternal` 的 `Ticks` 恒为 **128**，而 bench 的 `--warmup_keys` 也正好是 **128**。
+> ⇒ **推断：SpDiag 每个点位只保留前 128 个样本（用于算分位数）；bench 先读 128 个 warmup key，正好把这个配额吃满，正式测量的样本一个都没进去。**
+> ⇒ 这解释了为什么抓到的是冷启动量级（avg 554µs / max 9.2ms），而不是测量段（avg 328–381µs）。
+>
+> ### 2. 绕过办法：`--warmup_keys=0`（**零改码、不改配置、一轮可得**）
+>
+> `--warmup_keys=0` 是合法参数（NOF-086 的 W0 那遍即为 0）。设成 0 后，**前 128 个样本直接落在测量段**。
+>
+> **执行**：两臂各跑一遍 `--warmup_keys=0`，其余口径不变（`--num_keys=400 --value_size=4MiB --batch_size=1 --num_threads=1`），全程 `spdiag watch --interval 200`，跑完取三个点位的 `Ticks / avg / p50`。
+>
+> ### 3. 判据（两边都写，必须看数值有没有变）
+>
+> | 跑 `warmup=0` 后 | 判定 |
+> |---|---|
+> | **Ticks 仍 128，但 avg/p50 从 ~554µs 降到 ~300µs 量级** | **假设成立，已拿到测量段数据** ⇒ 直接进第 4 步判 plan/submit/wait |
+> | Ticks 仍 128，数值仍是 ~554µs 那组 | 128 是别的机制，此路不通 ⇒ **退回 B2（改码加 chrono）**，不要再试 other 参数组合 |
+> | Ticks < 128 | 说明配额更小，如实记录，按实际样本数报 |
+>
+> ### 4. 拿到数据后的判据（同原任务书 C 段）
+>
+> | 结果 | 判定 |
+> |---|---|
+> | **`wait` ≥ 70%** | 时间花在等设备 ⇒ 结合 target W9 的 1.95× 与「IO 命令已被证完全一致」（NOF-073）⇒ **只剩「IO 到达时序」**，搜索面收窄到提交节奏 |
+> | **`submit` ≥ 30%** | 提交本身有开销 ⇒ 查 `submitVSegment` 内的 `openSegment` 循环与 lane 分配 |
+> | **`plan` > 30µs** | 开发侧「3–5µs」估算错了，须按 `be10be29` 实测重估 |
+> | 三者之和远小于 `read_us` | 仍有未覆盖段，如实写明差额，**不要硬凑** |
+>
+> ### 5. vseg 臂仍然必须建（本单未建，下轮补）
+>
+> 本单因判据判停未建 `vseg_nof091`，**下一轮必须建**：`slot=1` + vsegment enabled，写 **400 keys**（约 22 MB oplog，余量 150 MB），每轮复测 `dbSize`，增量 >100 MB 立即停；**不得重启 target**（PID 905586 / md5 `3129641f…`）。
+>
+> ### 6. 三个偏差的处理
+>
+> - **plain 第 3 遍异常**（P50 460.66 / Max 5213 / 1511 keys/s，其余 5 遍 289–324µs 稳定）：回执未能定位，且与 node1 他人 `cmake --build`（21:45:36）**时间对不上**（第 3 遍为 21:43:56）。**标注为噪声，不参与任何计算、不据此推断。**
+> - **oplog 字节口径**：本单按 value 计 757,092 B vs NOF-088 记录 899,149 B，差 142 KB（疑为 key 名/etcd 开销）。**两种口径并列标注、不混用**——这是正确处置。
+> - **`dirty=3` 归属更正**：`be10be29` 树 status=2（仅 etcd go.mod/go.sum）；`dirty=3` 属于我方副本 `mooncake-src`（多一条 `transfer_task.cpp` 日志插桩）。**NOF-091 首轮回执的归属表述有误，此处更正。**
+>
+> ### 7. 不选的选项
+>
+> 回执给的三个选项——①改走 B2 ②先查 128 机制 ③接受 warmup 比例——**暂都不选**：
+> - ① 在试过 warmup=0 之前不必付改码成本
+> - ② 需要 SpDiag 库源码，代价高且不带来性能结论
+> - ③ 只有比例结构、绝对值不可用，不足以支撑判据
+>
+> **先把 warmup=0 跑一遍，成本一轮，可能直接解决。**
 
 ## 0. 为什么派这单（开发侧已查到的关键事实）
 
