@@ -4305,3 +4305,55 @@ register 后 `/cvm/vseg_nof068b/` 的键清单与键数（是否含 segment 描�
 ## 回执必答（第一行）
 
 A1/A2 两宿主下 vseg 相对 plain 的倍数（target 内部 `t_cb−t_db` 与端到端各给一组）；客户端位置是否排除；bdev 层父 IO 长度两臂是否相同；缓冲地址/NUMA/iov 是否可得与是否相同；M3-8 假设排序；下一单最小插桩点；有无失败。
+
+---
+
+# NOF-072（待执行 · M3-9：解阻 vseg master（oplog 32MB）+ 交错 A/B + 冷稳状态检验 · 一次写入仅在必要时 · 2026-11-24）
+
+## 0. 前置判决（NOF-071）与两处新事实
+
+- **客户端位置排除**：同宿主 node3、同 bench、同 target、同 400 keys——vseg `t_cb−t_db` **242.6µs** vs plain **50.0µs** = **4.86×**；plain 从 node3→node1 只变 **1.03×**（50.0→48.5），且 plain 在 node1 两次测量 **1.00×** 复现。
+- **可外报的公平端到端**：同宿主 **608.83 vs 276.93µs = 2.20×**（P90 703.97 vs 570.01）。**NOF-069 的 2.57× 是跨宿主混比，作废**。
+- **父 IO 长度两臂完全相同**：`BDEV_IO_START.size` 全为 128KiB/256 块（vseg 33,792 / plain 33,792 条），层级 raid0→nvme 一一对应 ⇒ **「vseg 32×128K vs plain 1×4M」假设否证**。
+- **缓冲地址/NUMA/iov：`[未获取]`**——`bdev`/`bdev_raid`/`bdev_nvme` 三组 tpoint 无 base/iovcnt 字段；最小插桩点已定位 `lib/bdev/bdev.c:3851` 旁。
+- **产品级缺陷（新，需上报）**：`vseg_nof068b` 的 `/oplog/` 涨到 **2,801 批 / 58,545,043 B**，master 启动回放时 etcd gRPC 单消息 **32MB 上限**（35,087,559 > 33,554,432）触发 `ResourceExhausted`，75s 内重试 959 次、50056 从未 LISTEN ⇒ **该 cluster 无法再启动**。对照 `/oplog/vseg_nofvseg/` = 400 批 / 178KB（正常）。历史 cid（`vseg_nof061` 2,005 批）当时能启动，说明存在阈值。
+
+## A. 解阻（决策树，按序尝试；每步记录结果）
+
+1. **A1（首选，零破坏）**：`--enable_oplog=false` 起 `vseg_nof068b` master（只读实验）；验收 50056 LISTEN + mount rc[0] + `Keys=400`。若成功 ⇒ 进 B。
+2. **A2（仅删我方 oplog）**：删除 **仅** `/oplog/vseg_nof068b/`（保留 `/cvm/vseg_nof068b/`），正常启动；验收同上。**删前记录键数与字节数**。若 /cvm 快照足以恢复 mount ⇒ 成功。
+3. **A3（最后手段，需写入）**：新 cid `vseg_nof072`，**单遍**写 400 keys（`VSEGMENT_CREATING` 仍会丢 key，最多补 3 轮）；验收 Keys=400、logical_used=1,677,721,600。此步为**唯一允许的写入**，执行前需在回执首行标注"已按 A3 写入"。
+4. 三步都失败 ⇒ 停手回报，附 `etcdctl` 键数/体积与 master 日志。
+
+## B. 交错 A/B（同宿主 node3，核心）
+
+1. 顺序：**vseg → plain → vseg → plain**，各 1 遍 T1（400 keys、warmup=128、batch=1、verify=false、node3 本机）。
+2. 每遍开同一组 tracepoint、跑完立即快照 ring、`trace_clear` 再下一遍；记录每遍 `t_cb−t_db` p50/p90/mean 与端到端 P50。
+3. **判据**：四遍交错后 vseg 两遍是否仍 ≥4×（若是 ⇒ **时间/设备状态漂移排除**；若差距随次序变化 ⇒ 设备状态是主变量，需记录漂移方向）。
+
+## C. 冷/稳状态检验（同宿主）
+
+1. **plain 连读 2 遍**（不换 master、不重挂）：第 2 遍 `t_cb−t_db` 是否仍 ~50µs。
+2. **vseg 连读 2 遍**：是否仍 ~242µs；并给两遍的 `last_empty−t_db` 与 `obs−le`。
+3. 关联已知旁证：NOF-059 裸 SPDK **长扫 40µs** vs **单 key 4MiB 定点 218.88µs** ⇒ 设备存在"冷/稳"两态；本段要判 Mooncake 的两臂是否分别落在不同态。
+4. **判据**：若 plain 第 2 遍明显变慢（趋近 242）或 vseg 第 2 遍明显变快 ⇒ 强弱不在路径而在"设备被喂饱和的程度"，M3-9 方向随之改判。
+
+## D. 判决（必答）
+
+1. A 段最终用哪条路径解阻（A1/A2/A3），代价与风险。
+2. B 段四遍交错的 vseg 倍数（每遍给数字）⇒ 时间漂移是否排除。
+3. C 段冷/稳结论：plain 两遍、vseg 两遍各是多少；是否支持"设备两态"。
+4. M3-9 假设排序与下一步（若指向设备两态 ⇒ 给"如何把 vseg 喂进稳态"的可验证方案；若仍指向路径 ⇒ 给最小插桩点）。
+5. 产品级缺陷上报口径：oplog 阈值、复现条件、规避手段（不影响本单结论）。
+
+## E. 边界
+
+- target **不重启**（487638、nof059、`--num-trace-entries 262144`）；tracepoint 用完即关（mask→0x0）。
+- etcd：**只允许** A2 删除 `/oplog/vseg_nof068b/`（我方、单 cid）；不删 `/cvm/vseg_nof068b/`、不删 `vseg_nofvseg|vseg_nof061`、不 compact 全局。
+- 写入仅 A3 一次；B/C 段零写入。
+- 两臂**必须同宿主 node3**；每遍记录 bench md5 与 `hostname`。
+- 产物 `run/nof072_*.txt`（≤3 个，每个 ≤1MB）。
+
+## 回执必答（第一行）
+
+A 段用哪条路径解阻（及是否发生 A3 写入）；B 段四遍交错的 vseg/plain 倍数（逐遍）；C 段 plain 两遍与 vseg 两遍的 `t_cb−t_db`；时间漂移是否排除；设备两态是否成立；M3-9 方向；有无失败。
