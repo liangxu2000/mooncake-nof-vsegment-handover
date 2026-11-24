@@ -49,7 +49,8 @@
 >
 > ⇒ **目前唯一「可重启且数据完好」的是 `plain_nof088`。任何新的 vseg 实验都必须新建 cid 重写数据。**
 
-- 当前任务：**NOF-091（拿 vsegment 的 plan/submit/wait 分解）**。用户 20:41 批准派任务。**优先零改码**：源码里三个 `SpDiag::PerfPoint` 埋点（`VSEGMENT_READ_PLAN/SUBMIT/WAIT`）已存在，若构建是 Layer 1 且 `spdiag` CLI 在，直接 `spdiag show` 拿数；否则才加 chrono 重编（65s）。
+- 当前任务：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
+- 历史：**NOF-091（拿 vsegment 的 plan/submit/wait 分解）**。用户 20:41 批准派任务。**优先零改码**：源码里三个 `SpDiag::PerfPoint` 埋点（`VSEGMENT_READ_PLAN/SUBMIT/WAIT`）已存在，若构建是 Layer 1 且 `spdiag` CLI 在，直接 `spdiag show` 拿数；否则才加 chrono 重编（65s）。
 - 历史（已暂停）：**NOF-090（版本对照：换掉 be10be2 看 2× 是否版本问题）**。实地核查确认：我们用的是 `LeeJace993/Mooncake` 的 **`nof-urma-v2-bench-merge`** 分支（HEAD `d371e22`，2026-10-23），**不是 kvcache-ai/Mooncake**；`be10be2` 不在我们的历史里；唯一可升的 1 个提交（`523256d`）只加 EID 配置，与性能无关。**这条线不存在「升一版拿回 2×」的选项。** 下一步待用户拍板（A 问同事 / B cherry-pick 上游修复 / C 接受现状）。
 - 历史（已作废）：**NOF-090（版本对照：换掉 be10be2 看 2× 是否版本问题）**。开发侧决策：60+ 轮已排除 IO 层/命令层/客户端结构层；唯一未排除项是**版本落后**（`be10be2` 缺 `ff3e853`/`13b7c19` 等读路径修复）。源码里那处「重复 view 校验」已量化仅 **3–5µs（约 1%）**，不构成主因、不值得单独重编。
 - 历史任务位：**无 —— 口径已回 400 keys（见上方口径决议），待用户定向下一单**。NOF-089 已完成：`read_us` 内部无 breakdown 埋点，**拆解失败**（offload 三子项恒 0，`read_overhead_us` ≡ `read_us` 是恒等式），要细分需新增插桩（改码）。
@@ -5677,6 +5678,51 @@ read_overhead_us = read_us - known_read_us    // read_us <= known 时为 0
 ---
 
 # NOF-091（**拿 vsegment 内部分解：plan / submit / wait** · 优先零改码 · 2026-11-24 20:42 派）
+
+> **【2026-11-24 20:55 开发侧裁决 · 两个阻塞都放行 · 并更正一个前提】**
+>
+> **A 段结论成立，B1 路线技术可行**：`MOONCAKE_ENABLE_SPDIAG=ON` / layer=system / `/usr/bin/spdiag` 在位 / bench 链接 `libspdiag.so.1` / MODULE(3) 点位有值 ⇒ **埋点是活的**，这条路能走。
+>
+> ### 1. **必须先更正一个前提：测试机源码 ≠ 开发侧分析用的源码**
+>
+> 回执「源码树 **be10be29** dirty=3」 ⇒ 测试机用的是 `be10be29`。
+> 而开发侧本轮所有源码分析，用的是本地副本 `D:\gds性能\repos\Mooncake`（`d371e22`，2026-10-23）。
+> **⇒ 两者不是同一份代码。** 此前基于本地副本得出的三个判断（`Plan` 重复校验仅 3–5µs、`openSegment` 只是 map 查找、两臂提交方式一致）**降级为「待核」，不得再作为定案依据**。
+>
+> **本单 C 段补做**：把测试机上 `client_service.cpp` 的 vsegment 分支原样贴出（约 L2170–2340 共 170 行），开发侧逐行比对后再重新定性。
+>
+> ### 2. 阻塞 1（vseg 臂无数据源）→ **放行重启 master**
+>
+> 前提已满足：plain 臂数据够了（NOF-088 四遍 + 本单两遍）。
+>
+> 1. **先固化** `plain_nof088` 状态：`Keys=2000`、`/oplog/plain_nof088/` = 2,001 entries / 899,149 B、`dbSize` 现值。**它的 oplog 只有 899 KB，随时可切回**，风险远低于 `vseg_nof086`（942 MB 不可重启）
+> 2. 新建 `vseg_nof091`（`slot=1`，vsegment enabled），写 **400 keys**（预计 22 MB oplog；余量 150 MB）
+> 3. **写入用 400 keys 上限**，不得超；每轮复测 `dbSize`，增量 >100 MB 立即停
+> 4. 切 cid 前后**不得重启 target**（PID 905586 / md5 `3129641f…` 必须不变）
+>
+> ### 3. 阻塞 2（采样窗口不足）→ **不改全局配置，改用「多跑几遍」**
+>
+> 回执推断「dump 周期 1000ms，400-key 读流仅约 0.5s，进程在第二次 dump 前退出」——**推断合理。**
+>
+> **禁止改 `/etc/spdiag/spdiag.conf`**（系统级共享，会影响其他用 SpDiag 的进程；本单未获此授权）。
+>
+> **改用**：同一口径**连跑 ≥6 遍**（每遍约 0.5s ⇒ 累计 ≥3s，跨过 ≥3 个 dump 周期）。
+> - SpDiag 计数是**累积**的，多遍会累加，取均值仍有效；**口径不变**（仍 400 keys × 4 MiB、warmup=128、batch=1、thread=1）
+> - 跑完**立即** `spdiag history` / `show` 取最终累计值，再与 bench 报的每遍 P50 对账
+> - **两臂都要跑 ≥6 遍**（plain 也补跑，使口径对称）
+>
+> **判据（两边都写）**：
+> - 若 `Ticks` 随遍数增长（≥128 + 400×遍数）⇒ 窗口问题解决，取测量段数值
+> - **若 Ticks 仍恒为 128（不随遍数增长）⇒ 说明 SpDiag 对 MODULE 点位有独立上限或只记首块，属另一问题**：如实回执并**停手**，不要为凑数去改配置或改口径
+>
+> ### 4. warmup 段那组数据仍保留价值（但要标口径）
+>
+> 本单抓到的 `Submit[G]=4,857ns` / `Wait[G]=441,661ns` ⇒ **wait 占 97.8%**，与「时间花在等设备」一致。
+> **但必须标注**：那是 warmup 段（冷启动），该遍 avg 554µs / max 9.2ms，而测量段 avg 328–381µs / max 695–815µs ⇒ **绝对值偏大，只有比例结构可参考**，不得与测量段数值混用。
+>
+> ### 5. 回执必答补充
+>
+> 除原任务书 D 段外，追加：**测试机源码 HEAD 与 `git status` 是否仍为 `be10be29` dirty=3**；`client_service.cpp` L2170–2340 原文；两臂各跑了几遍、Ticks 是否随遍数增长；`vseg_nof091` 的 oplog 增量与 `Keys`。
 
 ## 0. 为什么派这单（开发侧已查到的关键事实）
 
