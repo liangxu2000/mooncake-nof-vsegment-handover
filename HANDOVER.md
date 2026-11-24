@@ -6,12 +6,12 @@
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
 - 最后更新：2026-11-24
-- 当前任务：**NOF-086（真写 2000 keys · 待执行）**。用户 2026-11-24 17:26 授权「就写 2000」；开发侧决定先写后诊断。
-- **NOF-085 暂缓**：其 B 段要切 master，与本单「全程不重启 master」冲突；待 NOF-086 完成后再恢复。
+- 当前任务：**NOF-083（流长实验 · 已放行 · 全段零写入）**。NOF-086 已完成（2000 keys 写成，验收通过，见该单裁决块），`vseg_nof086` 冻结为只读资产。
+- **NOF-085 已被 NOF-086 裁决取代**：A 段的 `--max-request-bytes` 定位**已被源码证否**（见 NOF-086 裁决 §7），真正的墙是 Mooncake 客户端 `storeMaxMsgSize = 32MiB`。原单作废，改由 NOF-087 核版本常量。
 - **NOF-084 的「外推 >24MB 即停手」判据已撤销**（24.2MB 下限假设 1 entry/key，与实测 7 entries/key 矛盾）。
 - **NOF-084 已完成（主动停手，L0）**：2000 keys 未写入；100 keys 预检实测 84.8KB/key，2000 keys 外推 24.2–169.6MB 全部超 24MB 阈值。见该单顶部裁决块。
-- **口径整改目前阻塞**，方向（snapshot / 改共用 etcd / 分片 / 降 keys / 改码）待用户裁决；NOF-085 只做只读诊断，不改配置、不改码。
-- **NOF-083 暂缓**：其 C/D 段依赖 400-key cid，且「start ≥2048MiB 在数据区之外」边界在 2000 keys 下失效（卷 2048MiB → 盘内 186.18MiB，落在新的 0–727.27MiB 数据区内）。整改后重派或改写。
+- **口径整改阻塞已解除**：阻塞根因是 Mooncake 客户端常量，**不需要改共用 etcd**。修复方案 A/B/C 见 NOF-086 裁决 §7；改码需用户授权，未授权前不执行。
+- **NOF-083 已放行**：C/D 段复用已有 trace，A 段在裸 SPDK 读；边界已从 `start ≥ 2048MiB` 修正为 **`start ≥ 8000MiB`**（= 盘内 727.27MiB，在 NOF-086 新数据区外）。**全段零写入，不增一个字节 oplog。**
 - **口径隔离**：2000-key 结果与全部 400-key 历史数字不得混用 / 并列 / 做比值。
 - NOF-082 **已完成，结论部分修正**：慢程模型成立；B 段「形态不同⇒根因」判据撤回（见该单顶部裁决块）。
 - NOF-081 **已完成，结论部分被拒**：A 段判决与 C 段「对外表述定稿」已作废（见该单顶部裁决块）。
@@ -5087,7 +5087,7 @@ N 的不变量结论（按字节 / 按 IO / 按时间）；A3 三段定义与冲
 ## F. 边界
 
 - 零改码、零重编、**零重启 target**（PID 905586 / md5 `3129641f…` 保持）；trace mask 末态 `0x0`。
-- **严禁写 `vseg_nof080`**（oplog 22MB，距 etcd gRPC 32MB 墙约 9MB），不重建该 cid；preflight 不可关 ⇒ 所有 `start ≥ 8000MiB`（**2026-11-24 18:51 修正**：NOF-086 已把每盘 0–727.27MiB 写满，原 `start ≥ 2048MiB` 换算到盘内仅 186.18MiB、已落入新的 2000-key 数据区；`start ≥ 8000MiB` = 盘内 727.27MiB，正好在数据区外）。本单零写入，读不改变任何数据。
+- **严禁写 `vseg_nof080`**（oplog 22MB，距**客户端 32MiB recv 上限**约 10MB）、**严禁写 `vseg_nof086`**（oplog **942MB**，已永久不可重启；etcd 余量仅 **316MB**，一轮补写即可吃光）；**不重建任何 cid、不切 cid、不重启 master**；preflight 不可关 ⇒ 所有 `start ≥ 8000MiB`（**2026-11-24 18:51 修正**：NOF-086 已把每盘 0–727.27MiB 写满，原 `start ≥ 2048MiB` 换算到盘内仅 186.18MiB、已落入新的 2000-key 数据区；`start ≥ 8000MiB` = 盘内 727.27MiB，正好在数据区外）。本单零写入，读不改变任何数据。
 - 不碰他人进程；产物 `run/nof083_*.txt`（≤3 个、每个 ≤1MB）；结论只写「观测 + 是否支持判据」。
 
 ---
@@ -5297,6 +5297,47 @@ N 的不变量结论（按字节 / 按 IO / 按时间）；A3 三段定义与冲
 > 2. **禁止切换 cid / 重启 master。** 一重启就触发 942MB 回放 ⇒ 集群报废（产品缺陷 ③）。
 > 3. **etcd 余量 = 316MB**（1,187,229,696 / 2GiB = 55%，70% 线余 316MB）。**任何新一轮补写都可能一次吃光**（R3 单轮 810MB）。⇒ 定位超线性增长机制前，**禁止任何写入型实验**；只读实验不受限。
 >
+> ### 7. **C11 定案（L3）：墙在 Mooncake 客户端，不在 etcd** —— 源码已定位（2026-11-24 19:00）
+
+用户 18:55 批准后，开发侧直接 grep 本地源码（`D:\mooncake-spdk-gap\_ref\Mooncake`，HEAD `706551a`，2026-11-03），得到完整因果链，**每一环都有文件:行号**：
+
+| # | 环节 | 证据 |
+|---|---|---|
+| 1 | 启动回放入口 | `master_service.cpp:16878 TrySelfRecoverFromOpLog()`；外层 `kMaxSelfRecoverAttempts = 3`、间隔 200ms |
+| 2 | 回放主体 | `master_service.cpp:16767 RecoverStateFromOpLogStream()`；`kMaxPollRounds = 4096`、`kMaxReplayWallClock = 30s`、RETRYABLE 时 `sleep 50ms` |
+| 3 | 每轮拉取 | `master_service.cpp:16822 reader.PollOnce()` —— **未传参** |
+| 4 | 默认批数 | `oplog_batch_standby_reader.h:37 PollOnce(size_t max_batches = 1024)` ⇒ **1024 批/轮** |
+| 5 | 落到存储层 | `oplog_batch_standby_reader.cpp:90 storage_.ReadBatchesAfter(last_applied_batch_id_, max_batches, batches)` |
+| 6 | **单条 etcd Range** | `oplog_batch_storage.cpp:234 backend_.Range(begin_key, range.end_key, remaining, kvs)`，`remaining = limit - 已拉数` ⇒ **一次请求最多拉 1024 个 KV** |
+| 7 | **客户端上限** | `mooncake-common/etcd/etcd_wrapper.go:96 storeMaxMsgSize = 32 * 1024 * 1024 // 32MB`；`:105-106` 赋给 `MaxCallSendMsgSize` / `MaxCallRecvMsgSize` |
+| 8 | 数值吻合 | `32 x 1024 x 1024 = 33,554,432` = NOF-071 报错值，**精确相等** |
+| 9 | 重试为何 959 次 | `Range` 失败 ⇒ `ETCD_OPERATION_ERROR` ⇒ `IsRetryableBackendError` → RETRYABLE（`oplog_batch_standby_reader.cpp:13-16`）⇒ sleep 50ms **再发同一请求** ⇒ 959 × 50ms ≈ 48s，与 NOF-071 的 75s（≈ 2.5 × 30s 预算）吻合 |
+| 10 | 终态 | 3 次外层全败 ⇒ `LOG(ERROR) "self oplog replay failed ... fall back to empty state"` ⇒ `return false` ⇒ serve 前失败 ⇒ **50056 从未 LISTEN** |
+
+**语义辨析（这正是 NOF-084 回执归错的地方）**：
+- etcd `--max-request-bytes=33554432` 管**请求**。回放是纯读，请求只有 begin/end key + limit，**不可能 35 MB** ⇒ **etcd 那个 32 MiB 与本次故障无关**。
+- 响应体 35,087,559 B 是从 etcd **读出**的数据，撞的是客户端 `MaxCallRecvMsgSize`。
+- 两者数值相同（都是 32 MiB），**纯属巧合**（都取了「32MB」这个整数），靠数字无法区分，必须靠语义。
+
+**⇒ 结论：`vseg_nof068b` 与 `vseg_nof086` 起不来，责任在 Mooncake 客户端 `storeMaxMsgSize = 32MiB`，与共用 etcd 无关。改这个常量不影响任何人。**
+
+**根因（比常量更深一层）：单次拉取量按「批数」控制，而不是按「字节数」控制。**
+- 批的大小是可变的：NOF-086 实测 entry 均体积逐轮 **2,311 → 28,719 → 206,301 B（89×）**。
+- 固定 1024 批 ⇒ 字节数完全不可控：NOF-068b 前 1024 批 = 35,087,559 B（34,265 B/批）；NOF-086 均 67,637 B/批 ⇒ 估计 **69 MB**。
+- **按批数限流是个错误的抽象**——这正是它必然被写爆的原因。
+
+**修复选项（均需改码授权，本单不执行）**：
+
+| 方案 | 改动 | 效果 | 风险 |
+|---|---|---|---|
+| **A 降批数** | `PollOnce(128)`，或把 header 默认值改小 | 单次 4.4 MB（按 34,265 B/批）；NOF-086 的 13,930 批需 109 轮 << 4096 上限 | 低；功能无损 |
+| **B 按字节预算截断（推荐·治本）** | `ReadBatchesAfter` 加 `max_bytes`，累计到 8 MiB 即停 | 与批大小无关，永不超限 | 中；改函数签名 |
+| **C 提高上限** | `storeMaxMsgSize` → 2GB（对齐 `snapshotMaxMsgSize`） | 一行改动 | **单独不可行**：NOF-086 的 942MB oplog 一次拉 1024 批也要 ~69MB 内存，仍需配合 A/B |
+
+**一个必须点明的设计矛盾**：同一份文件里 `snapshotMaxMsgSize = 2000 * 1000 * 1000 // 2GB`（`etcd_wrapper.go:85`，注释 "for GB-level snapshot files"）——**作者自己知道 GB 级数据要单独开一条大额度通道，只是没把同样的思路用到 oplog 回放上**。⇒ 这不是「做不到」，是「没做到」。
+
+> **版本缺口（必须如实标注）**：以上行号取自本地 `706551a`。生产部署为 `be10be2`，**未逐行核对**。若 `be10be2` 中 `storeMaxMsgSize` 不是 `32 * 1024 * 1024`，则本结论失效 —— 但 `333554432` 与报错值精确相等，且调用链的 1024/4096/30s/50ms 四个数字与 NOF-071 时序全部吻合，巧合概率极低。**NOF-087 第一步就是核这个版本的常量值。**
+
 > ### 6. 产品缺陷 ③ 证据强度升级
 >
 > 原先只有一例（`vseg_nof068b` 58.5MB）。现在多了 **942MB** 一例，且是在**常规用量**下产生（2000 个 4MiB key，非极端配置）。
