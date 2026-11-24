@@ -5433,6 +5433,21 @@ read_overhead_us = read_us - known_read_us    // read_us <= known 时为 0
 **两边日志都还在**：vseg 侧 `run/nof086_read.log.gz`（21MB）、plain 侧 `run/nof088_read.log.gz`（17.6MB），字段是同一套 19 项。
 ⇒ **不需要跑任何新实验，就能定位 2.58× 落在哪一段。** 这比「验证 2 倍是否成立」有用：验证只回答「是不是」，拆分回答「在哪」。
 
+## A0. **零值预检（必做第一步，防白工）**
+
+> **开发侧新发现的风险（2026-11-24 19:45）**：这四个子项**只在 offload 路径里赋值**（`real_client.cpp:7359/7397/7422/7458`，均由 `if (current_offload_read_timing)` 保护，而该指针只被 `ScopedOffloadReadTiming` 设置）。
+> 而 `mode` 字段**不是** offload/full 的意思 —— `real_client.cpp:4486` 是 `(src_offset==0 && actual_size==total_size) ? "full" : "range"`，即**「整对象 vs 部分对象」**，与走不走 offload 无关。
+> ⇒ **`mode[full]` 完全不能证明 offload 字段非零。本单必须先在 A 段验证，否则可能拆出 `0/0/0/426` 这种零信息量结果。**
+
+1. **各抽 3 条完整日志原文**（vseg 侧 3 条、plain 侧 3 条），原样贴出，不要摘要
+2. 逐条读 `offload_rpc_us` / `transfer_data_us` / `release_buffer_us` 三个值
+3. **判据（硬）：**
+   - **三项在两侧、六条样本里全为 0** ⇒ **立即停手**，回执第一行写「offload 三子项恒为 0，split 无信息量」+ 贴那 6 条原文，**不要执行 B/C 段**
+   - 三项中**至少一项非零** ⇒ 继续 B/C 段
+4. 同时记录两侧 `mode` 与 `type` 的实际取值（用于说明为什么走/不走 offload）
+
+> 若三项全 0，说明耗时全在 `read_overhead_us`（= `read_us`），那本单的替代价值是：**确认 2.58× 不在 RPC/传输/释放这三段**，方向应转向 `execute_ranged_read` 内部或 target 侧。这一点在停手回执里写明。
+
 ## A. 提取（纯离线，用已有日志）
 
 1. **vseg 侧**：取 `nof086_read.log.gz` 的 **W0 段**（`warmup=0`，2000 条完整，无预热混入）。
