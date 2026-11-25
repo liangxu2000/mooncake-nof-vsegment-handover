@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-099（host 侧 URMA attach EPERM 诊断；只读 + 旧 bench 对照；不重启 target、不换设备、不清理资源）**。NOF-098 已否证“vseg 8 参数导致失败”：今日 plain 模式同样 `Operation not permitted / rc=-19 / opened=0`；最后一次成功是 2026-11-24 19:30，首次失败是当日 21:55，此后 plain/vseg 全失败。target 905586 自 11-24 12:21 未重启、subsystem/4457 正常、零错误；node1 `/dev/uburma/udmac0d1e2` 节点今日被重建。NOF-099 先查 host 侧设备权限/provider/cgroup/内核日志与首个失败 syscall，并用旧 bench 做全局性对照。plain timing 重算已完成：n=2112 与 n=2240 差异 ≤1µs，max=9121µs 来自 P4，非 P2 污染。
+- 当前任务：**NOF-100（target 可达性对照：一次 `nof_register` 前后采集 transport/qpair/stats/日志增量；不重启、不换设备、不清理）**。NOF-099 证明 host 侧 `/dev/uburma` open/ioctl 与 TCP `connect():4457` 均成功，strace 无任何 EPERM；设备权限、EID 表、provider md5、capability/cgroup/AppArmor/SELinux 均无差异。EPERM 来自 host URMA 用户态握手或 NVMe-oF connect 应答映射（L2 候选）。下一步只在一次 register 前后比较 target 计数/日志，判断连接请求是否到达 target。plain timing 基线保持有效。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -6794,7 +6794,17 @@ vsegment 规划参数（命令行）：
 
 ---
 
-# NOF-099（待执行 · host 侧 URMA attach EPERM 诊断：首个失败 syscall / 设备权限 / provider · 2026-11-25）
+# NOF-099（已关闭 · 无 syscall EPERM；收窄到 URMA 用户态握手/connect 应答层 · 2026-11-25）
+
+> **关键结果**：两次 strace 均**没有任何 EPERM syscall**；`openat("/dev/uburma/udmac0d1e2", O_RDWR)`、URMA ioctl、TCP `connect():4457` 全部成功。失败发生在这些调用之后：**host 侧 URMA 用户态（liburma/ubcore provider）握手，或 NVMe-oF connect 应答被映射为 EPERM**（L2 候选，尚未定位）。
+>
+> **已排除**：`/dev/uburma` 权限（666 root:root、无 ACL/xattr）、EID 表（两端 1024/1024 一致）、provider/URMA 库 md5（两端一致）、capability（全能力）、devices cgroup（无）、AppArmor（关）、SELinux（Disabled）、hugepages/IOVA。`udmac0d1e2` 节点 12:49 重建晚于首次失败，不是起点；udev/journal/dmesg 无 EPERM/permission/reset 记录。
+>
+> **偏差**：指定旧 bench `bench-io-params-e12` 在 node1 不存在，使用的 node1 `bench-io-params` 在 attach 前因“无 mounted NoF segment”退出，未能复现 EPERM；因此“旧 bench 全局对照”仍未完成。strace 做了两次（第一次漏 write/read），结论一致。
+>
+> **环境**：master plain_nof088 仍运行但 NoF 未挂载；target 905586 未重启、4457 正常；新增业务写入=0。产物 `run/nof099_summary.txt` 与 strace/register 日志。
+>
+> **下一步 NOF-100**：在一次 `nof_register` 前后采集 target transport/qpair/stats/日志增量，判断连接请求是否到达 target；不重启、不换设备、不清理资源。
 
 ## 背景与目标
 
@@ -6842,3 +6852,50 @@ vsegment 规划参数（命令行）：
 - 只读为主；唯一允许的运行是 A 段一次旧 bench attach/读尝试与一次 strace。
 - target 905586 保持不变；plain_nof088 元数据不删；新增业务写入=0。
 - 若需要重启 target/换设备/清理会话，先回报，由开发侧授权。
+
+---
+
+# NOF-100（待执行 · target 可达性对照：一次 register 前后计数 + 可选抓包 · 2026-11-25）
+
+## 背景与目标
+
+- NOF-099 证明 host 侧 `/dev/uburma` open/ioctl 与 TCP `connect():4457` 成功，strace 无 EPERM；失败在 URMA 用户态握手或 connect 应答映射层。
+- 本单只回答一个问题：**这次 NVMe-oF connect 请求到底有没有到达 target 的 URMA transport？**
+- 用两种独立证据：target RPC/日志增量 + 可选 TCP 抓包。
+
+## A. target 前快照（只读）
+
+1. 记录 target PID/md5/启动时刻、4457 LISTEN、`nvmf_get_subsystems`、`nvmf_get_transports`。
+2. 采集 `nvmf_get_stats`、当前 admin/io qpair 数、URMA transport 可用计数；记录 `/tmp/nvmf_tgt.log` 的字节数/md5/offset。
+3. 若 `tcpdump` 存在，准备对 node1↔node3 4457 的单次抓包（只抓本次 register 窗口，文件写 /tmp）。
+
+## B. 触发一次注册
+
+1. 在当前 `plain_nof088` master 上执行**一次** `nof_register`（不写业务 key）；记录开始/结束时间与 master 日志中的 3 次 attach 尝试。
+2. 同时抓包（若可用）；不要触发第二次 register。
+
+## C. target 后快照与日志增量
+
+1. 重复 A 的全部 RPC/计数，给出前后 delta。
+2. 只分析本次时间窗内新增的 target 日志，grep `connect|ctrlr|URMA|handshake|jetty|jfc|reject|error`；记录第一条相关行。
+3. 若抓包成功：统计 SYN/ACK、TCP payload 字节数、连接方向；判断 NVMe-oF connect 数据是否发出/到达。
+
+## D. 判读（三选一）
+
+- **到达 target**：target 计数/日志或抓包证明 connect payload 到达 ⇒ 失败在 URMA 握手/target 应答层；下一步开 host/target 的 URMA 调试日志。
+- **未到达 target**：只有 TCP SYN/ACK、无 connect payload，且 target 零增量 ⇒ host URMA 用户态在发送 connect 前失败；下一步开 liburma/ubcore debug。
+- **不确定**：RPC 计数器不覆盖失败握手且抓包不可用 ⇒ 明确 `[未获取]`，不得猜。
+
+## E. 回执必答
+
+- target 前后 qpair/stats/transport 计数 delta；
+- target 新增日志首条；
+- 抓包是否有 TCP payload、字节数；
+- 三选一判决；
+- 新增业务写入=0、target 905586 未重启、原二进制未变。
+
+## F. 边界
+
+- **不重启 target、不换设备、不 reload driver、不清理资源、不 kill 进程**。
+- 只读 RPC + 一次现有 master 的 `nof_register`；可选单次抓包。
+- 不建新 cid、不写业务 key、不改 etcd 配置。
