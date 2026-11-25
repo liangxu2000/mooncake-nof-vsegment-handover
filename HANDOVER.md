@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-104（node2/node4 只读盘点与迁移可行性；NOF-103 已取消）**。用户 2026-11-25 决定：node1/node3 他人要用，**取消 NOF-103 node1 重启**，改用 **node2/node4（独占）** 继续；目标不变。先只读盘点两台机器的 URMA 设备/provider、NVMe 数据盘/BDF/NUMA、CPU/内存/hugepages、网络/端口、Mooncake/SPDK 构建与 etcd、root/sudo 与现有进程；据此确定 target/master 角色、需要复制/重建的资产和迁移步骤。**全只读、不重启、不绑盘、不写数据。** 如果 node2/4 缺少 NVMe 数据盘或 URMA 设备，则此路不可行，需及时回报。
+- 当前任务：**NOF-105（node4 target 部署 + 清理我方旧进程；用户已确认独占，可 kill 我方旧进程；不装包、不重编 SPDK）**。NOF-104 盘点：node4 11 块 7T 全空闲、BDF 与 node3 一致；node2 可 master+client。**用户 2026-11-25 明确：node4 50056/9006/8086 与 node2 50156 上的进程是他之前起的，独占即可 kill（佛挡杀佛）**。NOF-105 只清理我方旧 PID/路径（`/home/l00955908/nds` 等），建我们自己的目录，复制 node3 已知可用 target/bench/SPDK 树到 node4，启动 target（4457/RAID0/ns），验收后停手；不跑 master/数据。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -7092,7 +7092,16 @@ vsegment 规划参数（命令行）：
 
 ---
 
-# NOF-104（待执行 · node2/node4 只读盘点与迁移可行性 · 2026-11-25）
+# NOF-104（已关闭 · 迁移可行但有条件：node4=target、node2=master+client；两台均非独占 · 2026-11-25）
+
+> **盘点结论（L0 只读）**：
+> - **node4=target**：11 块 7T NVMe 全部空闲、nvme 驱动、未挂载/未 vfio；BDF 与 node3 完全一致（21/22/28/29/2a/91/92/a1/a2/a3/a4），系统盘 2b。URMA/provider 库与 node1/node3 完全一致（liburma `5c021f7f…`、udma `09daf8ea…`、ubagg `267a9259…`），udmac0d1e2 EID 1024/1024。
+> - **node2=master+client**：仅 6 块空闲盘（a1/92/a2/a3/a4/91，全 numa2），5 块被他人 vfio；50056/9006/8086 在 node2 上 free；50156 被他人 client 占用（需改 50256）。
+> - **两台都不独占**：node2 多人会话/loadavg 14.8、root fs 97%（2.6G）；node4 多人会话/loadavg 9.4，且有他人 master 占 50056/9006/8086；node4 root fs 66G、hugepages 17.1G（远低于 node1/3 的 444G）。
+> - **SPDK 库不可直接复用**：`/usr/local/lib/libspdk_bdev.a` 是 NOF-096 禁用集；node4 现成解包树 `3ec28c61…` ≠ node3 已知可用 `4056b6bd…`。node3 可用树 origin 是本地路径 `/home/yin/nof/spdk`、detached `bd5ee124d`、dirty=6；原始仓库 URL/分支 `[未获取]`。node2 有 tarball `spdk-e12b7cb.tar.gz`，sha256 `f98de24f…`。
+> - **迁移顺序建议**：① SPDK 用 node2 tarball/或复制 node3 已知可用树到 node4 自建目录；② target 优先复制 node3 `nvmf_tgt`（3129641f）+ takeover/wrapper；③ Mooncake 用 `wangyuqi0429/Mooncake@supercache-snapshot` 在 node4 重 clone/重编；④ node2 起独立 etcd；⑤ bench 复制 `bench-nof097`/`bench-io-params-e12`；⑥ 端口 target 4457、master 50056/9006/8086、client 50256。
+> - **阻塞**：独占性未确认、node4 缺 meson/ninja（若重编 SPDK）、node2 空间小、node4 hugepages 17.1G 需核算。
+> - **环境**：全只读，未重启/未绑盘/未写业务数据；产物 `~/nof104_*`、`run/nof104_summary.txt`。
 
 ## 背景与目标
 
@@ -7136,3 +7145,52 @@ vsegment 规划参数（命令行）：
 - **全只读**：不重启、不绑 vfio、不写数据、不装包、不改系统配置、不动他人进程。
 - 不把内网 IP/账号写入公开仓；用 node2/node4 指代。
 - 若关键项无法获取，记 `[未获取]` 并说明；不猜。
+
+---
+
+# NOF-105（待执行 · node4 target 部署 + 清理我方旧进程 · 2026-11-25）
+
+## 授权与目标
+
+- **用户已确认 node2/node4 独占**；node4 50056/9006/8086、node2 50156 上的进程是用户之前起的，**可以 kill（佛挡杀佛）**。
+- 本单只做：清理我方旧进程/端口 → 建我们自己的目录 → 复制 node3 已知可用 target/bench/SPDK 树 → 启动 node4 target 并验收。
+- 不跑 master/数据、不重编 SPDK、不装包、不改内核参数。目标：target 4457 就绪。
+
+## A. 清理我方旧进程（严格按 PID/路径）
+
+1. 记录候选进程的 PID/cmdline/owner：node4 master 1260028、metadata 1260073、node2 client 3204031、node2 `nds/spdk_v2_runtime/nvmf_tgt`，以及 `/home/l00955908/nds` 下仍存活的 `mooncake_master|mooncake_client|nvmf_tgt`。
+2. **只 kill 上述用户所属路径/PID**：先 `kill -TERM`，10s 不退再 `kill -KILL`；逐个记录。**不碰其他用户/未知路径进程**。
+3. 清端口验收：node4 50056/9006/8086/4457、node2 50156/2379 均 free（或仅剩非我方进程时停手回报）。
+
+## B. 建自有目录并复制资产
+
+1. 在 node4/node2 创建 `/home/l00955908/mooncake-nof-vsegment-2`（或用户已有命名），**不使用 node2/node4 的 nds/GAP 工作目录**。
+2. 从 node3 复制我们自己的已知可用资产到 node4 自有目录（node4→node3 ssh 可用）：
+   - `build/spdk-e12b7cb-src` 的构建产物/必要源码（优先 `build/bin/nvmf_tgt` md5 `3129641f…`、`build/lib`、takeover/wrapper 脚本、RPC 快照）；
+   - `bench-nof097`（md5 `6757c001…`）或 `bench-io-params-e12`；
+   - 记录每个文件的 md5/sha256 与来源路径。
+3. **不重编 SPDK**（node4 缺 meson/ninja）；若复制产物不可运行，停手回报，不自行装包/重编。
+
+## C. 启动 node4 target
+
+1. 预检：11 块 7T BDF 升序 21/22/28/29/2a/91/92/a1/a2/a3/a4、系统盘 2b 禁碰；URMA udmac0d1e2 正常；hugepages **free ≥10GiB**（当前 17.1G，必须实测；不足则停手）。
+2. 按 takeover 脚本绑定 11 盘 vfio；用复制的同一 `nvmf_tgt`（3129641f）启动，同 RPC 序列：
+   - RAID0 strip 256K、11 base、nsid1 100GiB、NQN `nqn.2026-01.io.spdk:urma-gpu-test`、listener URMA 4457、transport udmac0d1e2/capsule urma；
+   - **不启用 BUFFER**。
+3. 验收：新 PID/md5、4457 LISTEN、RAID0 online/11 base/BDF 升序、nsid1、transport、target 日志无错误；记录新 RAID0 UUID。
+4. **停手**：不启动 master、不 register、不跑 bench、不写业务数据。target 保持运行供 NOF-106。
+
+## D. 回执必答
+
+- 清理的 PID/路径清单与端口释放；
+- 复制资产清单/md5；
+- target 新 PID/md5/4457/RAID0/ns/transport/新 UUID；
+- hugepages free 实测；
+- 是否安装/重编（应为否）；
+- target 未重启/未写数据/未动其他用户进程。
+
+## E. 边界
+
+- **只 kill 用户确认的我方旧进程**；不碰未知/他人进程。
+- 不装包、不改内核参数、不重编 SPDK、不换 URMA 设备。
+- 不启动 master/bench、不写业务数据；target 起后保持运行。

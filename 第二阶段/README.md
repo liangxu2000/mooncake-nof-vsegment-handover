@@ -3,7 +3,7 @@
 > **2026-11-25 接管状态（覆盖下方所有旧“当前状态 / 当前任务”）**
 >
 > - 本文正文记录到 NOF-083，之后的历史以 `../HANDOVER.md` 与 `../工作汇总.md`《结论登记表》为准。
-> - **当前任务：NOF-104（迁移评估）**——用户决定 node1/node3 他人要用，取消 NOF-103，改用 node2/node4 独占，目标不变。先只读盘点两台机器的 URMA 设备/provider、NVMe 数据盘/BDF/NUMA、CPU/内存/hugepages、网络/端口、Mooncake/SPDK 构建与 etcd、权限与现有进程，确定 target/master 角色与迁移资产。换 host 只解决 attach 阻塞，vseg 2.07× 仍需重新基线化。
+> - **当前任务：NOF-105（node4 target 部署 + 清理我方旧进程）**——用户确认独占，node4 50056/9006/8086、node2 50156 上的旧进程可 kill。NOF-104 盘点：node4 11 块 7T 全空闲、BDF 同 node3；node2 可 master+client。NOF-105 清理我方旧 PID/端口、建自有目录、复制 node3 已知可用 target/bench/SPDK 树、启动 node4 target 并验收；不重编 SPDK、不装包、不跑数据。
 > - **当前主线：C18（L2）**——vseg 比 plain 慢约 **2.07×**，`read_us` **2.58×**、`query_us` 1.11×；根因未定。
 > - **已撤回**：C03/C17「vseg 无代价」、所有 4.6–5.9× 单因归因。慢程 **N=400MiB/遍** 在单 IO 层成立，但端到端不可见（1.043×），不是端到端根因。
 > - **口径**：bench 回到 **400 keys**；2000-key 数据封存，禁止跨口径比较。target 905586 不重启；etcd 约 150MB。
