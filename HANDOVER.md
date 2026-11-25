@@ -5,7 +5,7 @@
 - 之后每轮：`cd mooncake-nof-vsegment-handover && git pull`
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
-- 最后更新：2026-11-24 19:52
+- 最后更新：2026-11-25
 
 
 > ## 📌 代码来源链（2026-11-24 21:38 · 用户提供 + NOF-092 实测 · **所有源码判断的唯一依据**）
@@ -97,17 +97,17 @@
 >
 > ⇒ **目前唯一「可重启且数据完好」的是 `plain_nof088`。任何新的 vseg 实验都必须新建 cid 重写数据。**
 
-- 当前任务：**NOF-095（输出 `NofTransferTiming` 全字段 · 改码一次 · 2026-11-25 11:00 派）**。原计划的三段 chrono 只能得 3 个数；改为一次性输出 `future.nofTiming()` 的 **30+ 字段**（`lane`/`qpair_id`/`credit_wait_us`/`head_to_first_submit_us`/`max_sub_io_latency_us` 等），能一次验证 lane 分散、信用限流、队头阻塞三个假设。前提：`MC_HIFREQ_LOG_SAMPLE_RATE=1`（`track_timing_` 由 `ShouldSampleHiFreqLog(parent_trace_id)` 控制）。原待派记录：改码一次到位，在 `TransferReadInternal` 输出 `future.nofTiming()` 的 20+ 个字段（`dispatch_queue_us` / `credit_wait_us` / `qos_fifo_wait_us` / `submit_span_us` / `drain_us` / `sub_io_count`），比「三段 chrono」信息量大一个数量级。**另：建 cid 必须带完整 env（slot / URMA 设备 / vsegment 规划 8 参数），昨日漏 slot_count 导致 12 小时数据无效。**
-- 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 绕开 128 样本配额）**。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（`client_service.cpp:5956-5990`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
-- 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 绕过 SpDiag 的 128 样本配额）**。前两轮结论：B1 路线可行但每个点位只记前 128 样本，而 warmup 正好 128 个把配额吃满 ⇒ 抓到的全是冷启动数据。**推断 128 即配额，故用 warmup=0 让前 128 个样本落在测量段。** 判据看数值是否从 554µs 降到 ~300µs 量级。**同时必须建 `vseg_nof091`（400 keys），vseg 臂前两轮一轮都没跑。** NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
+- 当前任务：**NOF-095（输出 `NofTransferTiming` 全字段 · 改码一次 · 2026-11-25 加固）**。在我方 `be10be29` 源码副本的 `Client::TransferReadInternal`（`client_service.cpp:5926`）中，**vseg 与 plain 两个分支各在 `future->get()` 后**输出同一条 `NOF095_TIMING`（带 `arm=vseg|plain`），保留原 SpDiag；`MC_HIFREQ_LOG_SAMPLE_RATE=1`。先 plain 20-key 冒烟 + 3 遍 → 建 `vseg_nof095` 写 400 keys → vseg 20-key 冒烟 + 3 遍。一次验证 lane 分散、credit 等待、队头阻塞，并看 drain/最慢子 IO。**target 905586 不重启；建 cid 必须带全 slot/URMA/vsegment 规划参数。**
+- 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
+- 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
 - 历史：**NOF-091（拿 vsegment 的 plan/submit/wait 分解）**。用户 20:41 批准派任务。**优先零改码**：源码里三个 `SpDiag::PerfPoint` 埋点（`VSEGMENT_READ_PLAN/SUBMIT/WAIT`）已存在，若构建是 Layer 1 且 `spdiag` CLI 在，直接 `spdiag show` 拿数；否则才加 chrono 重编（65s）。
-- 历史（已暂停）：**NOF-090（版本对照：换掉 be10be2 看 2× 是否版本问题）**。实地核查确认：我们用的是 `LeeJace993/Mooncake` 的 **`nof-urma-v2-bench-merge`** 分支（HEAD `d371e22`，2026-10-23），**不是 kvcache-ai/Mooncake**；`be10be2` 不在我们的历史里；唯一可升的 1 个提交（`523256d`）只加 EID 配置，与性能无关。**这条线不存在「升一版拿回 2×」的选项。** 下一步待用户拍板（A 问同事 / B cherry-pick 上游修复 / C 接受现状）。
+- 历史（已作废，NOF-092 更正）：**NOF-090（版本对照：换掉 be10be2 看 2× 是否版本问题）**。以下分支/版本判断来自错误的本地副本 `d371e22`，**不得引用**；实际基准是顶部 `be10be29`。当前没有“升一版拿回 2×”的已验证选项。
 - 历史（已作废）：**NOF-090（版本对照：换掉 be10be2 看 2× 是否版本问题）**。开发侧决策：60+ 轮已排除 IO 层/命令层/客户端结构层；唯一未排除项是**版本落后**（`be10be2` 缺 `ff3e853`/`13b7c19` 等读路径修复）。源码里那处「重复 view 校验」已量化仅 **3–5µs（约 1%）**，不构成主因、不值得单独重编。
 - 历史任务位：**无 —— 口径已回 400 keys（见上方口径决议），待用户定向下一单**。NOF-089 已完成：`read_us` 内部无 breakdown 埋点，**拆解失败**（offload 三子项恒 0，`read_overhead_us` ≡ `read_us` 是恒等式），要细分需新增插桩（改码）。
 - 原任务位记录：**NOF-089（把 `read_us` 的 2.58× 拆成 4 子项 · 纯离线）**。用户 19:39 把决策权交开发侧，决定**先拆解定位、暂不做升 L3 实验**——理由：① C18 的 2.07× 已与 NOF-025 的 2.08× 独立吻合 0.5%，「是不是真的」把握已较高；② 升 L3 需同 cid 双副本，但 bench 的 flag 不控制路径（NOF-088 已证），可能根本做不到；③ 先把 261µs 的差值拆到具体子项，才知道该往哪查。
 - 历史：原「待用户定向」如下 —— NOF-088 已完成并**推翻 C03/C17**：bench 无法在同 cid 切读取方式（`type` 取自 `metadata.replica_type`），「两 flags 差 0.00%」是同一条路径测两遍。**实测 vsegment 比 plain 慢 2.07×**（与 NOF-025 的 2.08× 吻合 0.5%），差异在 `read_us`（2.58×）而非 `query_us`（1.11×）。等级 L2（布局混淆未排除）。
-- **⚠️ 权威口径以本文件顶部「当前任务」与 `工作汇总.md` 的《结论登记表》为准；C03/C17 已撤回，任何仍引用「vsegment 无性能代价」的表述一律作废。**NOF-087 判定：**慢程在端到端不可见（1.043×，四遍一致）⇒ 对业务无影响，这条线关闭**。**主线结论：vsegment 本身不引入性能代价（C03 L3）；5.91×/2.08× 是跨 cid 的数据状态差异，与 vsegment 无关。**
+- **⚠️ 权威口径以本文件顶部「当前任务」与 `工作汇总.md` 的《结论登记表》为准；C03/C17 已撤回，任何仍引用「vsegment 无性能代价」的表述一律作废。**NOF-087 判定：**慢程在端到端不可见（1.043×，四遍一致）⇒ 对业务无影响，这条线关闭**。**当前主线：C18（L2）——vsegment 比 plain 慢约 2.07×，差异在 `read_us`（2.58×）；根因未定。** 单 IO 的 400MiB 慢程是真实现象，但不得当作端到端根因。
 - **NOF-085 已被 NOF-086 裁决取代**：A 段的 `--max-request-bytes` 定位**已被源码证否**（见 NOF-086 裁决 §7），真正的墙是 Mooncake 客户端 `storeMaxMsgSize = 32MiB`。原单作废，改由 NOF-087 核版本常量。
 - **NOF-084 的「外推 >24MB 即停手」判据已撤销**（24.2MB 下限假设 1 entry/key，与实测 7 entries/key 矛盾）。
 - **NOF-084 已完成（主动停手，L0）**：2000 keys 未写入；100 keys 预检实测 84.8KB/key，2000 keys 外推 24.2–169.6MB 全部超 24MB 阈值。见该单顶部裁决块。
@@ -117,7 +117,7 @@
 - NOF-082 **已完成，结论部分修正**：慢程模型成立；B 段「形态不同⇒根因」判据撤回（见该单顶部裁决块）。
 - NOF-081 **已完成，结论部分被拒**：A 段判决与 C 段「对外表述定稿」已作废（见该单顶部裁决块）。
 - NOF-077（自建 `--rounds` / `--start_key` 口径补丁）**暂缓**；NOF-025 **须重做**，重做前不得引用。
-- **状态提示（2026-11-24）**：此前所有 4.6–5.9× 归因均未成立；唯一站得住的是「同 cid 两 flags 差 0.00/0.14%」与「两档 latency 由访问流长度触发」。详见 `工作汇总.md` 顶部状态更正。
+- **状态提示（2026-11-25）**：此前所有 4.6–5.9× 单因归因与 C03/C17 均已撤回；当前只保留结论登记表里的 C18（L2，vseg 慢 2.07×）、C09/C16（慢程存在但端到端不可见）、C02 排除项等。NOF-095 测客户端内部 timing，用于判定该修客户端还是 target/会话层。
 
 ## 归因纪律（2026-11-24 起 · **所有单必读** · 优先于任何单的任务书判据）
 
@@ -4905,7 +4905,7 @@ vseg 10 遍与 plain 10 遍的逐遍内部 p50（两列）与是否出现跃迁�
 > 用户质疑"数据放一会儿读更快"不合理，开发侧复核后**收回"年龄是唯一变量"的表述**。原因：跨 cid 对照同时改了两个变量，回执自己也写明「跨象限 LBA 集合不同（1,164 vs 1,819 个盘内 offset，因 slot_count 1 vs 1024），跨象限不可配对」。
 
 **当前可信的只有一半**：
-- ✅ **同一 cid、同一批 LBA、两 flags 交替 3+3 遍 ⇒ 差 0.00–0.14%（6 遍）** ⇒ **读路径无独立代价**，这条是硬的。
+- ✅ **同一 cid、同一批 LBA、两 flags 交替 3+3 遍 ⇒ 差 0.00–0.14%（6 遍）** ⇒ **当时判为“读路径无独立代价”**；**该结论已由 NOF-088 撤回：两 flags 实际未切换读取路径，`type` 全为 vsegment。**
 - ❓ **跨 cid 的 4.95× 是"年龄"还是"LBA 布局"，未分离** ⇒ 不得对外说"放几天就快"。
 
 因此本单改为下列三段，**A/B 全部零写入、不需要等任何时间**：
@@ -4940,7 +4940,7 @@ vseg 10 遍与 plain 10 遍的逐遍内部 p50（两列）与是否出现跃迁�
 | **盘首慢区** | 成员盘 offset **< 35.4 MiB → 242µs**；**> 35.5 MiB → 43µs**（分界间隙仅 0.12 MiB）；两 cid 在该区差 **1.01×** | 设备侧**物理位置**效应，与路径、年龄都无关 |
 | **新写数据/分散布局的读惩罚** | 同 offset 区间 `[36,145.4) MiB`：老 cid **42.91µs** vs 新写 **238.55µs** = **5.56×** | 归因**待定**（见下） |
 | ~~881 MiB 预热阈值~~ | **撤销** | 真实机制：顺序扫描越过 offset 35.4 MiB 边界（6/6 遍，跃迁点对应 offset 33.5–33.6 MiB）；**不需要任何状态重置**，每遍都从 offset 0 扫起才是"重置"的假象 |
-| 路径独立代价 | 同 cid 两 flags **0.00% / 0.14%** | **保留并强化**：vsegment 读路径无独立代价 |
+| 路径独立代价 | 同 cid 两 flags **0.00% / 0.14%** | 当时保留并强化；**NOF-088 已撤回：两 flags 未切换路径** |
 | 跃迁前后 | `qd` 1.00×、gap 1.01×、在飞 1.00×、qpair/core 同；**唯一变化 `last_empty−t_db` 0.14×** | 设备侧 |
 
 **开发侧怀疑（本单要解决）**：NOF-079 的 5.56× 仍有**两个变量没分离**——
@@ -5458,7 +5458,7 @@ NOF-083 C 段证明 **Mooncake 侧有慢程**（NEW080 fast 0.0%、OLD 62.9% 快
 
 ## 0. 为什么派这单
 
-主线结论 C17「vsegment 本身不引入性能代价」目前只建立在 **400-key 口径**（C03：同 cid 两 flags 交替 6 遍差 0.00%/0.14%）。**2000-key 口径只有 vseg，没有 plain 对照。**
+**（本段为 NOF-087 当时结论，已由 NOF-088 撤回）** 主线结论 C17「vsegment 本身不引入性能代价」目前只建立在 **400-key 口径**（C03：同 cid 两 flags 交替 6 遍差 0.00%/0.14%）。**2000-key 口径只有 vseg，没有 plain 对照。**
 
 本单补这个缺口。**但优先方案不是新建 cid**——新建要重启 master，会让 `vseg_nof086` 永久报废（942MB oplog），还引入布局混淆。**先看能不能在同一批数据上换读取方式。**
 
@@ -5775,7 +5775,7 @@ read_overhead_us = read_us - known_read_us    // read_us <= known 时为 0
 >
 > 除原任务书 D 段外，追加：**测试机源码 HEAD 与 `git status` 是否仍为 `be10be29` dirty=3**；`client_service.cpp` L2170–2340 原文；两臂各跑了几遍、Ticks 是否随遍数增长；`vseg_nof091` 的 oplog 增量与 `Keys`。
 
-> **【2026-11-24 21:48 开发侧裁决 · 不改码，换 warmup=0 绕过 128 配额】**
+> **【2026-11-24 21:48 开发侧裁决 · 不改码，换 warmup=0 检验 128 配额假设（后被否证）】**
 >
 > **本单的 L1 排除成立**：层（Layer 1）、CLI（`/usr/bin/spdiag`）、门控（`level_gate=0`）、点位（MODULE 级确有记录）已逐一排除；`SetupReal Ticks=1` / `RegisterBuffer Ticks=2` 证明**不是全局截断**；头文件里 `MAX_PERF_SLOTS=256`、`maxTopN=100` 都不是 128 ⇒ **128 是库内部按点位计的固定窗口**，无源码可查。**在「400 keys + warmup=128」这个用法下，spdiag 确实给不出测量段数据。**
 >
@@ -5993,7 +5993,7 @@ read_overhead_us = read_us - known_read_us    // read_us <= known 时为 0
 >
 > **已转 NOF-095**：不再加「三段 chrono」，改为**一次性输出 `future.nofTiming()` 的 30+ 字段**（`lane` / `qpair_id` / `credit_wait_us` / `head_to_first_submit_us` / `max_sub_io_latency_us` 等），信息量比三段大一个数量级，能一次验证 lane 分散、信用限流、队头阻塞三个假设。
 
-> **本单替代 NOF-091（091 三轮概念已混，废弃不再续）。091 的结论只继承两条**：① SpDiag 是 Layer 1 且埋点活着；② 每点位只记 **128** 个样本，被 `warmup_keys=128` 吃满，故只拿到冷启动数据。
+> **本单替代 NOF-091（091 三轮概念已混，废弃不再续）。091 只继承两条**：① SpDiag 是 Layer 1 且埋点活着；② 现有取样方式只能拿到冷启动/不完整样本。**“128 配额被 `warmup_keys=128` 吃满”的假设已被本单否证，不得再引用。**
 
 > **【2026-11-25 10:55 开发侧裁决 · spdiag 路线关闭 · 改走改码，但一次改到位】**
 >
@@ -6079,7 +6079,7 @@ get_into → execute_ranged_read → Client::Get(:1843)
 
 ## A. 关键手法：`--warmup_keys=0`
 
-**091 的血泪教训**：`Ticks` 恒为 128，因为 SpDiag 每点位只存前 128 个样本，而 bench 的 `warmup=128` 正好把配额吃满 ⇒ 抓到的全是冷启动。
+**091 的教训（已更正）**：`Ticks` 恒为 128 与 `warmup=128` 的对应关系曾被误认为“配额被吃满”，但 NOF-094 配对实验已否证；现状是取样机制不明、`warmup=0` 时读取点位为 0，路线关闭。
 
 **本单两臂一律 `--warmup_keys=0`**，让前 128 个样本落在**测量段**。
 
@@ -6139,7 +6139,15 @@ get_into → execute_ranged_read → Client::Get(:1843)
 
 ---
 
-# NOF-095（**输出 `NofTransferTiming` 全字段：一次拿到客户端侧 IO 画像** · 改码一次 · 2026-11-25 11:00 派）
+# NOF-095（**输出 `NofTransferTiming` 全字段：一次拿到客户端侧 IO 画像** · 改码一次 · 2026-11-25 加固）
+
+> **【2026-11-25 加固 · 执行以本段为准】**
+>
+> - **代码基准**：`LeeJace993/Mooncake @ mooncake-vesegment @ be10be29`。开发侧已直接核对：`mooncake-store/include/transfer_task.h:56` 的 `NofTransferTiming` 与 `:412 nofTiming()` 存在，字段齐全；`client_service.cpp:5926 Client::TransferReadInternal` 的 vseg/plain 分支各只有一个 `future`。旧 `d371e22/706551a` 的行号与源码判断不得引用。
+> - **补丁范围**：同一个 `TransferReadInternal` 内，**vseg 与 plain 两个分支都要在 `future->get()` 后输出** `NOF095_TIMING`，带 `arm=vseg|plain`、`has_timing=0|1` 和 `NofTransferTiming` **全部字段**；原 SpDiag 三点位保持不动。可用函数内 lambda 避免复制两份 30 字段格式，只改这一个文件。
+> - **两次冒烟**：plain 20-key 冒烟在写 vseg 前做；vseg 20-key 冒烟在 `vseg_nof095` 写完后做。任一分支无日志或 `has_timing=0` ⇒ 停手并回滚，不继续正式测量。
+> - **源码/产物隔离**：只改我方副本 `$D/mooncake-src/mooncake-store/src/client_service.cpp`；先记录 HEAD/status/md5，构建独立产物 `bench-nof095`，原 `bench-io-params-e12` 的 md5 必须不变。测完恢复 `.orig` 并重编回原状（或删除新产物并验证原二进制未变），回执写明。
+> - **环境红线**：target **905586 / md5 3129641f 不重启**；不启用 BUFFER；400-key 口径；etcd 写入前复测余量。
 
 ## 0. 为什么这单比「三段 chrono」强
 
@@ -6168,18 +6176,20 @@ get_into → execute_ranged_read → Client::Get(:1843)
 
 ⇒ **`MC_HIFREQ_LOG_SAMPLE_RATE` 必须为 1（全采样）**。历史上我们一直设 1，本单继续。
 
-## B. 改码（**只改一个文件，必须备份回滚**）
+## B. 改码（**只改一个文件、两个分支、独立产物、备份回滚**）
 
-1. 备份：`cp client_service.cpp client_service.cpp.orig`
-2. 改 `Client::TransferReadInternal`（**5956-5990 三个点位那段**）：
-   - **保留原有 `SpDiag::PerfPoint` 完全不动**
-   - 在 `future->get()` 之后，加一段：若 `future->nofTiming()` 有值，则 `LOG(INFO)` 输出**全部字段**，日志名 `nof095_vseg_timing`
-   - 字段顺序照 `transfer_task.h` 定义写全，**一个都不要省**
-3. 重编 + 重链（NOF-048 验证过：改一个 .cpp → 编译 61s → `ar r` → 重链 4s）
-4. **改完先跑一次冒烟（20 key）**，确认日志里能看到 `nof095_vseg_timing` 行；看不到 ⇒ 说明 timing 为空（parent_trace_id 采样问题），**停手回执，不要继续**
-5. 测完**必须回滚**：`mv client_service.cpp.orig client_service.cpp`，并重编回原状，回执里写明已回滚
+1. **基线**：在我方副本 `$D/mooncake-src` 记录 `git rev-parse HEAD`（必须为 `be10be29`）、`git status --short`、`mooncake-store/src/client_service.cpp` 的 md5；备份为 `client_service.cpp.orig`；记录原 `bench-io-params-e12` 的 md5。
+2. **改 `Client::TransferReadInternal`**（be10be29 函数起点 `client_service.cpp:5926`）：
+   - **vseg 分支**：在 `const ErrorCode result = future->get(); pt_vsegment_wait.End(...);` 之后、`return result;` 之前调用计时输出；
+   - **plain 分支**：把 `return future->get();` 改为“先取 result → 调用计时输出 → return result”；
+   - 输出统一日志名 **`NOF095_TIMING`**，字段包含 `arm=vseg|plain`、`has_timing=0|1`，以及 `transfer_task.h` 中 `NofTransferTiming` 的**全部字段、按定义顺序**；无 timing 时也要输出 `has_timing=0`，不得静默跳过；
+   - **原 `SpDiag::PerfPoint` 三点位完全不动**；只改这一个 `.cpp`。
+3. **独立构建**：按 NOF-048 的最小重建路径编译该 `.cpp` → `ar r` 换库成员 → 重链为 **`bench-nof095`**；`--help` 正常；**原 `bench-io-params-e12` 文件与 md5 必须不变**。
+4. **plain 冒烟**：在 `plain_nof088` 上跑 20 keys、`--warmup_keys=0`，预期 **20 条 `NOF095_TIMING arm=plain has_timing=1`**；不足/为空 ⇒ 停手回执，不继续。
+5. **vseg 冒烟**：待 D2 建好 `vseg_nof095` 后，同样跑 20 keys、`warmup=0`，预期 **20 条 `arm=vseg has_timing=1`**；不足/为空 ⇒ 停手回执，不继续正式 3 遍。
+6. **回滚**：全部测完后恢复 `client_service.cpp.orig` 并重编回原状（或删除 `bench-nof095` 并验证原二进制未变）；回执写明源码已恢复、原二进制 md5 未变。
 
-## C. 建 vseg cid（**必须带全参数，昨日漏参数疑似导致 `insufficient space`**）
+## C. 建 vseg cid（**必须带全参数组，漏参数会导致环境不可用**）
 
 **master 启动命令必须逐字带全**（来源：node1 `/tmp/nof076_switch.sh`）：
 
@@ -6188,7 +6198,6 @@ get_into → execute_ranged_read → Client::Get(:1843)
   MC_STORE_PARTITION_SLOT_COUNT=1          ← 昨日漏这个，导致 SLOT_NOT_OWNED 13 小时
   SPDK_URMA_DEV_NAME=udmac0d1e2
   SPDK_URMA_CAPSULE_TRANSPORT=urma
-  MC_HIFREQ_LOG_SAMPLE_RATE=1              ← nofTiming 的前提
 
 vsegment 规划参数（命令行）：
   --cvm_segments_vsegment_exclusive=true
@@ -6201,14 +6210,18 @@ vsegment 规划参数（命令行）：
   --vsegment_reserved_ratio=0
 ```
 
+**reader 进程 env（冒烟与正式读都必须）**：`MC_HIFREQ_LOG_SAMPLE_RATE=1`（`track_timing_` 前提）、`MC_STORE_PARTITION_SLOT_COUNT=1`、`MC_NOF_IO_PARAMS_LOG=1`（可选，用于交叉核对）、`SPDK_URMA_STAGE_TRACE_US=0`、其余诊断关。
+
 **另：master 每次重启后必须重跑 `nof_register` 挂载**；且**每次 bench 跑前都要重新挂载并验证**（NOF-094 已两次实测：重启丢挂载、bench 跑完也丢）。
 
 ## D. 执行顺序
 
-1. **plain 臂**（零写入）：读 `plain_nof088` 前 400 key，`warmup=128`，跑 3 遍，每遍前重挂载
-2. **建 `vseg_nof095`**：写 400 keys（注意 `VSEGMENT_CREATING` 步长 17，需多轮补写）
-3. **vseg 臂**：同样参数跑 3 遍
-4. 两臂日志里抽 `nof095_vseg_timing` 行
+0. **plain 环境预检**：若 `plain_nof088` master 未运行，启动必须带 `--cluster_id=plain_nof088`、`MC_STORE_PARTITION_SLOT_COUNT=1`、`SPDK_URMA_DEV_NAME=udmac0d1e2`、`SPDK_URMA_CAPSULE_TRANSPORT=urma`；`nof_register` 后验收 `Keys=2000`、`owned_slots=1`、`ready=1/1`。若已在运行，也要先验证这些值与挂载；缺一项先修复再读。
+1. **plain 冒烟 + 正式臂**（零写入）：在 `plain_nof088` 上先跑 20 keys、`warmup_keys=0` 验证 `arm=plain` 日志；通过后读前 400 key、`warmup_keys=128`、跑 **3 遍**。每遍 bench 前重新 `nof_register` 并验证挂载。
+2. **建 `vseg_nof095`**：按 §C 完整参数启动 vseg master，写 **400 keys**（多轮补齐，验收只认 master `Keys=400` / `logical_used=1,677,721,600`）；写入前复测 etcd 余量。
+3. **vseg 冒烟 + 正式臂**：先跑 20 keys、`warmup_keys=0` 验证 `arm=vseg` 日志；通过后按同口径跑 **3 遍**（400 keys / warmup 128 / T1 / batch1 / qpairs4 / verify=false）。每遍前重新挂载并验证。
+4. 两臂各日志中提取 **`NOF095_TIMING`** 行；正式臂每遍预期 **528 条**（400 测量 + 128 warmup），冒烟每臂预期 20 条。
+5. 全部完成后按 §B6 回滚源码/产物，再停 master；**target 保持运行**。
 
 ## E. 判据（逐条回答，不要只给结论）
 
@@ -6222,15 +6235,18 @@ vsegment 规划参数（命令行）：
 | **最慢的子 IO 有多慢？** | `max_sub_io_latency_us`，并用 `max_sub_io_cid` 与 target 侧 W9 关联 |
 | drain 占比 | `last_submit_to_complete_us` ÷ `total_us` |
 
-**⇒ 只要能答出「lane 数、信用等待、队头阻塞」这三项，就能判定客户端侧到底有没有责任。**
+**判读（两臂同口径，时延字段同时给 p50/p90 与非零占比）**：
+- vseg 的 lane 更少、`credit_wait_us` 或 `head_to_first_submit_us` 明显更大 ⇒ **客户端提交层有责任**；
+- lane/credit/队头三项相同，但 `last_submit_to_complete_us` 或 `max_sub_io_latency_us` 更大 ⇒ **客户端提交正常，target/传输/会话等待更大**；
+- 全部相同 ⇒ **客户端 timing 层排除**，不得继续猜，转 target/会话层的受控实验。
 
 ## F. 回执必答（第一行）
 
-`nofTiming` 是否取到（有几行日志）；vseg/plain 各落在几条 lane；`credit_wait_us` 与 `head_to_first_submit_us` 的 p50；`max_sub_io_latency_us`；`sub_io_count`；源码是否已回滚 + 是否已重编回原状；`vseg_nof095` 的 Keys 与 oplog 增量；有无失败。
+源码 HEAD/status/md5 与原 bench md5（改前/改后）；plain/vseg 冒烟各多少条 `has_timing=1`；正式臂各多少条 `NOF095_TIMING`（预期 528/遍）；vseg/plain 的 lane 去重数、qpair/worker 分布；`credit_wait_us`、`first_credit_wait_us`、`head_to_first_submit_us`、`dispatch_queue_us`、`qos_fifo_wait_us`、`worker_setup_us` 的 **p50/p90/非零占比**；`first_to_last_submit_us`、`last_submit_to_complete_us`、`task_total_us`；`max_sub_io_latency_us/index/cid`；`sub_io_count` 分布；按 §E 判读客户端是否有责任；源码是否已回滚 + 原二进制 md5 是否未变；`vseg_nof095` 的 Keys 与 oplog 增量；有无失败。
 
 ## G. 边界
 
-- **只改 `client_service.cpp` 一个文件**，必须备份 + 回滚 + 重编回原状。
+- **只在我方副本 `$D/mooncake-src` 改 `client_service.cpp` 一个文件**，不改同事源码树；必须备份 + 回滚，构建独立 `bench-nof095`，原 `bench-io-params-e12` 的 md5 必须不变。
 - **禁止重启 target**（PID 905586 / md5 `3129641f…` 不变）。
 - **禁止改共用 etcd、禁止删 `/oplog` 前缀、禁止改 `/etc/spdiag/spdiag.conf`。**
 - 建 vseg cid 允许重启 master，但**必须带全 §C 的参数**。
