@@ -97,7 +97,7 @@
 >
 > ⇒ **目前唯一「可重启且数据完好」的是 `plain_nof088`。任何新的 vseg 实验都必须新建 cid 重写数据。**
 
-- 当前任务：**无 —— NOF-094 已收口（A 段不成立，spdiag 路线关闭），下一单 NOF-095 待派**：改码一次到位，在 `TransferReadInternal` 输出 `future.nofTiming()` 的 20+ 个字段（`dispatch_queue_us` / `credit_wait_us` / `qos_fifo_wait_us` / `submit_span_us` / `drain_us` / `sub_io_count`），比「三段 chrono」信息量大一个数量级。**另：建 cid 必须带完整 env（slot / URMA 设备 / vsegment 规划 8 参数），昨日漏 slot_count 导致 12 小时数据无效。**
+- 当前任务：**NOF-095（输出 `NofTransferTiming` 全字段 · 改码一次 · 2026-11-25 11:00 派）**。原计划的三段 chrono 只能得 3 个数；改为一次性输出 `future.nofTiming()` 的 **30+ 字段**（`lane`/`qpair_id`/`credit_wait_us`/`head_to_first_submit_us`/`max_sub_io_latency_us` 等），能一次验证 lane 分散、信用限流、队头阻塞三个假设。前提：`MC_HIFREQ_LOG_SAMPLE_RATE=1`（`track_timing_` 由 `ShouldSampleHiFreqLog(parent_trace_id)` 控制）。原待派记录：改码一次到位，在 `TransferReadInternal` 输出 `future.nofTiming()` 的 20+ 个字段（`dispatch_queue_us` / `credit_wait_us` / `qos_fifo_wait_us` / `submit_span_us` / `drain_us` / `sub_io_count`），比「三段 chrono」信息量大一个数量级。**另：建 cid 必须带完整 env（slot / URMA 设备 / vsegment 规划 8 参数），昨日漏 slot_count 导致 12 小时数据无效。**
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 绕开 128 样本配额）**。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（`client_service.cpp:5956-5990`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 绕过 SpDiag 的 128 样本配额）**。前两轮结论：B1 路线可行但每个点位只记前 128 样本，而 warmup 正好 128 个把配额吃满 ⇒ 抓到的全是冷启动数据。**推断 128 即配额，故用 warmup=0 让前 128 个样本落在测量段。** 判据看数值是否从 554µs 降到 ~300µs 量级。**同时必须建 `vseg_nof091`（400 keys），vseg 臂前两轮一轮都没跑。** NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -6103,6 +6103,107 @@ get_into → execute_ranged_read → Client::Get(:1843)
 - 不碰他人进程（royi master / yin 的 `vseg_yin_bonding` / 以及 node1 上正在 cmake 构建的进程）。
 - 若 A 段验证失败（数值仍是 554µs）⇒ **停手如实回执**，不要改配置、不要改口径凑数。
 - 产物 `run/nof094_*.txt`（≤3 个、每个 ≤1 MB）。
+
+---
+
+# NOF-095（**输出 `NofTransferTiming` 全字段：一次拿到客户端侧 IO 画像** · 改码一次 · 2026-11-25 11:00 派）
+
+## 0. 为什么这单比「三段 chrono」强
+
+原计划在三个点位加 chrono 只能得 3 个数。**而 `future.nofTiming()` 返回的 `NofTransferTiming` 有 30+ 个字段**（`transfer_task.h:56-101`），全部由 NoF 传输层在完成时填好：
+
+| 字段 | 能直接回答什么 |
+|---|---|
+| `lane` / `qpair_id` / `worker_index` | **这个 IO 落在哪条通道、哪个 qpair** |
+| `lane_task_sequence` / `lane_completion_sequence` | **在通道队列里排第几** |
+| `qos_tasks_ahead_at_enqueue` | 入队时前面压了多少任务 |
+| `dispatch_queue_us` / `worker_setup_us` | 调度队列 / 线程准备耗时 |
+| **`credit_wait_us` / `first_credit_wait_us`** | **有没有被信用（限流）卡住** |
+| **`head_to_first_submit_us`** | **有没有队头阻塞** |
+| `qos_fifo_wait_us`（及 full/partial/zero 三分解） | FIFO 背压细分 |
+| `first_to_last_submit_us` | 首次提交到末次提交的跨度 |
+| **`last_submit_to_complete_us`** | drain（末次提交→完成） |
+| `max_sub_io_latency_us` / `max_sub_io_index` / `max_sub_io_cid` | **最慢的子 IO 及其 CID —— 能与 target 侧关联** |
+| `queued_mono_ns` / `first_submit_mono_ns` / `last_submit_mono_ns` / `completed_mono_ns` | 绝对时间戳，可排时序 |
+| `sub_io_count` | 子 IO 数量（预期 vseg 32） |
+
+**⇒ 这些字段能一次性验证此前所有假设**（lane 分散、信用限流、队头阻塞、调度开销），不用再一轮一轮试。
+
+## A. 采样前提（**必须满足，否则 timing 为空**）
+
+`transfer_task.cpp:2496` 与 `transfer_task.h:303`：`track_timing_` 由 `ShouldSampleHiFreqLog(parent_trace_id)` 决定。
+
+⇒ **`MC_HIFREQ_LOG_SAMPLE_RATE` 必须为 1（全采样）**。历史上我们一直设 1，本单继续。
+
+## B. 改码（**只改一个文件，必须备份回滚**）
+
+1. 备份：`cp client_service.cpp client_service.cpp.orig`
+2. 改 `Client::TransferReadInternal`（**5956-5990 三个点位那段**）：
+   - **保留原有 `SpDiag::PerfPoint` 完全不动**
+   - 在 `future->get()` 之后，加一段：若 `future->nofTiming()` 有值，则 `LOG(INFO)` 输出**全部字段**，日志名 `nof095_vseg_timing`
+   - 字段顺序照 `transfer_task.h` 定义写全，**一个都不要省**
+3. 重编 + 重链（NOF-048 验证过：改一个 .cpp → 编译 61s → `ar r` → 重链 4s）
+4. **改完先跑一次冒烟（20 key）**，确认日志里能看到 `nof095_vseg_timing` 行；看不到 ⇒ 说明 timing 为空（parent_trace_id 采样问题），**停手回执，不要继续**
+5. 测完**必须回滚**：`mv client_service.cpp.orig client_service.cpp`，并重编回原状，回执里写明已回滚
+
+## C. 建 vseg cid（**必须带全参数，昨日漏参数疑似导致 `insufficient space`**）
+
+**master 启动命令必须逐字带全**（来源：node1 `/tmp/nof076_switch.sh`）：
+
+```
+环境变量：
+  MC_STORE_PARTITION_SLOT_COUNT=1          ← 昨日漏这个，导致 SLOT_NOT_OWNED 13 小时
+  SPDK_URMA_DEV_NAME=udmac0d1e2
+  SPDK_URMA_CAPSULE_TRANSPORT=urma
+  MC_HIFREQ_LOG_SAMPLE_RATE=1              ← nofTiming 的前提
+
+vsegment 规划参数（命令行）：
+  --cvm_segments_vsegment_exclusive=true
+  --vsegment_auto_plan=true
+  --vsegment_required_medium=nof
+  --vsegment_io_alignment=4096
+  --vsegment_member_count=1
+  --vsegment_stripe_size=2097152
+  --vsegment_member_extent_size=67108864
+  --vsegment_reserved_ratio=0
+```
+
+**另：master 每次重启后必须重跑 `nof_register` 挂载**；且**每次 bench 跑前都要重新挂载并验证**（NOF-094 已两次实测：重启丢挂载、bench 跑完也丢）。
+
+## D. 执行顺序
+
+1. **plain 臂**（零写入）：读 `plain_nof088` 前 400 key，`warmup=128`，跑 3 遍，每遍前重挂载
+2. **建 `vseg_nof095`**：写 400 keys（注意 `VSEGMENT_CREATING` 步长 17，需多轮补写）
+3. **vseg 臂**：同样参数跑 3 遍
+4. 两臂日志里抽 `nof095_vseg_timing` 行
+
+## E. 判据（逐条回答，不要只给结论）
+
+| 问题 | 看哪个字段 |
+|---|---|
+| vseg 的 IO 落在**几条 lane**？plain 呢？ | `lane` 去重计数 |
+| 有没有**信用等待**？ | `credit_wait_us` / `first_credit_wait_us` |
+| 有没有**队头阻塞**？ | `head_to_first_submit_us` |
+| 调度/线程准备各占多少？ | `dispatch_queue_us` / `worker_setup_us` |
+| 子 IO 数量对不对？ | `sub_io_count`（预期 vseg 32、plain 32） |
+| **最慢的子 IO 有多慢？** | `max_sub_io_latency_us`，并用 `max_sub_io_cid` 与 target 侧 W9 关联 |
+| drain 占比 | `last_submit_to_complete_us` ÷ `total_us` |
+
+**⇒ 只要能答出「lane 数、信用等待、队头阻塞」这三项，就能判定客户端侧到底有没有责任。**
+
+## F. 回执必答（第一行）
+
+`nofTiming` 是否取到（有几行日志）；vseg/plain 各落在几条 lane；`credit_wait_us` 与 `head_to_first_submit_us` 的 p50；`max_sub_io_latency_us`；`sub_io_count`；源码是否已回滚 + 是否已重编回原状；`vseg_nof095` 的 Keys 与 oplog 增量；有无失败。
+
+## G. 边界
+
+- **只改 `client_service.cpp` 一个文件**，必须备份 + 回滚 + 重编回原状。
+- **禁止重启 target**（PID 905586 / md5 `3129641f…` 不变）。
+- **禁止改共用 etcd、禁止删 `/oplog` 前缀、禁止改 `/etc/spdiag/spdiag.conf`。**
+- 建 vseg cid 允许重启 master，但**必须带全 §C 的参数**。
+- 400 keys 上限；写入前查 etcd 余量（当前约 150 MB）。
+- 不碰他人进程（royi / yin / node1 上的 cmake 构建）。
+- 冒烟失败（日志无 `nof095_vseg_timing`）⇒ **停手回执**，不要改采样开关或试其他参数。
 
 ---
 
