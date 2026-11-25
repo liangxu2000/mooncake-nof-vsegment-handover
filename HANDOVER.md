@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-111（单变量：`--nof_qpairs_per_segment=1` + `MC_NOF_INFLIGHT_BYTES_LIMIT=8MiB` 夹紧；判断“每 key 两个 qpair 扇出”是否是 target 慢档触发条件；两臂各 3 遍；零写/零重启/零改码）**。NOF-110 完成：`MC_NOF_WORKERS=1` 对 vseg **无改善**（P50 555.00→558.50，W9 248.80→249.36），plain 不变（274.00→266.27，W9 120.07→120.36）；`MC_NOF_DEBUG` 证明 4 条 lane 全绑到 worker0，且**两配置的 lane/segment inflight 额度相同（16384/65536）** ⇒ **worker 线程分布、inflight 额度均排除**。**但 qpair 仍是 4 条**：`transfer_task.cpp:911-916` 的 `binding.next_lane++ % lane_count` 让连续 task 轮转到不同 qpair；vseg 的两个 child 连续提交 ⇒ 每 key 用 **2 条 qpair**，plain 每 key 只用 **1 条**。所以“qpair 扇出”未被 NOF-110 排除，交给 NOF-111。前序：NOF-109 已判两 child 100% 并行、每 child 自身慢；NOF-108 已补 `type` 并定位 95% 差值在 `completion_wait`。
+- 当前任务：**NOF-112（LBA 布局对照：离线解析 vseg `nof_slow_task` 的 lba/offset + plain 补 1 遍 threshold=1 的 LBA 日志；判断“vseg 数据落点”能否解释 2×；零写/零重启/零改码）**。NOF-111 完成：`--nof_qpairs_per_segment=1` + 8MiB 夹紧后 vseg **无改善**（W9 248.80→248.87、P50 555.00→558.74），plain W9 120.29；探针证明 1 条 lane/qpair、单 lane 额度仍 16384 ⇒ **qpair 扇出排除**。累计：NOF-108（resolve/prepare/submit <10µs、95% 在 completion_wait）、NOF-109（两 child 100% 并行、各 ~380µs）、NOF-110（worker 分布 + 额度）、NOF-111（qpair 扇出）⇒ **客户端可见的组织方式基本排除**。注意：**“两个 child 合并成一个 task”本身尚未实现/操纵**，但在 workers=1+qpairs=1 下两个 child 已共享同一 worker 和同一 qpair，target 看到的 32×128KiB 数量/大小/通道相同；剩余差异首选**数据 LBA/落点**。三次独立实验 W9 比值均精确 2.07×。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -7658,3 +7658,91 @@ vsegment 规划参数（命令行）：
 - 只切 master（vseg→plain），不碰他人进程；失败停手回报。
 - qpairs=1 只用于机制判定，不作为最终性能配置对外。
 - 注意：qpairs=1 会改变 target 看到的连接数（4→1），这本身就是本单要测的变量；不要把它和“客户端 worker 数”混为一谈。
+
+---
+
+## NOF-111 裁决（2026-11-25 · 回执已收）
+
+### 1. 结果（[事实]，diag 关，3 遍，µs）
+
+| 指标 | qpairs=4 | workers=1 | qpairs=1 |
+|---|---|---|---|
+| plain P50 | 274.00 | 266.27 | 254.10（漂移，W9 未动） |
+| plain W9 | 120.07 | 120.36 | 120.29 |
+| vseg P50 | 555.00 | 558.50 | 558.74 |
+| vseg W9 | 248.80 | 249.36 | **248.87** |
+| W9 比值 | 2.07× | 2.07× | **2.07×** |
+
+- 探针：`NoF qpairs/segment: 1`、`lanes=1`、`lane=0 qpair_id=2`、`lane_inflight_blocks_limit=16384` ⇒ 单变量成立，额度与基线同值（不是“额度变化抵消收益”）。
+- `segment_inflight_blocks_limit` 从 65536 降到 16384 是 `lane_count=1` 的直接结果；T1 每 key 32×128KiB=4MiB=8192 blocks，仍小于 16384，不会限流。
+- plain P50 254 vs 274：W9 完全没动（120.29 vs 120.07），且近几单 plain P50 在 253–277 漂移；**不作归因**。
+
+### 2. 判决
+
+- **qpair 扇出不是原因（L1 排除）**：把 4 条 qpair 压到 1 条，vseg W9 三遍 248.79/248.87/248.86，与基线差 0.03%。
+- **客户端组织方式累计排除**：resolve/prepare/submit（NOF-108）、child 串行（NOF-109）、worker 分布与 inflight 额度（NOF-110）、qpair 扇出（NOF-111）。
+- 三次独立实验 W9 比值都精确锁在 **2.07×** ⇒ 差异稳定锚在 **target 对单笔 128KiB IO 的服务时间**。
+
+### 3. 措辞边界（防过度）
+
+- 回执写“child 拆分也排除”——严格说，**“两个 child 合并成一个 task”没有实现过**；被操纵的是 worker/inflight/qpair。只是在 workers=1 + qpairs=1 下，两个 child 已共享同一 worker、同一 qpair，target 看到的 32 个 128KiB IO 在数量/大小/通道上都与 plain 相同。因此可以把“客户端组织方式”视为基本排除，但**不能写“已证明合并 task 无效”**。
+- W9 只覆盖 target 的 `exec→bdev_cpl`；`completion_wait` 还含 URMA 往返/完成通知。说“锚在 target 单 IO 服务时间”是**落点**，不是机制根因。
+- **数据 LBA/落点仍未对照**；这是当前唯一能直接解释“所有 vseg key 都慢”的客户端可见差异。
+
+### 4. 下一步
+
+**NOF-112（LBA 布局对照）**：
+- vseg 侧**零成本**：NOF-108 的 vseg 日志里 `nof_slow_task` 已经带 `lba` / `blocks` / `offset_bytes` / `max_subio_lba`（每遍 1056 条），可直接解析出 400 个 key 的两个 child 物理 LBA。
+- plain 侧：补 1 遍 `MC_NOF_SLOW_TRACE_THRESHOLD_US=1` 的只读日志（目前 plain master 2203377 在跑），拿 528 条 task 的 LBA；仅用于布局，不作性能。
+- 判读：若 vseg 两个 child 相邻、且其 LBA 大部分不在盘首慢区，**但 per-key 延迟仍平坦 ~470µs** ⇒ 位置解释力弱，下一步转 target 侧 trace；若 vseg 数据明显落在慢区/碎片化 ⇒ 布局是主因，改分配策略。
+
+---
+
+# NOF-112（待执行 · LBA 布局对照 · 零写/零重启/零改码 · 2026-11-25）
+
+## 目标
+
+- 拿到两臂 400 个 key 的**精确物理 LBA**，回答：vseg 的 2× 是否可能由数据落点（盘首慢区、跨盘分布、碎片化）解释。
+- vseg 侧直接用 **NOF-108 已落盘日志**（diag on 时 `nof_slow_task` 每 child 一条，含 `lba/blocks/offset_bytes/max_subio_lba`），不重跑。
+- plain 侧补 **1 遍只读 LBA 日志**：`MC_NOF_SLOW_TRACE_THRESHOLD_US=1` 让每个 task 都打印；仅用于布局，不作性能结论。
+
+## A. vseg 离线解析（不碰环境）
+
+1. 日志：`run/nof108_vsegp{1,2,3}.log`（注意实际文件名无下划线；若不存在，用 `ls run/nof108_vseg*` 核对后说明）。每遍应有 `nof_slow_task=1056` 条（400 measured + 128 warmup，×2 child）。
+2. 每条取：`vsegment_op_id`、`child_idx`、`child_count`、`lba`、`blocks`、`offset_bytes`、`length_bytes`、`qpair_id`、`max_subio_lba`、`max_subio_blocks`。
+3. 按 `(trace_id, vsegment_op_id)` 归组；warmup/measured 的切分沿用 NOF-109 的方法（按 op first_submit 排序，前 128 为 warmup），并说明这是 [推算]。
+4. 每个 measured key 计算：
+   - `child1.lba - child0.lba`（期望 4096 blocks = 2MiB；统计相邻比例）；
+   - 两个 child 的 namespace 偏移（bytes）与覆盖范围；
+   - per-disk 分布：`strip = lba / 512`（256KiB strip）、`disk = strip % 11`、`round = strip / 11`、`offset_on_disk = round × 256KiB + (lba % 512) × 512B`；
+   - 慢区标记：`offset_on_disk < 36MiB`（同时用由 plain 前缀实测的 384MiB/11 ≈ 34.9MiB 再算一版）；
+   - 对 `max_subio_lba` 做同样统计（每个 child 一个样本，补充 128KiB 落点）。
+5. 与 NOF-108 的逐 key `read_us` 关联：
+   - 按 key 的 child0 LBA 分桶（前 384MiB / 384MiB–1GiB / >1GiB，或四分位），看 read_us 是否随 LBA 变化；
+   - 计算“慢区 child 占比”与“慢区 key 的平均 read_us vs 非慢区 key”。
+
+## B. plain LBA 日志（1 遍只读）
+
+1. 预检：plain master 2203377 运行、Keys=400；target 2142228 不动。
+2. reader：`MC_NOF_SLOW_TRACE_THRESHOLD_US=1`，diag 关；其余同 NOF-107（400 keys、4MiB、T1、warmup=128、qpairs=4、verify=false）。
+3. 每遍前 `nof_register`；跑 **1 遍**；400/0。
+4. 解析 528 条 `nof_slow_task`：`lba`、`blocks`（期望 8192）、`max_subio_lba`；用与 A 相同的 per-disk/慢区公式统计。
+5. 记录 P50/W9 仅作有效性检查（threshold 日志有开销，**不作性能结论**）。
+
+## C. 对比与判决（必答）
+
+1. 两臂 LBA 表：min/max/span、每盘 strip 数、慢区 child/key 占比、相邻比例。
+2. **同 key index** 的 LBA 差分布（只作布局对照，不声称同位置）。
+3. vseg 内部：key read_us 与 (a) child0 LBA、(b) 慢区标记、(c) 每盘分布 的相关性。
+4. 判决三选一：
+   - **布局可解释**：vseg 数据显著落在慢区/碎片化，且慢区 key 明显更慢；
+   - **布局解释力弱**：vseg 数据大部分不在慢区、child 相邻，且 key 延迟与 LBA 无相关 ⇒ 下一步转 target 侧 trace；
+   - **混合**：给出比例与边界。
+5. 5 个代表 key 的原始 `nof_slow_task` 行（vseg 两 child + plain 一条）。
+
+## D. 边界
+
+- **零写入**；target 不重启；不改码/不重编；不启用 BUFFER；不跑 16t；不动 `/usr/local`。
+- 不切换 master：plain master 已在跑，vseg 日志直接用 NOF-108 的，无需重启 vseg。
+- threshold=1 的 plain 单遍只用于 LBA 采集，**不得把它的 P50/W9 当性能数字**。
+- 所有 LBA 统计都基于 **512B block**；若发现 block_size 不是 512，停手回报并写明实际值。

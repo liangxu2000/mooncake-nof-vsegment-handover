@@ -251,6 +251,26 @@ vseg:       ~465µs          │        ~470–485µs（平坦，没有快档）
 
 因此 NOF-110 的回执里“客户端编排、队列归属、并发深度全部排除”是**说过头了**；qpair 扇出留给 NOF-111（`--nof_qpairs_per_segment=1` + 8MiB 额度夹紧）。
 
+### 5.4 NOF-111：qpair 扇出也排除；客户端组织方式基本清空
+
+`--nof_qpairs_per_segment=1` + `MC_NOF_INFLIGHT_BYTES_LIMIT=8MiB`（单 lane 额度仍 16384），两臂各 3 遍：
+
+| 指标 | qpairs=4 | workers=1 | qpairs=1 |
+|---|---|---|---|
+| plain P50 | 274.00 | 266.27 | 254.10（漂移，W9 未动） |
+| plain W9 | 120.07 | 120.36 | 120.29 |
+| vseg P50 | 555.00 | 558.50 | 558.74 |
+| vseg W9 | 248.80 | 249.36 | **248.87** |
+| W9 比值 | 2.07× | 2.07× | **2.07×** |
+
+- 探针：`NoF qpairs/segment: 1`、`lanes=1`、`lane=0 qpair_id=2`、`lane_inflight_blocks_limit=16384` ⇒ 单变量成立。
+- vseg W9 三遍 248.79/248.87/248.86，与基线差 0.03% ⇒ **qpair 扇出不是原因（L1）**。
+- plain P50 254 vs 274 不归因：W9 完全没动，近几单 plain P50 在 253–277 漂移。
+
+累计排除：resolve/prepare/submit（NOF-108）、child 串行（NOF-109）、worker 分布 + inflight 额度（NOF-110）、qpair 扇出（NOF-111）。三次独立实验 W9 比值都精确 2.07× ⇒ 差异稳定锚在 target 对单笔 128KiB IO 的服务时间。
+
+**措辞边界**：没有实现过“把两个 child 合并成一个 task”，所以不能说“合并 task 已证明无效”；只是在 workers=1+qpairs=1 下，两个 child 已共享同一 worker、同一 qpair，target 看到的 32×128KiB 在数量/大小/通道上都与 plain 相同。**数据 LBA/落点仍未对照**，这是当前唯一能直接解释“所有 vseg key 都慢”的客户端可见差异。
+
 ---
 
 ## 6. 本轮顺带补掉的证据与混杂
@@ -338,7 +358,6 @@ MC_STORE_TRANSFER_DIAG=1
 
 **NOF-110 已完成**：`MC_NOF_WORKERS=1` 对 vseg 无改善（558.50/249.36 vs 555.00/248.80），inflight 额度两配置相同 ⇒ **worker 线程分布、额度排除**（见 5.3）。
 
-**NOF-111（待执行）**：`--nof_qpairs_per_segment=1` + `MC_NOF_INFLIGHT_BYTES_LIMIT=8MiB`，让两个 child 共享同一条 qpair（T1 下 plain 每 key 只用 1 条 qpair，作对照），两臂各 3 遍。  
-- 若 vseg 明显变快 ⇒ “每 key 两个 qpair 扇出”是 target 慢档触发条件；修法是合并相邻 child 为一个 4MiB task。  
-- 若不变 ⇒ qpair 扇出也排除，转向 LBA/布局或 target 侧 trace。  
-零写、target 不重启、零改码。
+**NOF-111 已完成**：`--nof_qpairs_per_segment=1` + 8MiB 夹紧，vseg W9 248.87（与基线差 0.03%）⇒ **qpair 扇出排除**（见 5.4）。
+
+**NOF-112（待执行）**：LBA 布局对照。vseg 直接解析 NOF-108 的 `nof_slow_task`（已带 `lba/offset_bytes/max_subio_lba`，每遍 1056 条）；plain 补 1 遍 `MC_NOF_SLOW_TRACE_THRESHOLD_US=1` 的只读 LBA 日志。判定 vseg 数据是否落在盘首慢区/碎片化，以及 per-key 延迟是否与 LBA 相关。零写、target 不重启、零改码。

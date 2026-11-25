@@ -82,7 +82,8 @@ node2（reader + writer）                     node4（master + etcd + target）
 | **NOF-108** | vseg 2× 归因第一步 | `type` 补证 **vseg 528/528 / plain 528/528**；**95% 差值在 `completion_wait`（+206.5µs）**，客户端逻辑排除；W9 **248.03 vs 120.08µs（2.07×）**；plain 后跑不变 ⇒ 臂序排除。**plain 实测 key 0–95 三遍一致前缀慢档（~452µs vs 96+ ~250µs），vseg 全区平坦 ~470µs**；diag 开销不对称，真实比值仍用 diag-off 2.03× |
 | **NOF-109** | vsegment 子任务时序（纯离线） | **1200/1200 op overlap 100%**；submit_skew 6.8µs、completion_gap 22.9µs；child0/child1 各 ~375/394µs；op span 420µs = **1.10× 单 child**、span/(lat0+lat1)=0.52 ⇒ **“串行两波”被否，“并行但每 child 自身慢”成立**。源码确认 `member_count=1` 时两 child 物理相邻 |
 | **NOF-110** | 单变量 `MC_NOF_WORKERS=1` | **无改善**：vseg P50 555.00→558.50、W9 248.80→249.36；plain 274.00→266.27、W9 120.07→120.36。4 条 lane 全绑 worker0，两配置 `lane_inflight=16384`/`segment_inflight=65536` 相同 ⇒ **worker 分布、inflight 额度排除**。但 qpair 仍 4 条，连续 task 轮转 ⇒ vseg 每 key 2 条 qpair、plain 1 条，**qpair 扇出未排除** |
-| **NOF-111（当前）** | 单变量 qpair 数 | `--nof_qpairs_per_segment=1` + `MC_NOF_INFLIGHT_BYTES_LIMIT=8MiB` 夹紧，让两 child 共享一条 qpair（plain 每 key 只用 1 条，作对照）；两臂各 3 遍。若 vseg 变快 ⇒ 合并相邻 child 为一个 4MiB task；若不变 ⇒ 转 LBA/布局或 target trace。零写/零重启/零改码 |
+| **NOF-111** | 单变量 qpair 数 | **无改善**：vseg W9 248.80→**248.87**、P50 555.00→558.74；plain W9 120.29。探针确认 1 条 lane/qpair、单 lane 额度仍 16384 ⇒ **qpair 扇出排除**。客户端组织方式累计全部排除；W9 比值三次独立实验均为 **2.07×** |
+| **NOF-112（当前）** | LBA 布局对照 | vseg 离线解析 NOF-108 日志的 `nof_slow_task`（`lba/offset_bytes/max_subio_lba`，每遍 1056 条）；plain 补 1 遍 `MC_NOF_SLOW_TRACE_THRESHOLD_US=1` 只读 LBA 日志；判断 vseg 数据是否落在盘首慢区/碎片化、per-key 延迟是否与 LBA 相关。零写/零重启/零改码 |
 
 ---
 
@@ -92,9 +93,10 @@ node2（reader + writer）                     node4（master + etcd + target）
 2. **已回答（NOF-108）**：`type` 确认走 vsegment；客户端 95% 差值在 `completion_wait`，resolve/submit 可忽略；臂序排除。**plain 有 key 0–95 前缀慢档，vseg 全区平坦 ~470µs ⇒ 2× 来自 plain 快区**。
 3. **已回答（NOF-109）**：两个 child **100% 重叠**，span = 1.10× 单 child ⇒ 不是串行两波；**每个 child 自身慢**。源码确认两 child 物理相邻。
 4. **已回答（NOF-110）**：`MC_NOF_WORKERS=1` 无改善 ⇒ worker 线程分布、inflight 额度排除；但 qpair 仍 4 条，**每 key 两个 qpair 扇出未排除**。
-5. **进行中（NOF-111）**：`--nof_qpairs_per_segment=1` + 8MiB 额度夹紧，让两 child 共享一条 qpair；看 vseg 是否向 plain 靠近 ⇒ 判断 qpair 扇出是否 target 慢档触发条件。
-6. **仍未隔离**：两臂物理 LBA/写入历史不同 ⇒ 路径归因仍为 L2；只有同 LBA/同数据对照才能升到 L3。
-7. **要达成用户目标（vseg 必须快于 plain）**：若 111 显示 qpair 扇出是原因，合并相邻 child 为一个 4MiB task；若否，转向 LBA/布局或 target 侧 trace。
+5. **已回答（NOF-111）**：qpairs=1 无改善（W9 248.87）⇒ qpair 扇出排除；客户端组织方式累计全部排除。
+6. **进行中（NOF-112）**：LBA 布局对照——vseg 数据是否落在盘首慢区/碎片化，per-key 延迟是否与 LBA 相关。
+7. **仍未隔离**：两臂物理 LBA/写入历史不同 ⇒ 路径归因仍为 L2；只有同 LBA/同数据对照才能升到 L3。
+8. **要达成用户目标（vseg 必须快于 plain）**：若 112 显示布局是主因，改分配/落点；若布局解释力弱，转 target 侧 trace（bdev/URMA 层）。
 
 **注意**：NOF-106 的 10-key P50 555.36µs 是 node2 远端读、10 个 key 的冒烟，含冷启动/远端路径，不能当性能基线。正式数字只看 NOF-107/108 的 400-key 3 遍。
 
