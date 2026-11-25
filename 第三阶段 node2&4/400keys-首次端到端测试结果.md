@@ -398,4 +398,6 @@ MC_STORE_TRANSFER_DIAG=1
 - vseg 的 2MiB child 直接作为一个大 IO 下发（`MC_NOF_SUBMIT_CHUNK_BYTES`=1M/2M），plain 保持 128K；
 - 同时跑 plain 的大 IO 臂作同工作对照；
 - T1 400 keys、每臂 3 遍、零写、target 不重启、不重编。
-- 回答：vseg@2M 能否快于 plain@128K？同 2M 下 vseg 是否有优势？若都不行 ⇒ 单 target 同工作无赢面，停止配置调参，转多 target/member 或内存分层。用户强调：即使单 target，开了 vseg 也应比 plain 快。
+- 回答：vseg@2M 与 plain@128K 的 P50/W9 差多少？是否达到 **parity**？同 2M 下 vseg 是否有优势？
+- **用户验收（2026-11-25）：打平即可，2× 绝不可接受**；parity = P50/W9 ≤ plain×1.05。
+- 若配置达不到 parity ⇒ 唯一已知的 parity 修法是合并相邻 child（需批准改码）；否则转多 target/member 或内存分层。

@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-113R（修订 · 纯配置：vseg 大 IO vs plain；零改码/零写/零重启）**。**用户明确：现在不接受修改 vsegment 的逻辑代码** ⇒ NOF-113 的 merge 补丁已取消并从仓库撤下，不 apply/不构建。修订后只测一个 vseg 独有配置：让 vseg 的 2MiB child 作为一个 IO 下发（`MC_NOF_SUBMIT_CHUNK_BYTES`=1M/2M），plain 保持 128K 对照；同时跑 plain 的大 IO 臂作同工作对照。回答：vseg@2M 能否快于 plain@128K？同 2M 下 vseg 是否有优势？若都不行 ⇒ 单 target 同工作无 vseg 赢面，停止配置调参，转多 target/member 或内存分层。**NOF-112 完成**：两臂 400/400 起始 LBA 完全相同，非慢区 301 key 上 vseg 301/301 全慢（478.5 vs 179.0µs），慢区相等 ⇒ 位置不能解释 2×。**用户强调：即使单 target，开了 vseg 也应比 plain 快**；但同一份工作（同 target/同 LBA/同 IO 数）物理上最多 parity，要更快必须让 vseg 做不同的功（更大 IO / 多 member 跨独立 target / 内存分层）。
+- 当前任务：**NOF-113R（修订 · 纯配置：vseg 大 IO vs plain；零改码/零写/零重启）**。**用户明确：现在不接受修改 vsegment 的逻辑代码** ⇒ NOF-113 的 merge 补丁已取消并从仓库撤下，不 apply/不构建。修订后只测一个 vseg 独有配置：让 vseg 的 2MiB child 作为一个 IO 下发（`MC_NOF_SUBMIT_CHUNK_BYTES`=1M/2M），plain 保持 128K 对照；同时跑 plain 的大 IO 臂作同工作对照。回答：vseg@2M 能否快于 plain@128K？同 2M 下 vseg 是否有优势？若都不行 ⇒ 单 target 同工作无 vseg 赢面，停止配置调参，转多 target/member 或内存分层。**NOF-112 完成**：两臂 400/400 起始 LBA 完全相同，非慢区 301 key 上 vseg 301/301 全慢（478.5 vs 179.0µs），慢区相等 ⇒ 位置不能解释 2×。**用户最新验收（2026-11-25）：打平即可，2× 绝不可接受**；因此 NOF-113R 以 **parity（P50/W9 ≤ plain×1.05）** 为成功标准。若配置达不到，唯一已知的 parity 修法是合并相邻 child（改 vseg 读提交逻辑，需用户另行批准）；多 target/member 或内存分层属于另一路线。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -7933,11 +7933,14 @@ vsegment 规划参数（命令行）：
 1. 探针原始行：每个 chunk 的 `blocks_per_chunk` 与实际生效证据。
 2. 矩阵表：臂、chunk、3 遍 P50/W9、failed；附 vseg/plain 比值。
 3. 三个问题的直接答案：
-   - vseg@2M 是否 ≤ plain@128K？
+   - vseg@2M 与 plain@128K 的 P50/W9 差多少？是否达到 **parity**？
    - vseg@2M 与 plain@2M 是否相同/谁快？
    - 大 IO 是否降低绝对时延？最佳配置数值。
-4. 判决：若 vseg@2M 仍不赢 plain@128K，且 vseg@2M ≈ plain@2M ⇒ 明确写“单 target 同工作下无 vseg 赢面；需要多 target/member 或内存分层”。
-5. 环境末态与回退（env 不设即回原配置）。
+4. **验收口径（用户 2026-11-25 明确）**：**打平即可，2× 绝不可接受**。parity 定义为 vseg 的 P50 与 W9 均 ≤ plain 基线 ×1.05（或绝对差 ≤10–15µs）；超过即未达标。
+5. 判决分支：
+   - 若 vseg@2M 达到 parity ⇒ **本方向达标**，记录最佳配置（env 值），无需改码。
+   - 若仍有明显差距（>1.2×）⇒ 记录“单 target 配置调参不能消除差距”；**唯一已知的 parity 修法是合并相邻 child（改 vseg 读提交逻辑，需用户另行批准）**；多 target/member 或内存分层属于另一路线（可更快，但工作量大）。
+6. 环境末态与回退（env 不设即回原配置）。
 
 ## E. 边界
 
