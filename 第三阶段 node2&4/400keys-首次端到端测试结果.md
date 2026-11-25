@@ -394,8 +394,8 @@ MC_STORE_TRANSFER_DIAG=1
 
 **NOF-112 已完成**：两臂起始 LBA 逐值相同 400/400；在非慢区 301 个 key 上 vseg 301/301 全慢（478.5 vs 179.0µs），慢区两臂相等 ⇒ **数据落点解释力弱/被否**（见 5.5）。
 
-**NOF-113（已下发，用户批准“一起上”）**：一次跑完 merge × chunk × 并发矩阵：
-- vseg：T1 128K off/on、512K off/on、256K off、T4/T16 128K off；
-- plain：T1 128K/256K/512K、T4/T16 128K；
-- 每臂 3 遍，零写、target 不重启，只重建带 env 开关的 bench。
-- 四个问题：merge 是否消除 2×、chunk 是否改变绝对时延/比值、T4/T16 是否收敛、**是否存在任何配置 vseg ≤ plain**；若没有，说明当前同工作/单 member 配置达不到要求，下一步改工作方式（多 member/独立 target 或分层），不再调参。用户强调：即使单 target，开了 vseg 也应比 plain 快。
+**NOF-113R（当前 · 纯配置）**：用户明确**不接受修改 vsegment 逻辑代码**，merge 补丁取消并撤下；只测一个 vseg 独有杠杆：
+- vseg 的 2MiB child 直接作为一个大 IO 下发（`MC_NOF_SUBMIT_CHUNK_BYTES`=1M/2M），plain 保持 128K；
+- 同时跑 plain 的大 IO 臂作同工作对照；
+- T1 400 keys、每臂 3 遍、零写、target 不重启、不重编。
+- 回答：vseg@2M 能否快于 plain@128K？同 2M 下 vseg 是否有优势？若都不行 ⇒ 单 target 同工作无赢面，停止配置调参，转多 target/member 或内存分层。用户强调：即使单 target，开了 vseg 也应比 plain 快。
