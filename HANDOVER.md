@@ -7568,6 +7568,8 @@ vsegment 规划参数（命令行）：
 4. 判决：workers=1 是否让 vseg 明显变快；plain 是否保持不变。
 5. 若没变化，明确写“task/lane 分布不是原因”，不要外推。
 
+**判读注意（必须写进回执）**：`SpdkNofQos` 的 `inflight_blocks_limit = MC_NOF_INFLIGHT_BYTES_LIMIT(32MiB) / lane_count`（`transfer_task.cpp:655-668`）。workers=1 时单 lane 额度从 8MiB 提到 **32MiB**，所以若 vseg 变快，**不能直接归因“两个 task 同 lane”**，也可能是“单 lane 额度变大”。下一单需用 `MC_NOF_WORKERS=1` + 调低 `MC_NOF_INFLIGHT_BYTES_LIMIT`（例如 8MiB）把两者分离。
+
 ## F. 边界
 
 - **零写入**；target 不重启；不改码/不重编；不启用 diag/BUFFER；不跑 16t；不动 `/usr/local`。
