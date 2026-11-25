@@ -111,7 +111,8 @@ node2（reader + writer）                     node4（master + etcd + target）
 3. **node2 根分区仅 2.6G**：大文件只放 /home；不要把日志/构建写根盘。
 4. **源码/依赖离线**：三台集群机无外网，源码/子模块/gtest 需 Windows 中转；etcd Go wrapper 复用 node3 预构建库，版本差异需记录。
 5. **RAID0 superblock=false**：11 盘顺序敏感；node4 已按 BDF 升序接回，后续任何重启都要重新核对 BDF。
-6. **旧结论不可直接复用**：be10be29/node1 的数字与 supercache/node4 不可跨环境相减；第三阶段必须重新基线化。
+6. **旧结论不可直接复用**：be10be29/node1 的数字与 supercache/node4 不可跨环境相减；第三阶段必须重新基线化。旧数字亦未经本侧复核，只作参照。
+7. **盘首慢窗口未在 node2/node4 验证**：36MB/盘、RAID0 前 ~396MB、keys 0–96 都是 node1/node3 的观测，新环境的盘序/RAID/数据布局不同，不能预设。NOF-107 主表用全量 400 keys；只有新数据里出现多遍可重复的按 key index 前缀慢档时，才按实测边界追加排除列，禁止套用 0–96。
 
 ---
 
