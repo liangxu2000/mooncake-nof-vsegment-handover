@@ -97,7 +97,8 @@
 >
 > ⇒ **目前唯一「可重启且数据完好」的是 `plain_nof088`。任何新的 vseg 实验都必须新建 cid 重写数据。**
 
-- 当前任务：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 绕开 128 样本配额）**。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（`client_service.cpp:5956-5990`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
+- 当前任务：**无 —— NOF-094 已收口（A 段不成立，spdiag 路线关闭），下一单 NOF-095 待派**：改码一次到位，在 `TransferReadInternal` 输出 `future.nofTiming()` 的 20+ 个字段（`dispatch_queue_us` / `credit_wait_us` / `qos_fifo_wait_us` / `submit_span_us` / `drain_us` / `sub_io_count`），比「三段 chrono」信息量大一个数量级。**另：建 cid 必须带完整 env（slot / URMA 设备 / vsegment 规划 8 参数），昨日漏 slot_count 导致 12 小时数据无效。**
+- 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 绕开 128 样本配额）**。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（`client_service.cpp:5956-5990`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 绕过 SpDiag 的 128 样本配额）**。前两轮结论：B1 路线可行但每个点位只记前 128 样本，而 warmup 正好 128 个把配额吃满 ⇒ 抓到的全是冷启动数据。**推断 128 即配额，故用 warmup=0 让前 128 个样本落在测量段。** 判据看数值是否从 554µs 降到 ~300µs 量级。**同时必须建 `vseg_nof091`（400 keys），vseg 臂前两轮一轮都没跑。** NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
 - 历史：**NOF-091（拿 vsegment 的 plan/submit/wait 分解）**。用户 20:41 批准派任务。**优先零改码**：源码里三个 `SpDiag::PerfPoint` 埋点（`VSEGMENT_READ_PLAN/SUBMIT/WAIT`）已存在，若构建是 Layer 1 且 `spdiag` CLI 在，直接 `spdiag show` 拿数；否则才加 chrono 重编（65s）。
@@ -5961,7 +5962,67 @@ read_overhead_us = read_us - known_read_us    // read_us <= known 时为 0
 
 > **本单替代 NOF-091（091 三轮概念已混，废弃不再续）。091 的结论只继承两条**：① SpDiag 是 Layer 1 且埋点活着；② 每点位只记 **128** 个样本，被 `warmup_keys=128` 吃满，故只拿到冷启动数据。
 
-## 0. 为什么派这单
+> **【2026-11-25 10:55 开发侧裁决 · spdiag 路线关闭 · 改走改码，但一次改到位】**
+>
+> ### 1. A 段不成立，我的假设错了
+>
+> 我的假设是「SpDiag 每点位只存前 128 个样本，warmup=128 把配额吃满」。**实测否证**：
+> - `warmup=0` 时，读取点位样本数 = **0**（不是 128）
+> - 对照 `warmup=128` 时，13 个读取点位**全是 128**
+> - 且与遍数无关（091 第二轮 6 遍后仍 128）
+>
+> **⇒ 「128 是配额上限」这个推断不成立。** 128 更像「进程存活期间只赶上一次快照」的副产物，而 `warmup=0` 时进程活得更短，连那次快照都没赶上。
+> **⇒ 接受回执建议：spdiag 取样路线关闭，不再试。**（5 次观测、跨两轮、跨两次 master 重启，已足够）
+>
+> ### 2. 但改码不该只加 chrono —— 一次改到位
+>
+> 回执建议「改 `client_service.cpp` 加 chrono」。**开发侧认为这个方案太保守，会浪费一轮编译。**
+>
+> **本单源码排查发现**：`Client::BatchGet` 里有 `future.nofTiming()`，能一次性给出 **20+ 个客户端内部时序字段**（`client_service.cpp:2338-2440`）：
+>
+> | 字段 | 含义 | 为什么关键 |
+> |---|---|---|
+> | `sub_io_count` | 子 IO 数 | vseg 是不是真的拆成 2×16 |
+> | **`dispatch_queue_us`** | **调度队列耗时** | **IO 在客户端排了多久队** |
+> | `worker_setup_us` | worker 准备耗时 | 线程分配开销 |
+> | **`qos_fifo_wait_us`** | **QoS FIFO 等待** | 是否被 QoS 限流 |
+> | **`credit_wait_us`** | **信用等待** | 是否等 URMA credit |
+> | **`submit_span_us`** | **首次到末次提交** | **提交是否被拉开** |
+> | **`drain_us`** | **末次提交到完成** | 等数据回来的净时间 |
+> | `task_total_us` | 任务总耗时 | 对账用 |
+>
+> **但这套输出只在 `BatchGet` 路径上；bench 走的是 `TransferReadInternal`（`client_service.cpp:5956-5990`），那里没有。**
+>
+> **⇒ 改码只需在 `TransferReadInternal` 的 `future->get()` 之后，把 `future.nofTiming()` 的字段打到日志里（约 20 行）。一次编译，拿到的信息比「三段 chrono」多一个数量级。**
+>
+> ### 3. 回执里两条新发现，价值很高
+>
+> **新发现 A：master 重启会丢 NoF 挂载。** `/cvm/<cid>/` 无 `segments/` 键，必须重跑 `nof_register`；**且一次成功 bench 跑完后挂载会再次消失** ⇒ 需「每遍前先挂载」。
+> **新发现 B：master 侧持续报 `spdk_wrapper.cpp:638 Failed to attach NoF controller rc=-19 (ENODEV)`**，未定位。
+> **⇒ 这两条都指向「master 与 NoF 挂载的稳定性」问题，与性能结论无直接关系，但会影响每轮实验的可重复性。登记为产品级缺陷，后续单独查。**
+>
+> **新发现 C（最有价值）：建 vseg cid 必须带一整套 vsegment 规划参数。**
+> `node1:/tmp/nof076_switch.sh` 里的完整参数组：
+> ```
+> --cvm_segments_vsegment_exclusive=true
+> --vsegment_auto_plan=true
+> --vsegment_required_medium=nof
+> --vsegment_io_alignment=4096
+> --vsegment_member_count=1
+> --vsegment_stripe_size=2097152
+> --vsegment_member_extent_size=67108864
+> --vsegment_reserved_ratio=0
+> ```
+> **昨日（NOF-091）建 cid 时漏了这组参数 ⇒ 未验证，但高度吻合当时的 "insufficient space"。**
+> **⇒ 本单已把这三组参数（slot / URMA 设备 / vsegment 规划）写进任务书，回执建议采纳。**
+>
+> ### 4. 一条环境事故要认
+>
+> **昨日 21:55 切回 `plain_nof088` 时漏了 `MC_STORE_PARTITION_SLOT_COUNT=1`** ⇒ `CvmController slot count mismatch(cluster=1, local=16384)` ⇒ master 不持有 slot ⇒ **昨日 21:55 至今日 10:48 期间所有读都返回 `SLOT_NOT_OWNED`。**
+> **⇒ 责任在开发侧任务书未固化该 env。今日起所有「建 cid / 重启 master」的任务书必须带完整 env 清单。**
+> **⇒ 但昨日 21:43 那 6 遍读数在故障前的原 master（PID 2565234）上跑的，有效。**
+
+## 0. 为什么派这单（**已被 2026-11-25 裁决部分推翻，见上方；本单不再执行**）
 
 `read_us`：vseg **426µs** vs plain **165µs**（2.58×），但内部无 breakdown 埋点。
 **而源码里已有完整的三段计时**，位置在 **`TransferReadInternal`**（`client_service.cpp:5940-5990`），正是 bench 走的路径：
