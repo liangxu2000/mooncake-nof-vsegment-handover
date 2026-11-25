@@ -97,7 +97,8 @@
 >
 > ⇒ **目前唯一「可重启且数据完好」的是 `plain_nof088`。任何新的 vseg 实验都必须新建 cid 重写数据。**
 
-- 当前任务：**NOF-091 第三轮（用 `--warmup_keys=0` 绕过 SpDiag 的 128 样本配额）**。前两轮结论：B1 路线可行但每个点位只记前 128 样本，而 warmup 正好 128 个把配额吃满 ⇒ 抓到的全是冷启动数据。**推断 128 即配额，故用 warmup=0 让前 128 个样本落在测量段。** 判据看数值是否从 554µs 降到 ~300µs 量级。**同时必须建 `vseg_nof091`（400 keys），vseg 臂前两轮一轮都没跑。** NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
+- 当前任务：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 绕开 128 样本配额）**。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（`client_service.cpp:5956-5990`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
+- 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 绕过 SpDiag 的 128 样本配额）**。前两轮结论：B1 路线可行但每个点位只记前 128 样本，而 warmup 正好 128 个把配额吃满 ⇒ 抓到的全是冷启动数据。**推断 128 即配额，故用 warmup=0 让前 128 个样本落在测量段。** 判据看数值是否从 554µs 降到 ~300µs 量级。**同时必须建 `vseg_nof091`（400 keys），vseg 臂前两轮一轮都没跑。** NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
 - 历史：**NOF-091（拿 vsegment 的 plan/submit/wait 分解）**。用户 20:41 批准派任务。**优先零改码**：源码里三个 `SpDiag::PerfPoint` 埋点（`VSEGMENT_READ_PLAN/SUBMIT/WAIT`）已存在，若构建是 Layer 1 且 `spdiag` CLI 在，直接 `spdiag show` 拿数；否则才加 chrono 重编（65s）。
 - 历史（已暂停）：**NOF-090（版本对照：换掉 be10be2 看 2× 是否版本问题）**。实地核查确认：我们用的是 `LeeJace993/Mooncake` 的 **`nof-urma-v2-bench-merge`** 分支（HEAD `d371e22`，2026-10-23），**不是 kvcache-ai/Mooncake**；`be10be2` 不在我们的历史里；唯一可升的 1 个提交（`523256d`）只加 EID 配置，与性能无关。**这条线不存在「升一版拿回 2×」的选项。** 下一步待用户拍板（A 问同事 / B cherry-pick 上游修复 / C 接受现状）。
@@ -5953,6 +5954,94 @@ read_overhead_us = read_us - known_read_us    // read_us <= known 时为 0
 - 不碰他人进程（royi master 3463695 / yin 的 `vseg_yin_bonding`）。
 - 只产出 `run/nof092_summary.txt`（1 个文件，≤100 KB）。
 - **不做性能判断**，本单只回答「测试机上跑的是哪份代码」。
+
+---
+
+# NOF-094（**量 vsegment 读的三段分解：plan / submit / wait** · 零改码 · 2026-11-25 10:44 派）
+
+> **本单替代 NOF-091（091 三轮概念已混，废弃不再续）。091 的结论只继承两条**：① SpDiag 是 Layer 1 且埋点活着；② 每点位只记 **128** 个样本，被 `warmup_keys=128` 吃满，故只拿到冷启动数据。
+
+## 0. 为什么派这单
+
+`read_us`：vseg **426µs** vs plain **165µs**（2.58×），但内部无 breakdown 埋点。
+**而源码里已有完整的三段计时**，位置在 **`TransferReadInternal`**（`client_service.cpp:5940-5990`），正是 bench 走的路径：
+
+```
+get_into → execute_ranged_read → Client::Get(:1843)
+        → TransferReadRange(:6037) → TransferReadInternal(5940-5990)
+```
+
+该段代码为：
+
+| 点位 | 行 | 包住什么 |
+|---|---|---|
+| `VSEGMENT_READ_PLAN` | **5956** | `vsegment_transfer_planner_->Plan(...)` |
+| `VSEGMENT_READ_SUBMIT` | **5963** | `transfer_submitter_->submitVSegment(plan, READ)` |
+| `VSEGMENT_READ_WAIT` | **5788** | `future->get()` |
+
+> **注意**：`client_service.cpp` 里 `VSEGMENT_READ_*` 共出现 3 套（2246/5826/5956），只有 **5956 这套在 bench 的路径上**。另两套分别属于 `Client::BatchGet` 与 `Client::TransferData`，**不要采**。
+
+**⇒ 本单零改码**：埋点已在，`spdiag` 可读（Layer 1 已确认）。
+
+## A. 关键手法：`--warmup_keys=0`
+
+**091 的血泪教训**：`Ticks` 恒为 128，因为 SpDiag 每点位只存前 128 个样本，而 bench 的 `warmup=128` 正好把配额吃满 ⇒ 抓到的全是冷启动。
+
+**本单两臂一律 `--warmup_keys=0`**，让前 128 个样本落在**测量段**。
+
+**验证判据**：数值应从 091 抓到的 ~554µs（冷启动）降到 **~300µs 量级**。若仍是 554µs ⇒ 128 不是配额，**停手回执，不要改方案硬试**。
+
+## B. 执行顺序（**不可颠倒**）
+
+### B1. 先测 plain 臂（零写入）
+
+1. 对象：`plain_nof088` 的**前 400 个 key**（它现有 2000 keys，读前 400 即 1600 MiB，与 vseg 400 keys 同量）
+2. `spdiag clear` → 跑 reader：`--num_keys=400 --warmup_keys=0 --value_size=4MiB --batch_size=1 --num_threads=1`，同宿主 node3 本机
+3. 跑完立刻 `spdiag watch --interval 200` 或 `history`，取 **`GET_INTO_INTERNAL_NOF_READ`**（plain 走 nof 分支，没有 VSEGMENT_* 点位）的 `Ticks / avg / p50`
+4. **连跑 3 遍**，每遍前 `spdiag clear`，逐遍记录
+
+> **为什么 plain 的点位名不同**：`SelectGetIntoReadPerfKey()` 按副本类型分派——`is_nof_replica()` → `GET_INTO_INTERNAL_NOF_READ`；`is_vsegment_replica()` → `GET_INTO_INTERNAL_VSEG_READ`。两臂点位不同是设计如此，不是异常。
+
+### B2. 再建 vseg 臂（**会覆写 plain 前 400 key 的物理位置，所以必须 B1 之后**）
+
+1. 固化 `plain_nof088` 状态（`Keys=2000`、`/oplog/plain_nof088/` entries、`dbSize`）
+2. 切 master 到新 cid **`vseg_nof094`**（`slot=1`、vsegment enabled）
+3. 写 **400 keys**（预计 22 MB oplog；余量 150 MB）。每轮复测 `dbSize`，增量 >100 MB 立即停
+4. **`VSEGMENT_CREATING` 会丢约 23 个 key（步长 17），需多轮补写**，直到 `Keys=400`
+
+### B3. 测 vseg 臂
+
+1. `spdiag clear` → 同 B1 参数跑 reader
+2. 取 **`VSEGMENT_READ_PLAN` / `VSEGMENT_READ_SUBMIT` / `VSEGMENT_READ_WAIT`** 三个点位的 `Ticks / avg / p50`
+3. **连跑 3 遍**，逐遍记录
+
+## C. 判据（两边都写）
+
+**先对账**：三段之和 ÷ 该遍 `read_us`（vseg 约 426µs）。若和远小于 `read_us`（<70%）⇒ 还有未覆盖段，如实写明差额，**不要硬凑**。
+
+| 结果 | 判定 | 下一步 |
+|---|---|---|
+| **`wait` ≥ 70%** | 时间在**等设备** | 客户端洗清。结合 target W9 的 1.95× 与「IO 命令已被证完全一致」（NOF-073）⇒ 只剩「IO 到达时序」 |
+| **`submit` ≥ 30%** | 提交本身有开销 | 查 `submitVSegment`（`transfer_task.cpp:2479`）内的 `openSegment` 循环与 lane 分配 |
+| **`plan` > 30µs** | 开发侧「3–5µs」估算错了 | 按实际版本重估 |
+| 三段和 <70% read_us | 有未覆盖段 | 写明差额，等开发侧定 |
+
+**同时给 plain 臂的对照值**（`GET_INTO_INTERNAL_NOF_READ`），用于判「vseg 的三段结构是否与 plain 同形」。
+
+## D. 回执必答（第一行）
+
+两臂各 3 遍的三个点位 `avg / p50`；**wait 占比**；三段和 vs `read_us` 的对账；`Ticks` 是否 = 128 且数值是否降到 ~300µs 量级；`vseg_nof094` 的 `Keys` 与 oplog 增量；有无失败；**新增写入 LBA 清单**。
+
+## E. 边界
+
+- **零改码、零重编**（埋点已有，不需要动代码）。
+- **禁止改 `/etc/spdiag/spdiag.conf`**（系统级共享，影响他人）。
+- **禁止重启 target**（PID 905586 / md5 `3129641f…` 必须不变）。
+- **禁止改共用 etcd、禁止删任何 `/oplog` 前缀。**
+- B2 允许重启 master（`plain_nof088` 的 oplog 仅 899 KB，可随时切回）。
+- 不碰他人进程（royi master / yin 的 `vseg_yin_bonding` / 以及 node1 上正在 cmake 构建的进程）。
+- 若 A 段验证失败（数值仍是 554µs）⇒ **停手如实回执**，不要改配置、不要改口径凑数。
+- 产物 `run/nof094_*.txt`（≤3 个、每个 ≤1 MB）。
 
 ---
 
