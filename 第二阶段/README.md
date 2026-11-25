@@ -3,7 +3,7 @@
 > **2026-11-25 接管状态（覆盖下方所有旧“当前状态 / 当前任务”）**
 >
 > - 本文正文记录到 NOF-083，之后的历史以 `../HANDOVER.md` 与 `../工作汇总.md`《结论登记表》为准。
-> - **当前任务：NOF-095**——在 `be10be29` 的 `TransferReadInternal` 两个分支输出 `NofTransferTiming` 全字段，测 lane 分散 / credit 等待 / 队头阻塞，并看 drain 与最慢子 IO。
+> - **当前任务：NOF-096**——NOF-095 补丁成功，但当天重链二进制 attach NoF `rc=-19`；先核对 OLD/raw 的静态 SPDK 版本、wire 与真实链接库集，再恢复 `NofTransferTiming` 测量。target 不重启、零业务写入。
 > - **当前主线：C18（L2）**——vseg 比 plain 慢约 **2.07×**，`read_us` **2.58×**、`query_us` 1.11×；根因未定。
 > - **已撤回**：C03/C17「vseg 无代价」、所有 4.6–5.9× 单因归因。慢程 **N=400MiB/遍** 在单 IO 层成立，但端到端不可见（1.043×），不是端到端根因。
 > - **口径**：bench 回到 **400 keys**；2000-key 数据封存，禁止跨口径比较。target 905586 不重启；etcd 约 150MB。

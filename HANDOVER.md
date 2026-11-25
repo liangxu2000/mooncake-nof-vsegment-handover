@@ -97,7 +97,7 @@
 >
 > ⇒ **目前唯一「可重启且数据完好」的是 `plain_nof088`。任何新的 vseg 实验都必须新建 cid 重写数据。**
 
-- 当前任务：**NOF-095（输出 `NofTransferTiming` 全字段 · 改码一次 · 2026-11-25 加固）**。在我方 `be10be29` 源码副本的 `Client::TransferReadInternal`（`client_service.cpp:5926`）中，**vseg 与 plain 两个分支各在 `future->get()` 后**输出同一条 `NOF095_TIMING`（带 `arm=vseg|plain`），保留原 SpDiag；`MC_HIFREQ_LOG_SAMPLE_RATE=1`。先 plain 20-key 冒烟 + 3 遍 → 建 `vseg_nof095` 写 400 keys → vseg 20-key 冒烟 + 3 遍。一次验证 lane 分散、credit 等待、队头阻塞，并看 drain/最慢子 IO。**target 905586 不重启；建 cid 必须带全 slot/URMA/vsegment 规划参数。**
+- 当前任务：**NOF-096（M3-1 前置：定位重链后 ENODEV；先查静态 SPDK 版本与真实链接库集；零业务写入、target 不重启）**。NOF-095 补丁与构建成功，但 NEW/CTRL/裸重链全部 attach `rc=-19`，旧二进制正常；源码已回滚、原二进制未变。**不能直接断言“相同输入不可复现”**：旧二进制当初的真实链接命令/静态 SPDK 库集尚未证明与当前 `link.txt` 相同。NOF-096 先对比 OLD/raw 的内嵌 SPDK 版本、wire、build-id、链接命令与 `.a` md5；若发现旧库集不同，按旧库集重链补丁版并做 plain 20-key 冒烟。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -6141,6 +6141,16 @@ get_into → execute_ranged_read → Client::Get(:1843)
 
 # NOF-095（**输出 `NofTransferTiming` 全字段：一次拿到客户端侧 IO 画像** · 改码一次 · 2026-11-25 加固）
 
+> **【2026-11-25 NOF-095 回执 · 阻塞关闭，未产生 timing 数据】**
+>
+> - **补丁/构建成功**：be10be29 的 `TransferReadInternal` 两分支加入 `NOF095_TIMING`（+60/−1，仅一个文件）；两个构建目录产物 md5 一致 `881df1a1…`；控制组/裸重链 `0afb26d6…`。
+> - **冒烟失败**：NEW / CTRL / 裸重链全部 attach NoF controller `rc=-19 (ENODEV)`，0 次读；OLD 二进制正常。`vseg_nof095` 未创建，新增业务写入=0。
+> - **L1 成立**：不是本次补丁导致——未改源码、未改 archive 的裸重链也同样失败。
+> - **L0 成立**：当前按 `link.txt` 重链无法复现旧二进制行为。
+> - **尚不能证明“相同输入不可复现”**：旧二进制当初的真实链接命令与静态 SPDK 库集，尚未证明与当前 `link.txt` 相同；`ldd` 相同不能排除静态 SPDK 库不同。首要候选是 OLD 使用 NOF-051 的 bd5ee124d/wire v4 静态库，而裸重链使用 `/usr/local` 的另一套库。
+> - **回滚完成**：源码 md5 恢复 `a147b489…`，`.orig` 已删；原 `bench-io-params-e12=88ad3134…` / in-tree `59662a26…` 均未变；target 905586 未重启；master/etcd 未变。产物 `run/nof095_summary.txt`（5,578B / md5 7f0ae4d0…）。
+> - **下一步 NOF-096**：先查 OLD/raw 的静态 SPDK 版本与真实链接输入，再决定重链路径；不在原因未明时继续堆插桩。
+
 > **【2026-11-25 加固 · 执行以本段为准】**
 >
 > - **代码基准**：`LeeJace993/Mooncake @ mooncake-vesegment @ be10be29`。开发侧已直接核对：`mooncake-store/include/transfer_task.h:56` 的 `NofTransferTiming` 与 `:412 nofTiming()` 存在，字段齐全；`client_service.cpp:5926 Client::TransferReadInternal` 的 vseg/plain 分支各只有一个 `future`。旧 `d371e22/706551a` 的行号与源码判断不得引用。
@@ -6592,3 +6602,65 @@ vsegment 规划参数（命令行）：
 - `run/nof086_summary.txt`（≤1MB）+ 每轮 writer/reader 原始日志（≤5 个文件）。
 - 末态：`vseg_nof086` master 运行中（Keys=实际值）、target 未重启、trace mask 0x0、无残留 bench。
 - **明确写下**：该 cid 的 oplog 体积与「不可重启」状态，供后续接手人知悉。
+
+---
+
+# NOF-096（待执行 · M3-1 前置：定位重链后 ENODEV，先查静态 SPDK 版本与真实链接库集 · 2026-11-25）
+
+## 背景与目标
+
+- NOF-095 已证明：**不是补丁导致 attach 失败**——未改源码、未改 archive 的裸重链也 `rc=-19`；OLD 二进制正常。
+- 但“相同输入链接出不同结果”尚未证明：**OLD 当初的真实链接命令和静态 SPDK 库集，可能不同于当前 `link.txt`**。`ldd` 相同不能排除静态 SPDK 库不同。
+- 首要候选：OLD 使用 NOF-051 的 **bd5ee124d / wire v4** 静态库，裸重链使用 `/usr/local` 的另一套静态库。
+- 本单只回答一个问题：**OLD 与 raw 的静态 SPDK/链接输入是否相同；若不同，按 OLD 的库集能否重建出可 attach 的补丁版。**
+
+## A. 固定对照与版本取证（只读）
+
+1. 记录并保留 md5/size/mtime：
+   - OLD `bench-io-params-e12`（`88ad3134…`）、in-tree OLD（`59662a26…`）、NOF-095 raw（`0afb26d6…`）。若 raw 已删，用 NOF-095 的**原样控制命令**重链一次，记录命令与 md5；不改源码。
+2. 对 OLD / in-tree OLD / raw 分别执行：
+   - `strings | grep -E 'SPDK v|git sha1|wire|URMA|openEIPer|DPDK'`，记录内嵌版本；
+   - `readelf -n`（build-id/note）、`readelf -d`（NEEDED/RPATH/RUNPATH）、`readelf -l`（program headers）；
+   - `stat`、`getcap`、`getfattr`、`getfacl`（文件权限/cap/xattr）。
+3. 找 OLD 的**真实链接命令**：NOF-051 的重链脚本/日志、`/tmp/nof051*`、构建目录备份、shell history；与当前两个构建目录的 `link.txt` 逐词对比。
+4. 列出两条链接命令实际使用的**全部静态 `.a` 路径与 md5**，重点区分：
+   - `$D/spdk-e12b7cb-src/build/lib`（bd5ee124d/v4）；
+   - `$D/spdk-build/lib`（9a413a44/v6）；
+   - `/usr/local/lib`。
+   若 OLD 的历史库已不存在，记 `[未获取]`，不得用“mtime 早”替代内容证据。
+
+## B. 决定性分叉
+
+### B1. 若 OLD 与 raw 的 SPDK 版本/静态库集不同
+
+1. 记录具体差异（版本串、wire、库路径/md5）。
+2. 在我方 `$D/mooncake-src` 重新应用 NOF-095 的同一补丁（只改 `client_service.cpp`，备份 `.orig`，原二进制不动）。
+3. 按 **OLD 的静态库集与真实链接参数**重链为 `bench-nof096`；`--help` 正常。
+4. 在 `plain_nof088` 上跑 **20 keys / warmup=0**（root、每遍前 mount 验证），验收：
+   - attach rc=0、读取成功；
+   - **20 条 `NOF095_TIMING arm=plain has_timing=1`**。
+5. 成功后**停在本单**：不建 vseg、不跑正式 3 遍、不写业务数据；回滚源码并验证原二进制 md5 未变。
+
+### B2. 若版本与静态库集完全相同
+
+1. **不要随机试 build-id/段布局参数**。先做纯二进制对比：
+   - OLD vs raw 的 section 地址/大小/对齐、init/fini 数组、符号表、`.rodata`、build-id、文件权限；
+   - 用同一命令再裸重链一次，比较 md5 是否稳定。
+2. 回执给出**第一个可复现差异**与是否可解释 `rc=-19`；若不能，停手，不继续堆实验。
+
+## C. 成功标准与回执必答
+
+- OLD / raw 的内嵌 SPDK 版本、wire、build-id、RPATH；
+- OLD 的真实链接命令 vs 当前 `link.txt` 的差异；
+- 两套静态 `.a` 路径/md5 对比；
+- 若重建：`bench-nof096` md5、plain 20-key attach/读取/timing 条数；
+- 源码是否回滚、原二进制 md5 是否未变；
+- 结论：**静态库集错误 / 链接不可复现 / 仍未定位**，三选一；
+- 新增业务写入=0，target 905586 未重启。
+
+## D. 边界
+
+- **target 905586 / md5 3129641f 不重启**；不启用 BUFFER。
+- **零业务写入**：只读 `plain_nof088` 做 20-key 冒烟；不建 `vseg_nof095`、不改 etcd、不重启 master（除非 plain master 未运行，则按完整 env 启动并 `nof_register`）。
+- 只改我方副本 `client_service.cpp`，不改同事树；原 `bench-io-params-e12` / in-tree OLD 的 md5 必须不变。
+- 构建或冒烟失败即停手回滚，不扩大实验矩阵。
