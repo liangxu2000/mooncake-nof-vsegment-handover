@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-108（vseg 2× 归因第一步：两臂开 `MC_STORE_TRANSFER_DIAG=1` 跑 T1 400-key ×3 遍，拿逐 key `get_into_breakdown` 与 `type`；vseg 先跑、plain 后跑，兼作臂序对照；零写/零重启/零改码）**。NOF-107 完成：node2/node4 新拓扑 + supercache-snapshot 下，vseg P50 **555.00** vs plain **274.00µs（2.03×）**，target W9 **248.80 vs 120.07µs（2.07×）**；两臂每 key 同样 32×128KiB（W9 n≈16.9k）；P90/P99 比值收敛到 1.07–1.11× 是 plain 自身长尾（plain P90/P50=2.11、vseg 1.16）所致，不是 vseg 追平。**等级：L1 排除“旧环境/旧源码是必要条件”；2× 的路径归因仍 L2（未做同 LBA/布局控制）。** NOF-107 的 vseg reader 用 `segment_read` 场景、未带 vseg flag；源码证明读路径由 master 返回的 `replica_type` 决定（`real_client.cpp:4598-4601`），但回执未直接给出 `type` 证据 ⇒ NOF-108 用逐 key 日志补上。
+- 当前任务：**NOF-109（纯离线：解析 NOF-108 日志里的 `nof_vsegment_child` / `nof_vsegment_operation`，判定 vseg 两个 child 是并行还是串行、每个 child 自身多慢；零环境/零写/零重启/零改码）**。NOF-108 完成：`type` 补证 **vseg 528/528 = vsegment、plain 528/528 = nof_remote**；客户端分解显示 **95% 差值在 `completion_wait`（+206.5µs）**，resolve/prepare/submit 合计 <10µs；两臂 target W9 **248.03 vs 120.08µs（2.07×）**；臂序排除（plain 后跑仍 363–372µs、W9 120.08）。**新事实：plain 出现三遍一致的 key 0–95 前缀慢档（read_us ~452µs，96+ ~250µs），vseg 无——vseg 全 key 平坦 ~470µs；在 plain 慢区两臂几乎相等（465 vs 455），2× 完全来自 plain 的快区。** 这是 node2/node4 上的**新环境实测**，但仍未做物理 LBA 对照，慢档不能归因于盘位置（L2）。diag 开销不对称（vseg +31.7、plain +91.4），**diag-on 的 1.61× 不能当真实比值，真实比值仍用 diag-off 的 2.03×**。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -7412,3 +7412,79 @@ vsegment 规划参数（命令行）：
 - **零写入**；不重启 target；不重编/不改码；不启用 BUFFER；不跑 16t；不动 `/usr/local`。
 - 只切 master（vseg→plain），不碰他人进程；失败停手回报。
 - 诊断日志可能抬高绝对值：**两臂同 diag 才可比**；绝对数仍以 NOF-107（diag off）为准。
+
+---
+
+## NOF-108 裁决（2026-11-25 · 回执已收）
+
+### 1. 硬结论（[事实]）
+
+| 项 | 结果 |
+|---|---|
+| `type` 补证 | vseg 臂 **528/528 = vsegment**；plain 臂 **528/528 = nof_remote**；status 全 `read_ok` ⇒ NOF-107 的 [未获取] 关闭，读路径确由 `replica_type` 决定 |
+| 客户端分段（measured 中位，µs） | vseg vs plain：`query` 95.5/96、`resolve` 2/0、`nof_prepare` 4/3、`nof_submit` 9/3、**`completion_wait` 449.5/243（+206.5）**、`unattributed` 10/7；`read_us` 475.5/257（+218.5） |
+| target W9 | **248.03 vs 120.08µs（2.07×）**，与 NOF-107 的 248.80/120.07 逐位一致 |
+| 臂序 | plain 后跑（vseg master 已停）仍 **363–372µs、W9 120.08** ⇒ 臂序、master 进程、target 运行时长均排除 |
+| 逐 key 分布 | **plain：key 0–95 read_us ~452µs（三遍一致），96+ ~250µs；vseg：全 key 平坦 ~470µs（447–521）**；在 plain 慢区两臂几乎相等（vseg 465 vs plain 455），2× 全部来自 plain 快区 |
+
+### 2. 判读
+
+1. **不是客户端逻辑**：resolve/prepare/submit 合计 <10µs，95% 差值在 `completion_wait`，与 target W9 的 +128µs/IO 同向 ⇒ 时间花在等 target/传输完成，不在算/排队。
+2. **vseg 没有“快区”**：plain 在 96+ 落回 ~250µs，vseg 始终 ~470µs（≈ 2×W9）。这与“plain 慢区 ≈ vseg 全区”的旧形状（NOF-041）在新环境重现。
+3. **diag 开销不对称**：vseg 555.00→586.68（+31.7），plain 274.00→365.44（+91.4）⇒ diag-on 的 P50 比 1.61× **无效**；分段占比、W9、配对差可用，绝对比值用 NOF-107 的 2.03×。
+4. **plain 前缀慢档已在新环境实测**：key 0–95（边界 96，三遍一致，warmup 已读过仍慢）⇒ 此前“旧环境结论不可搬”是对的；现在只能说**本数据集上**存在该前缀，仍不能声称是物理盘位置（未做 LBA 对照）。
+
+### 3. 仍不能下的结论
+
+- 2× 仍为 **L2**：两臂物理 LBA 未对齐、写入路径不同；`completion_wait` 只能证明“在等 target”，不能证明“为什么 target 慢”。
+- vseg 全区平坦 ~470µs 有两种互斥解释，未分离：
+  - **(a) 串行两波**：2 个 child 任务未并行，≈2×单 child；
+  - **(b) 每 child 自身慢**：target 对 vseg 的每个 128KiB IO 就是 ~248µs（随机/慢状态），与 child 数无关。
+- 旧 NOF-059（stripe=4MiB 单 child 无效）与旧 NOF-061（同 LBA 双路径）**未经本侧复核**，不能拿来排除 (a)/(b)。
+
+### 4. 下一步
+
+**NOF-109 纯离线**：解析 NOF-108 已落盘的 vseg 日志里 `nof_vsegment_child` / `nof_vsegment_operation`（diag on 时 `sampled=true` 才打印，每遍应有 800 measured + 256 warmup = 1056 条 child 行），直接看两个 child 的提交/完成时间是否重叠、各自延迟多少。这能在不碰环境的前提下分离 (a)/(b)。
+
+---
+
+# NOF-109（待执行 · 纯离线：vsegment 子任务时序解析 · 零环境/零写/零重启/零改码 · 2026-11-25）
+
+## 目标
+
+- 只解析 **NOF-108 已落盘的 3 份 vseg 日志**（`run/nof108_vseg_p{1,2,3}.log`，diag on），提取：
+  - `nof_vsegment_child`：`trace_id/vsegment_op_id/child_idx/submit_seq/first_submit_mono_ns/complete_mono_ns/get_block_us/complete_to_observe_us/serial_gap_us/fifo_wait_us/first_completion_from_submit_us`；
+  - `nof_vsegment_operation`：`planned_children/submitted_children/timed_children/first_submit_mono_ns/last_completion_mono_ns/last_child_idx/observed_total_us/rc`。
+- 按 `(trace_id, vsegment_op_id)` 归组，每 key 应有 2 个 child（4MiB / 2MiB stripe）。
+- **只回答**：vseg 的 ~470µs 是「两个 child 串行两波」还是「每个 child 自身就 ~250µs」；不做任何新测量。
+
+## A. 解析步骤
+
+1. 每份日志先数行：`nof_vsegment_child`、`nof_vsegment_operation`、`get_into_breakdown`；measured 与 warmup 按 key 名区分（warmup 128 行）。
+2. 每个 op 计算（child0 为基准）：
+   - `submit_skew_us = (child1.first_submit - child0.first_submit)/1000`
+   - `completion_gap_us = (child1.complete - child0.complete)/1000`
+   - `overlap = child1.first_submit < child0.complete`
+   - `child0/child1` 各自的 `first_completion_from_submit_us`、`fifo_wait_us`
+   - `op_total_span_us = (last_completion - first_submit)/1000`，与 `observed_total_us` 对照
+3. 统计（measured 400 个 op）：
+   - overlap 的 op 占比；child1 晚于 child0 完成的比例；
+   - `submit_skew_us`、`completion_gap_us`、两 child 延迟的 p50/p90；
+   - `timed_children` 分布（是否恒 2；有无 1）；
+   - 若 `observed_total_us ≈ child0_latency + child1_latency` 且 overlap=false ⇒ 串行；若两 child 延迟各 ~250 且 overlap=true、total ≈ max(latency) ⇒ 并行但每 child 慢。
+4. 抽 5 个代表 key 贴原始行（含 child0/child1/operation 三行），便于人工核对。
+5. 检查 plain 日志是否有 `nof_slow_task` 或 child 级行；若无，记录 0 即可，不要求补测。
+
+## B. 交付（必答）
+
+1. 三份日志的行数表（child/operation/breakdown，measured/warmup）。
+2. overlap 占比、submit_skew p50/p90、completion_gap p50/p90、两 child 延迟 p50/p90、`timed_children` 分布。
+3. 判决：**(a) 串行两波** / **(b) 并行但每 child 慢** / **两者混合**（给出比例）。
+4. `observed_total_us` 与 child 时间戳的闭合误差（p50/p90）。
+5. 5 个代表 key 的原始行。
+
+## C. 边界
+
+- **纯离线**：不跑 bench、不写、不重启、不改码、不启动/停止任何进程；只读 NOF-108 日志与已有 summary。
+- 日志缺失/行数明显不足时停手回报（不要用新测量补）。
+- 只做描述统计，不做物理 LBA/盘位归因。
