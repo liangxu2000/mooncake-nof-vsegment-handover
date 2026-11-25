@@ -83,7 +83,8 @@ node2（reader + writer）                     node4（master + etcd + target）
 | **NOF-109** | vsegment 子任务时序（纯离线） | **1200/1200 op overlap 100%**；submit_skew 6.8µs、completion_gap 22.9µs；child0/child1 各 ~375/394µs；op span 420µs = **1.10× 单 child**、span/(lat0+lat1)=0.52 ⇒ **“串行两波”被否，“并行但每 child 自身慢”成立**。源码确认 `member_count=1` 时两 child 物理相邻 |
 | **NOF-110** | 单变量 `MC_NOF_WORKERS=1` | **无改善**：vseg P50 555.00→558.50、W9 248.80→249.36；plain 274.00→266.27、W9 120.07→120.36。4 条 lane 全绑 worker0，两配置 `lane_inflight=16384`/`segment_inflight=65536` 相同 ⇒ **worker 分布、inflight 额度排除**。但 qpair 仍 4 条，连续 task 轮转 ⇒ vseg 每 key 2 条 qpair、plain 1 条，**qpair 扇出未排除** |
 | **NOF-111** | 单变量 qpair 数 | **无改善**：vseg W9 248.80→**248.87**、P50 555.00→558.74；plain W9 120.29。探针确认 1 条 lane/qpair、单 lane 额度仍 16384 ⇒ **qpair 扇出排除**。客户端组织方式累计全部排除；W9 比值三次独立实验均为 **2.07×** |
-| **NOF-112（当前）** | LBA 布局对照 | vseg 离线解析 NOF-108 日志的 `nof_slow_task`（`lba/offset_bytes/max_subio_lba`，每遍 1056 条）；plain 补 1 遍 `MC_NOF_SLOW_TRACE_THRESHOLD_US=1` 只读 LBA 日志；判断 vseg 数据是否落在盘首慢区/碎片化、per-key 延迟是否与 LBA 相关。零写/零重启/零改码 |
+| **NOF-112** | LBA 布局对照 | **布局假说被否**：两臂起始 LBA 逐值相同 400/400；非慢区 301 个 key 上 vseg **301/301 全慢**（p50 478.5 vs 179.0µs），慢区 99 个 key 两臂相等（447.5 vs 448.5）⇒ 位置不能解释 2× |
+| **NOF-113（待裁决）** | 切分边界 vs 会话路径 | A：改码合并物理相邻 child + env 开关（不写数据，~10–15 分钟）；B：零改码 stripe=4MiB 新写 400 keys（~20–30 分钟） |
 
 ---
 
@@ -94,9 +95,10 @@ node2（reader + writer）                     node4（master + etcd + target）
 3. **已回答（NOF-109）**：两个 child **100% 重叠**，span = 1.10× 单 child ⇒ 不是串行两波；**每个 child 自身慢**。源码确认两 child 物理相邻。
 4. **已回答（NOF-110）**：`MC_NOF_WORKERS=1` 无改善 ⇒ worker 线程分布、inflight 额度排除；但 qpair 仍 4 条，**每 key 两个 qpair 扇出未排除**。
 5. **已回答（NOF-111）**：qpairs=1 无改善（W9 248.87）⇒ qpair 扇出排除；客户端组织方式累计全部排除。
-6. **进行中（NOF-112）**：LBA 布局对照——vseg 数据是否落在盘首慢区/碎片化，per-key 延迟是否与 LBA 相关。
-7. **仍未隔离**：两臂物理 LBA/写入历史不同 ⇒ 路径归因仍为 L2；只有同 LBA/同数据对照才能升到 L3。
-8. **要达成用户目标（vseg 必须快于 plain）**：若 112 显示布局是主因，改分配/落点；若布局解释力弱，转 target 侧 trace（bdev/URMA 层）。
+6. **已回答（NOF-112）**：两臂起始 LBA 逐值相同 400/400；非慢区 301 个 key 上 vseg 301/301 全慢（478.5 vs 179.0µs）⇒ **数据落点排除**。
+7. **待裁决（NOF-113）**：只剩“请求切分边界（2MiB×2 vs 4MiB×1）”与“vseg 会话/服务路径”。A=改码合并相邻 child + env 开关；B=stripe=4MiB 新写数据。
+8. **仍未隔离**：两臂是不同 cid/client 进程/NoF 会话；即使 LBA 相同，会话身份仍未控 ⇒ 路径归因仍为 L2+。
+9. **要达成用户目标（vseg 必须快于 plain）**：若 A/B 显示切分边界是原因，合并 child 即可；若否，转 target 侧 trace（bdev/URMA 层）。
 
 **注意**：NOF-106 的 10-key P50 555.36µs 是 node2 远端读、10 个 key 的冒烟，含冷启动/远端路径，不能当性能基线。正式数字只看 NOF-107/108 的 400-key 3 遍。
 

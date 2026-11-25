@@ -269,7 +269,39 @@ vseg:       ~465µs          │        ~470–485µs（平坦，没有快档）
 
 累计排除：resolve/prepare/submit（NOF-108）、child 串行（NOF-109）、worker 分布 + inflight 额度（NOF-110）、qpair 扇出（NOF-111）。三次独立实验 W9 比值都精确 2.07× ⇒ 差异稳定锚在 target 对单笔 128KiB IO 的服务时间。
 
-**措辞边界**：没有实现过“把两个 child 合并成一个 task”，所以不能说“合并 task 已证明无效”；只是在 workers=1+qpairs=1 下，两个 child 已共享同一 worker、同一 qpair，target 看到的 32×128KiB 在数量/大小/通道上都与 plain 相同。**数据 LBA/落点仍未对照**，这是当前唯一能直接解释“所有 vseg key 都慢”的客户端可见差异。
+**措辞边界**：没有实现过“把两个 child 合并成一个 task”，所以不能说“合并 task 已证明无效”；只是在 workers=1+qpairs=1 下，两个 child 已共享同一 worker、同一 qpair，target 看到的 32×128KiB 在数量/大小/通道上都与 plain 相同。
+
+### 5.5 NOF-112：LBA 逐值相同，布局假说被否
+
+两臂 400 个 key 的**起始 LBA 完全相同**：
+
+```text
+plain key i:  lba = i×8192 ………………………… i×8192+8191   （4MiB，1 个 task）
+vseg  key i:  child0 = i×8192 … i×8192+4095
+              child1 = i×8192+4096 … i×8192+8191          （2 个 2MiB task）
+```
+
+- child1 − child0 ≡ **4096 blocks（2MiB）**，528/528 恒定；
+- 两臂覆盖同一 1.56GiB，11 盘 task 分布都均匀；
+- 慢区（每盘 <36MiB）占比同构（measured 慢区 key = 99/400 = 24.75%；37.5% 是含 warmup 的 528 task 口径）。
+
+同 LBA 直比：
+
+| 分组 | n | vseg p50 | plain p50 | 比值 | vseg 更慢 |
+|---|---|---|---|---|---|
+| 全部同 LBA | 400 | 472.5 | 180.0 | 2.62× | 363/400 |
+| **非慢区** | **301** | **478.5** | **179.0** | **2.67×** | **301/301 = 100%** |
+| 慢区 | 99 | 447.5 | 448.5 | 1.00× | 62/99 |
+
+- plain 有 2.5× 的慢区落差（448.5 vs 179.0），vseg **没有落差**（447.5 vs 478.5）。
+- 一句话：**vseg 在每个 LBA 上都按“慢区速度”被服务，plain 只在真正的盘首慢区才慢。**
+
+**判决**：数据落点不能解释 2×（L1 排除）。剩余候选只剩两个：
+
+1. **请求切分边界**：vseg 2MiB×2 task vs plain 4MiB×1 task，覆盖区间相同但 task 边界不同；
+2. **vseg 会话/服务路径**：不同 cid / client 进程 / NoF 会话，target 侧映射可能不同。
+
+**口径警告**：配对两侧 read_us 来自不同诊断配置（vseg diag-on、plain threshold=1），2.67× 的量值只能当近似；plain 179 vs vseg 478、301/301 全慢的方向是硬的。plain 采集遍 P50 287.75µs 不作性能结论。
 
 ---
 
@@ -360,4 +392,8 @@ MC_STORE_TRANSFER_DIAG=1
 
 **NOF-111 已完成**：`--nof_qpairs_per_segment=1` + 8MiB 夹紧，vseg W9 248.87（与基线差 0.03%）⇒ **qpair 扇出排除**（见 5.4）。
 
-**NOF-112（待执行）**：LBA 布局对照。vseg 直接解析 NOF-108 的 `nof_slow_task`（已带 `lba/offset_bytes/max_subio_lba`，每遍 1056 条）；plain 补 1 遍 `MC_NOF_SLOW_TRACE_THRESHOLD_US=1` 的只读 LBA 日志。判定 vseg 数据是否落在盘首慢区/碎片化，以及 per-key 延迟是否与 LBA 相关。零写、target 不重启、零改码。
+**NOF-112 已完成**：两臂起始 LBA 逐值相同 400/400；在非慢区 301 个 key 上 vseg 301/301 全慢（478.5 vs 179.0µs），慢区两臂相等 ⇒ **数据落点解释力弱/被否**（见 5.5）。
+
+**NOF-113（待裁决）**：只剩“请求切分边界”与“vseg 会话/路径”两个候选。
+- A：改码在 `submitVSegment` 合并物理/客户端地址都相邻的 read child，env 开关做同二进制 A/B；不写数据、不重启 target。
+- B：零改码，新建 stripe=4MiB 的 vseg cid 写 400 keys（一 key 一 child），读 3 遍；等价于一个 4MiB task，但要写 1.56GiB。
