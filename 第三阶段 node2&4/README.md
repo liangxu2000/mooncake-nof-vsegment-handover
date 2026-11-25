@@ -78,17 +78,19 @@ node2（reader + writer）                     node4（master + etcd + target）
 | **NOF-104** | node2/node4 只读盘点 | node4 11 块 7T 全空闲、BDF 与 node3 一致；node2 仅 6 块空闲盘；两台原非独占（用户确认旧进程可 kill）；node4 缺 meson/ninja；现有 SPDK 库均不可直接用 |
 | **NOF-105** | 清理我方旧进程 + node4 target 部署 | target **PID 2142228**、md5 `3129641f…`、`:4457 LISTEN`、RAID0 online/11 base/BDF 升序/strip256K、nsid1、URMA/udmac0d1e2/RM、新 UUID `0470fe3a…`；hugepages 启动后 free 4476 页；未重编/未装包/未写数据 |
 | **NOF-106** | supercache 编译 + node2 plain 环境 | supercache@aadab957 在 node2 编译 master/bench/nof_register，只链接自有 e12b7cb 库；etcd 3.4.14；plain master PID 34172（50056/9006/8086、Keys=400、owned_slots=1）；register node4 成功（0→100GB、心跳 0 失败）；400 keys/1.56GiB；10-key **10/10、P50 555.36µs**（node2 远端读，仅冒烟） |
-| **NOF-107（当前）** | 新环境 plain vs vseg 400-key 基线 | **master+target 都迁到 node4，reader 放 node2**；plain 400 keys 3 遍 → vseg_nof107 写 400 读 3 遍；target 不重启、不修代码 |
+| **NOF-107** | 新环境 plain vs vseg 400-key 基线 | **master+target 都在 node4、reader 在 node2**（元数据与数据均跨节点）；target 2142228 未重启。plain **P50 274.00µs / W9 120.07µs**；vseg **P50 555.00µs / W9 248.80µs** ⇒ **2.03× / 2.07×**；两臂每遍 target IO 数相同（n≈16.9k，32×128KiB/key）。P90/P99 比值 1.07–1.11× 是 plain 自身长尾（P90/P50=2.11）所致，不是追平 |
+| **NOF-108（当前）** | vseg 2× 归因第一步 | 两臂开 `MC_STORE_TRANSFER_DIAG=1`，拿逐 key `get_into_breakdown`（query/read/resolve/submit/wait、`type`）与 W9；vseg 先跑、plain 后跑兼作臂序对照；零写、target 不重启、零改码 |
 
 ---
 
 ## 5. 当前要回答的问题
 
-1. 在新 node2/node4 环境、supercache-snapshot 源码下，**vseg 是否仍约 2× 慢于 plain**？
-2. 如果仍慢，差距是否仍在 `read_us`/target 执行段？
-3. 如果不再慢，是旧环境（node1 host/旧 RAID 顺序）还是旧源码（be10be29）造成的？——这将直接决定后续是否还需要修代码。
+1. **已回答（NOF-107）**：在新环境 + supercache-snapshot 下，**vseg 仍慢约 2×**（P50 2.03×、target W9 2.07×）⇒ 旧环境/旧源码不是必要条件。
+2. **进行中（NOF-108）**：这 2× 在客户端落在哪一段，target W9 的 2× 是否与臂序/master 同机混叠有关；逐 key `type` 是否确为 vsegment。
+3. **仍未隔离**：两臂物理 LBA/写入历史不同 ⇒ 路径归因仍为 L2；只有同 LBA/同数据对照才能升到 L3。
+4. **要达成用户目标（vseg 必须快于 plain）**：先完成 NOF-108 的分解，再决定改客户端提交/合并，还是查 target 侧每个 128KiB IO 的服务路径。
 
-**注意**：NOF-106 的 10-key P50 555.36µs 是 node2 远端读、10 个 key 的冒烟，含冷启动/远端路径，不能当性能基线。正式数字只看 NOF-107 的 400-key 3 遍。
+**注意**：NOF-106 的 10-key P50 555.36µs 是 node2 远端读、10 个 key 的冒烟，含冷启动/远端路径，不能当性能基线。正式数字只看 NOF-107/108 的 400-key 3 遍。
 
 ---
 

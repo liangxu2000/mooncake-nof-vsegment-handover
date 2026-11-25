@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-107（新环境 plain vs vseg 400-key 基线；master+target 都放 node4，reader 放 node2，保证元数据和数据都跨节点；target 不重启）**。NOF-106 通过：node2 用 `supercache-snapshot@aadab957` 本地编译 master/bench/nof_register，只链接自有 e12b7cb 静态库；独立 etcd 3.4.14 + plain master（PID 34172、50056/9006/8086、Keys=400、owned_slots=1）；register node4 4457 成功（0→100GB、心跳 0 失败）；写 400 keys 1.56GiB；10-key 10/10、P50 555.36µs（node2 远端读，仅冒烟，不作性能结论）。**用户要求：reader 的元数据和数据都必须从远端读** ⇒ NOF-107 将 master 移到 node4（与 target 同机），node2 留作 reader；node2 到 master/target 都跨节点。先 plain 400 keys 3 遍，再切 vseg_nof107 写 400 读 3 遍；不修代码。
+- 当前任务：**NOF-108（vseg 2× 归因第一步：两臂开 `MC_STORE_TRANSFER_DIAG=1` 跑 T1 400-key ×3 遍，拿逐 key `get_into_breakdown` 与 `type`；vseg 先跑、plain 后跑，兼作臂序对照；零写/零重启/零改码）**。NOF-107 完成：node2/node4 新拓扑 + supercache-snapshot 下，vseg P50 **555.00** vs plain **274.00µs（2.03×）**，target W9 **248.80 vs 120.07µs（2.07×）**；两臂每 key 同样 32×128KiB（W9 n≈16.9k）；P90/P99 比值收敛到 1.07–1.11× 是 plain 自身长尾（plain P90/P50=2.11、vseg 1.16）所致，不是 vseg 追平。**等级：L1 排除“旧环境/旧源码是必要条件”；2× 的路径归因仍 L2（未做同 LBA/布局控制）。** NOF-107 的 vseg reader 用 `segment_read` 场景、未带 vseg flag；源码证明读路径由 master 返回的 `replica_type` 决定（`real_client.cpp:4598-4601`），但回执未直接给出 `type` 证据 ⇒ NOF-108 用逐 key 日志补上。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -7328,3 +7328,87 @@ vsegment 规划参数（命令行）：
 - target 不重启、不换设备；不重编 SPDK/Mooncake；不改 `/usr/local`；不装包。
 - 数据保留不是目标；只新建 `vseg_nof107` 写 400 keys；plain 现有数据只读。
 - 只跑 T1 400-key；16t 不在本单；失败停手回报。
+
+---
+
+## NOF-107 裁决（2026-11-25 · 回执已收）
+
+### 1. 结果（[事实]，3 遍中位，µs）
+
+| 指标 | plain | vseg | 比值 |
+|---|---|---|---|
+| Min | 261.95 | 466.83 | 1.78× |
+| Avg | 345.69 | 563.89 | 1.63× |
+| **P50** | **274.00** | **555.00** | **2.03×** |
+| P90 | 577.25 | 642.62 | 1.11× |
+| P99 | 682.03 | 730.85 | 1.07× |
+| Max | 745.76 | 800.43 | 1.07× |
+| target W9 | 120.07 | 248.80 | **2.07×** |
+
+环境：target 2142228 全程未重启；master+target 在 node4、reader 在 node2（元数据与数据均跨节点）；每遍 400/0 failed；target 读窗口 n≈16,896–16,905，两臂同为（400+128）×32×128KiB。
+
+### 2. 能站住的判断
+
+1. **复现成立（L0）**：P50 2.03×、W9 2.07×，与旧环境/旧源码的 2.07× 独立吻合 ⇒ **旧 node1/node3 环境与 be10be29 源码不是该现象的必要条件（L1 排除）**。
+2. **不是 IO 数差异**：两臂每遍 target IO 数、单 IO 大小（128KiB）完全一致 ⇒ 差异是 **target 单个 128KiB IO 的服务时间**，不是请求数量或切片大小。
+3. **尾部收敛是分布形状，不是追平**：plain P90/P50=2.11、vseg=1.16；vseg 分布紧、plain 长尾重。不得用 P90/P99 比值下降说“差距缩小”。
+4. **W9 绝对值不可跨环境比**：plain 旧环境 ~68µs、新环境 120.07µs；vseg 旧 ~250µs、新 248.8µs。只做本环境两臂对比。
+
+### 3. 仍不能下的结论（防过度归因）
+
+- **仍为 L2，不是 L3**：两臂数据由不同写入路径产生（plain 16t/batch16、vseg T1），**物理 LBA 未对齐、写入并发不同**；本单没有同 LBA/同数据对照，不能排除“布局/写入历史”是差异源。
+- **vseg reader 未带 vseg flag**：C4 用 `--scenario=segment_read`；源码 `stress_cluster_bench.cpp:3449` 禁止该场景与 `--vsegment_nof_io` 同用，且 `real_client.cpp:4598-4601` 表明 `type` 取 master 返回的 `replica_type` ⇒ 机制上 vseg 数据仍走 vseg 路径，但回执未直接给出逐 key `type` 证据（[未获取]）⇒ NOF-108 补。
+- **node4 上 master/etcd 与 target 同机**：CPU/网络混叠未测，不能排除它放大 W9；NOF-108 用 plain 后跑 + 同机条件作对照。
+- **vseg writer 23+2 次 `VSEGMENT_CREATING` 失败后补齐**：最终 Keys=400 达成，但写入历史与 plain 不同，作为布局混杂记录。
+
+### 4. 下一步
+
+**NOF-108**：两臂开 `MC_STORE_TRANSFER_DIAG=1` 拿逐 key 分解与 `type`，并把 plain 放到 vseg 之后跑，先分清“客户端哪一段 + 是否臂序/target 状态造成”，再决定是否值得做同 LBA 对照或 target 侧打点。
+
+---
+
+# NOF-108（待执行 · vseg 2× 归因第一步：两臂逐 key 分解 + 臂序对照 · 零写/零重启/零改码 · 2026-11-25）
+
+## 目标
+
+- 用 supercache 自带诊断 `MC_STORE_TRANSFER_DIAG=1`（`MC_HIFREQ_LOG_SAMPLE_RATE` 默认 1.0，不必另设），拿每个 key 的 `get_into_breakdown`：`query_us` / `select_us` / `read_us` / `vsegment_resolve_us` / `nof_prepare_us` / `nof_submit_us` / `completion_wait_us` / `read_unattributed_us` / `type` / `selected_type` / `status`。
+- 同一批已有 plain 数据与 `vseg_nof107` 数据，**不做任何写入**；先 vseg（master 已在跑）后 plain（切 master），兼作臂序对照。
+- 只回答四件事：
+  1. vseg 臂的 `type` 是否确实为 vsegment（补 NOF-107 的缺口）；
+  2. 281µs 的 P50 差在客户端落在哪一段（metadata query / plan / submit / completion wait / unattributed）；
+  3. 逐 key 分布：新盘上是否存在多遍可重复的前缀慢档（不预设 0–96）；
+  4. plain 在 vseg 之后跑，P50/W9 是否仍 ~274/120（排除臂序、target 运行时长、master 进程差异）。
+
+## A. 预检
+
+1. 记录 target 2142228 未变（PID 起始时间、md5、RAID0 UUID、4457 LISTEN）；**不重启**。
+2. 确认 vseg master 2157604 运行、Keys=400；node2 无残留 bench；plain 数据与 `vseg_nof107` 数据均保留且本单只读。
+3. 用 `--help 2>&1 | grep -E "warmup_keys|num_keys|batch_size"` 核对旗标。
+
+## B. vseg 臂（diag on，先跑）
+
+1. node2 reader：`--num_keys=400 --num_threads=1 --batch_size=1 --warmup_keys=128 --verify=false`、qpairs4、`--scenario=segment_read`；env `MC_STORE_TRANSFER_DIAG=1`。
+2. 每遍前重新 `nof_register` 到 node4 target 并验证挂载。
+3. 跑 **3 遍**；日志 `run/nof108_vseg_p{1,2,3}.log`；记每遍 Min/Avg/P50/P90/P99/Max、failed、400/400。
+4. 每遍读窗口取 target W9（沿用 NOF-107 的 FLUSH/period 块法）。
+
+## C. plain 臂（diag on，后跑）
+
+1. 停 vseg master（记录 PID/退出码），在 node4 起 plain master，参数与 NOF-107 B 段完全相同：`--cluster_id=plain_nof107`、50056/9006/8086、`MC_STORE_PARTITION_SLOT_COUNT=1`、etcd `127.0.0.1:2379`、URMA 设备/capsule；验收 leader/serving/Keys=400/owned_slots=1。
+2. `nof_register` 到 node4 target，验证挂载。
+3. 跑 **3 遍**，参数与 env 同 B；日志 `run/nof108_plain_p{1,2,3}.log`；W9 同法。
+
+## D. 交付（必答）
+
+1. 两臂逐 key 行数（应 400/遍）、`type`/`selected_type` 计数、`status` 非 `read_ok` 数。
+2. 每臂 3 遍的 P50/P90/P99，及 `read_us` / `query_us` / `nof_submit_us` / `completion_wait_us` / `read_unattributed_us` 的 p50 与 avg（先按 key 汇总，再按遍）。
+3. 逐 key `read_us` 按 key index 分桶（0–31、32–95、96–127、128–255、256–399，另附每 32 key 一桶的中位数）：判断是否有**≥2 遍一致**的前缀慢档；有则给出实测边界，无则明确写“无”。
+4. 同 key index 的 plain↔vseg 配对差值（只按 index 配对，**不声称物理 LBA 相同**）。
+5. 两臂 W9；与 NOF-107（diag off）的差异，用于提示诊断开销。
+6. 臂序结论：plain 后跑是否仍 ~274µs / W9 ~120。
+
+## E. 边界
+
+- **零写入**；不重启 target；不重编/不改码；不启用 BUFFER；不跑 16t；不动 `/usr/local`。
+- 只切 master（vseg→plain），不碰他人进程；失败停手回报。
+- 诊断日志可能抬高绝对值：**两臂同 diag 才可比**；绝对数仍以 NOF-107（diag off）为准。
