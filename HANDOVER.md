@@ -7109,6 +7109,15 @@ vsegment 规划参数（命令行）：
 
 ## B. 软件与资产（只读）
 
+### B0. 源码/版本政策（用户 2026-11-25 明确）
+
+1. **不使用 node2/node4 上现成的 GAP 工作目录/构建**；只读查看，不作为我们的环境。我们在 node2/node4 新建自己的工作目录（如 `/home/l00955908/mooncake-nof-vsegment-2`），所有源码/构建/日志放这里。
+2. **Mooncake**：统一用 `https://github.com/wangyuqi0429/Mooncake` 分支 **`supercache-snapshot`**（已核实 HEAD `aadab9573fe13ae6e355fcfce4520dcf67b1f385`）；重新 clone、重新编译，接受从头开始。
+3. **SPDK 不变**：保持现有 **wire v4** 这套（`e12b7cb` / `bd5ee124d` 谱系），不升级到 v6。**具体仓库 URL/分支/origin 尚未取证**（现有记录只有目录 `/home/yin/nof/spdk-cpu`、HEAD `e12b7cb` 且带 12 个本地改动；我们的构建副本 `$D/spdk-e12b7cb-src` 基线为 `bd5ee124d`）。本单必须用 `git remote -v` / `git branch -vv` / `git log -1` 查出，不猜。
+4. 若 node2/4 上已有旧 SPDK 树，只用于确认 origin/分支/commit；**必须在我们自己的目录重新构建**，不直接复用旧 build。
+
+### B1. 资产清单
+
 1. 是否已有 Mooncake/SPDK 源码或构建、`nvmf_tgt`、`bench-io-params-e12`、etcd；各自路径/md5/版本。
 2. 是否能从 node1/node3 复制我们自己的资产（target 二进制 `3129641f…`、bench、be10be29 源码、e12b7cb 静态库）；若不能，记录需要重建的清单。
 3. 现有进程/端口占用；node2/node4 是否有他人 etcd/master/target。
