@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-105（node4 target 部署 + 清理我方旧进程；用户已确认独占，可 kill 我方旧进程；不装包、不重编 SPDK）**。NOF-104 盘点：node4 11 块 7T 全空闲、BDF 与 node3 一致；node2 可 master+client。**用户 2026-11-25 明确：node4 50056/9006/8086 与 node2 50156 上的进程是他之前起的，独占即可 kill（佛挡杀佛）**。NOF-105 只清理我方旧 PID/路径（`/home/l00955908/nds` 等），建我们自己的目录，复制 node3 已知可用 target/bench/SPDK 树到 node4，启动 target（4457/RAID0/ns），验收后停手；不跑 master/数据。
+- 当前任务：**NOF-106（编译 supercache-snapshot 的 master+bench：优先 node2，空间不足才 node4；部署 node2，起本地 etcd，register node4 target，plain 400-key + 10-key bench）**。NOF-105 完成：node4 target **PID 2142228 / md5 3129641f… / 192.168.84.151:4457 LISTEN**，RAID0 online/11 base/BDF 升序/strip256K，nsid1，transport URMA/udmac0d1e2/RM，新 UUID `0470fe3a…`；旧进程已按 PID 清理，node4/node2 资产 md5 与 node3 一致；未重编/未装包。NOF-106 必须用 **`wangyuqi0429/Mooncake @ supercache-snapshot`（HEAD aadab957）** 重新编译 master+bench，链接 `spdk-e12b7cb-src` 的 e12b7cb/bd5ee124d 静态库（**禁用 `/usr/local/lib`**）；**node2 /home 可用 ≥10G 就直接在 node2 编译，否则 node4 编译后复制二进制**；node2 起独立 etcd（2379）并部署 master+bench；register node4 target；plain 400 keys + 10-key 读通即停。node3 的 be10be29 bench 只能做临时冒烟，不得用于性能结论。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -7148,7 +7148,15 @@ vsegment 规划参数（命令行）：
 
 ---
 
-# NOF-105（待执行 · node4 target 部署 + 清理我方旧进程 · 2026-11-25）
+# NOF-105（已关闭 · 通过：node4 target 就绪；旧进程清理；资产 md5 对齐 · 2026-11-25）
+
+> **结果**：按 PID 清理 node4 master 1260028/metadata 1260073、node2 client 3204031/nvmf_tgt 3206327；端口 50056/9006/8086/4457（node4）与 50156（node2）释放，余下 `/home/ql` 他人进程未碰。node4/node2 各自 `mooncake-nof-vsegment-2`（1.1G），`nvmf_tgt=3129641f…`、`libspdk_bdev.a=4056b6bd…`、74 libs sha256 `e4737186…`、takeover `8b825b66…`、wrapper `9eea126e…`、bench md5 全部与 node3 一致。
+>
+> **target**：PID **2142228**、md5 `3129641f…`、`192.168.84.151:4457 LISTEN`；`URMA_RAID0` online/11 base/strip256K/superblock=false/新 UUID `0470fe3a-b5db-4656-8346-0159c6ba9277`；nsid1→URMA_RAID0；transport URMA/max_io 8MiB/udmac0d1e2/capsule urma/RM。hugepages 启动前 8768 页（17.1GiB），启动后 free 4476 页；11 盘 vfio，系统盘/根分区未动。
+>
+> **偏差**：rsync `-e/-o` 写法首次报错，改 `RSYNC_RSH` 成功；node2↔node3/node4 无 ssh 互信，经 node4 中转；node4 系统盘为 nvme10n1（2b），11 数据盘为 nvme0–9+nvme11，target 侧映射 Nvme0..Nvme10；wrapper rc 未落盘 `[未获取]`，以 RPC 全成功 + “Target 就绪”为证据；日志唯一 `handshake rc=-104 peer=192.168.84.247` 是我方 TCP 探测建连即关的副作用。
+>
+> **末态**：target 保持运行供 NOF-106；未启动 master、未跑 bench、未重编、未装包、未写业务数据。
 
 ## 授权与目标
 
@@ -7195,3 +7203,67 @@ vsegment 规划参数（命令行）：
 - **只 kill 用户确认的我方旧进程**；不碰未知/他人进程。
 - 不装包、不改内核参数、不重编 SPDK、不换 URMA 设备。
 - 不启动 master/bench、不写业务数据；target 起后保持运行。
+
+---
+
+# NOF-106（待执行 · 编译 supercache master+bench（优先 node2，空间不足才 node4），部署 node2，跑通 plain 10-key · 2026-11-25）
+
+## 背景与目标
+
+- node4 target 已就绪：`192.168.84.151:4457`、RAID0 11 盘、nsid1 100GiB、hugepages 余 4476 页。
+- 用户要求 Mooncake 统一用 `wangyuqi0429/Mooncake @ supercache-snapshot`（HEAD `aadab957…`），master 和 bench 必须从该分支重编，链接 `spdk-e12b7cb-src` 的 e12b7cb/bd5ee124d 静态库。
+- 本单只做：编译 → 部署 node2 → 起本地 etcd → register node4 target → plain 400 keys → 10-key bench。**不做 vseg、不做性能结论。**
+
+## A. 构建位置与准备
+
+1. **先查空间**：在 node2 执行 `df -h /home /home/l00955908 /`；记录每个挂载点可用空间。
+   - 若 `/home`（或工作目录所在挂载）可用 **≥10G** ⇒ **直接在 node2 编译**（源码/依赖经 node4 或 Windows 中转）。
+   - 若不足 ⇒ 在 node4 编译（66G 空闲），只把 master/bench 二进制复制到 node2；复制后记录 md5。
+   - **不要为了省事盲目跨机复制，也不要冒险写满 node2 根盘。**
+2. clone `wangyuqi0429/Mooncake` 分支 `supercache-snapshot`（HEAD 必须 `aadab957…`；无外网则经 Windows 上传压缩包）。
+3. 记录 `cmake/gcc/g++/ninja` 版本与依赖；检查 `CMakeLists.txt` 的构建选项与目标名（master、bench）。
+4. 配置必须指向我们的 SPDK：
+   - `SPDK_INCLUDE_DIR=/home/l00955908/mooncake-nof-vsegment-2/spdk-e12b7cb-src/build/include`
+   - `SPDK_LIB_DIR=/home/l00955908/mooncake-nof-vsegment-2/spdk-e12b7cb-src/build/lib`
+   - `USE_NOF=ON`、`USE_NOF_URMA=ON`、`USE_UB=ON`、`STORE_USE_ETCD=ON`、`USE_NOF_GPU_DIRECT=OFF`
+   - **禁止 `/usr/local/lib/libspdk_*.a`**。
+5. 构建 Release；产物记录 md5/size；`--help` 正常。若缺依赖/目标名不同 ⇒ 停手回报，不装包。
+
+## B. etcd 与部署到 node2
+
+1. 在 node4/node2 找可用 `etcd`/`etcdctl`（`which`、旧 nds 目录、node3 可复制）；版本记录。若找不到 ⇒ 停手回报。
+2. 在 node2 自有目录启动**独立 etcd**：监听 `127.0.0.1:2379`，data-dir 在我们目录；验证 endpoint health。
+3. 若在 node4 编译，将 `mooncake_master` 与 bench 复制到 node2 自有目录；若在 node2 编译则直接使用。记录 md5/size；检查 node2 剩余空间（root fs 97%，必要时用 /home 其他挂载；不足则停手回报）。
+4. 复制/准备 register 工具与 bench 运行脚本；不改 `/usr/local`。
+
+## C. 起 plain master + register + 写 400 keys
+
+1. node2 起 plain master：`--cluster_id=plain_nof106`、`--rpc_port=50056`、`--metrics_port=9006`、HTTP 8086、etcd `127.0.0.1:2379`、`MC_STORE_PARTITION_SLOT_COUNT=1`、`SPDK_URMA_DEV_NAME=udmac0d1e2`、`SPDK_URMA_CAPSULE_TRANSPORT=urma`；记录 cmdline/env。
+2. 验收 50056/9006/8086 LISTEN、role=leader/serving、Keys=0、owned_slots=1。
+3. `nof_register` 到 node4：`192.168.84.151:4457`、100GiB、base0、nsid1；等 quota ≥20s；验收 mount/opened segment（记录 `Opened NoF segment` 与 qpair 数）。
+4. plain writer：400 keys、4MiB、T1/batch1（或与历史一致的 16t/batch16，记录清楚）、verify=false；验收 master `Keys=400`、`logical_used=1,677,721,600`（**不信 bench 报数**）。
+
+## D. 10-key bench（只做连通性/基线冒烟）
+
+1. 在 node2 跑 supercache 编出的 bench：10 keys、warmup=0、T1、batch1、qpairs4、verify=false、plain 模式（无 vsegment 参数）。
+2. 记录 rc、failed、10/10、P50、attachfail、target 4457 状态；**本单不评价性能**。
+3. 若 attach 仍 `err=-5/EPERM` ⇒ 停手回报（说明问题可能不是 node1 特有）；若 10/10 成功 ⇒ 环境跑通，停手，下一单再做 400-key plain/vseg 重基线。
+
+## E. 回执必答
+
+- supercache clone HEAD/编译配置/产物 md5；
+- SPDK include/lib 路径与 `libspdk_bdev.a` md5；
+- etcd 版本/端口/health；
+- master PID/端口/Keys/owned_slots；
+- register 的 opened/qpair；
+- writer Keys/logical_used；
+- 10-key bench rc/10/10/P50/attachfail；
+- 新增写入 LBA/cid、node2 空间、target 未重启；
+- 有无失败/缺依赖。
+
+## F. 边界
+
+- **target 保持运行，不重启、不换设备**。
+- **不装包、不改系统配置、不用 `/usr/local/lib`、不用 node2/node4 的 GAP/nds 构建**。
+- 不写 vseg 数据；只写 plain 400 keys；不跑正式 400-key 性能对比。
+- 只 kill 我方旧进程；不碰 `/home/ql` 等他人进程。
