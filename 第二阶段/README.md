@@ -3,7 +3,7 @@
 > **2026-11-25 接管状态（覆盖下方所有旧“当前状态 / 当前任务”）**
 >
 > - 本文正文记录到 NOF-083，之后的历史以 `../HANDOVER.md` 与 `../工作汇总.md`《结论登记表》为准。
-> - **当前任务：NOF-106（编译 supercache master+bench，部署 node2，plain 10-key）**——NOF-105 完成：node4 target PID 2142228/md5 3129641f，4457/RAID0 11 盘/nsid1 就绪。NOF-106 用 `wangyuqi0429/Mooncake@supercache-snapshot`（aadab957）重编 master+bench，链接 e12b7cb/bd5ee124d 静态库；优先 node2 编译（/home ≥10G），否则 node4 编译后复制；node2 起独立 etcd/plain master，register node4 target，写 plain 400 keys，跑 10-key smoke。
+> - **当前任务：NOF-107（新环境 plain vs vseg 400-key 基线）**——NOF-106 通过：supercache-snapshot 编译成功，node2 etcd+plain master，register node4 成功，400 keys 写入，10-key 10/10（P50 555.36µs，node2 远端读仅冒烟）。NOF-107 改为 **node4 本机 reader**：plain 400 keys 3 遍 → vseg_nof107 写 400 keys 读 3 遍，给同环境 plain/vseg P50 与 W9；target 不重启、不修代码。
 > - **当前主线：C18（L2）**——vseg 比 plain 慢约 **2.07×**，`read_us` **2.58×**、`query_us` 1.11×；根因未定。
 > - **已撤回**：C03/C17「vseg 无代价」、所有 4.6–5.9× 单因归因。慢程 **N=400MiB/遍** 在单 IO 层成立，但端到端不可见（1.043×），不是端到端根因。
 > - **口径**：bench 回到 **400 keys**；2000-key 数据封存，禁止跨口径比较。target 905586 不重启；etcd 约 150MB。

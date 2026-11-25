@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-106（编译 supercache-snapshot 的 master+bench：优先 node2，空间不足才 node4；部署 node2，起本地 etcd，register node4 target，plain 400-key + 10-key bench）**。NOF-105 完成：node4 target **PID 2142228 / md5 3129641f… / 192.168.84.151:4457 LISTEN**，RAID0 online/11 base/BDF 升序/strip256K，nsid1，transport URMA/udmac0d1e2/RM，新 UUID `0470fe3a…`；旧进程已按 PID 清理，node4/node2 资产 md5 与 node3 一致；未重编/未装包。NOF-106 必须用 **`wangyuqi0429/Mooncake @ supercache-snapshot`（HEAD aadab957）** 重新编译 master+bench，链接 `spdk-e12b7cb-src` 的 e12b7cb/bd5ee124d 静态库（**禁用 `/usr/local/lib`**）；**node2 /home 可用 ≥10G 就直接在 node2 编译，否则 node4 编译后复制二进制**；node2 起独立 etcd（2379）并部署 master+bench；register node4 target；plain 400 keys + 10-key 读通即停。node3 的 be10be29 bench 只能做临时冒烟，不得用于性能结论。
+- 当前任务：**NOF-107（新环境 plain vs vseg 400-key 基线；reader 尽量在 node4 本机，target 不重启）**。NOF-106 通过：node2 用 `supercache-snapshot@aadab957` 本地编译 master/bench/nof_register，只链接自有 e12b7cb 静态库；独立 etcd 3.4.14 + plain master（PID 34172、50056/9006/8086、Keys=400、owned_slots=1）；register node4 4457 成功（0→100GB、心跳 0 失败）；写 400 keys 1.56GiB；10-key 10/10、P50 555.36µs（node2 远端读，仅冒烟，不作性能结论）。NOF-107 先在 node4 本机读 plain 400 keys 3 遍，再切 vseg_nof107 写 400 keys 读 3 遍，给同环境同 target 的 plain/vseg P50 与 W9；不修代码。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -291,7 +291,7 @@
 | NOF-013 | 已关闭 2026-11-20（**结论待复核**） | 当时判"chunk 对读路径无效"（blocks 恒 256）；但复核代码后：vsegment 读路径本应读该 env，怀疑**运行环境被脚本硬编码覆盖**，NOF-015 用环境自证复测。文档 §3.1/3.2/3.4/§四/§八原文已取 |
 | NOF-014 | 已关闭 2026-11-20（**通过**） | 15/15 遍成功；**只有降线程有效**：L3（4 线程）p50 591.1 vs 714.9（−17.3%）、p99 −49.5%；8MiB inflight 无益、2MiB 灾难（+670%）；副本缓存 env 在二进制中不存在；target W9 在 L3 满窗口仍 254–259µs |
 | NOF-015 | 已关闭 2026-11-20（**通过**） | env 自证 chunk 已进进程（131072/262144/2097152），但读路径 NVMe IO 恒为 **128KiB**（blocks p50=256）⇒ **代码层固定**，env 无法改；vsegment child=2MiB（planned_children=2），128KiB 是更下层 IO 粒度 |
-| NOF-016 | 已关闭 2026-11-20（**通过**） | yin target 已起：PID 341038、md5 736a902f…、listener **192.168.84.149:4457**、strip 256K/11 成员、dev udmac0d1e2；旧三进程全退；我方键清空、yin 键未动；master 重启 PID 2462234（leader/serving、enabled=0）；回滚快照已存 |
+| NOF-016 | 已关闭 2026-11-20（**通过**） | yin target 已起：PID 341038、md5 736a902f…、listener **node3:4457**、strip 256K/11 成员、dev udmac0d1e2；旧三进程全退；我方键清空、yin 键未动；master 重启 PID 2462234（leader/serving、enabled=0）；回滚快照已存 |
 | NOF-017 | 已关闭 2026-11-20（**通过**） | 新 target 上 mount rc[0]（233ms）；1024 分区 reconcile 全通过（60s+ 复查仍 0）；quota 181,399 B；device_identity=5805fd63… 与新 raid 一致；**mount 期 target W9≈70µs（n=10，旧 target 255–288µs）** |
 | NOF-018 | 已关闭 2026-11-20（**通过**） | writer 400/0，1.5625 GiB，0.39s，4091.95 MiB/s；写时延 Avg 977.53 / P50 901.03 / P99 2775.35；**写窗口 target W9 23,550 ns（旧 24,840，−5.2%）** ⇒ 换 target 不影响写路径，5× 差异在读路径 |
 | NOF-019 | 已关闭 2026-11-20（**通过**） | **端到端基本不变**：R16 p50 719.0（旧 714.9，+0.58%）、R4 602.5（旧 591.1，+1.93%，均在臂内离散内）；**target 读 W9 254.8µs（旧 283–288，−11%）** ⇒ target 变快未传导到端到端 |
@@ -525,11 +525,11 @@
 
 ### NOF-016 关键事实（target 已换为同事构建，2026-11-20）
 
-- **新 target**：yin `nvmf_tgt`（md5 `736a902ffac8ce608acd22c5459f643d`，2026-11-17 19:20），PID 341038；listener **URMA 192.168.84.149:4457**（fabric 网段，旧地址 141.61.84.149 已拒绝）；NQN `nqn.2026-01.io.spdk:urma-gpu-test`，nsid 1 → `URMA_RAID0`（strip 256 KiB、11 成员、raid uuid `5805fd63-…`）；transport dev_name `udmac0d1e2`、max_io_size 8 MiB、capsule_transport=urma。
+- **新 target**：yin `nvmf_tgt`（md5 `736a902ffac8ce608acd22c5459f643d`，2026-11-17 19:20），PID 341038；listener **URMA node3:4457**（fabric 网段，旧地址 node3 已拒绝）；NQN `nqn.2026-01.io.spdk:urma-gpu-test`，nsid 1 → `URMA_RAID0`（strip 256 KiB、11 成员、raid uuid `5805fd63-…`）；transport dev_name `udmac0d1e2`、max_io_size 8 MiB、capsule_transport=urma。
 - **旧环境退出**：我方 master 2162056（2 s）、gap master 3673976（1 s）、gap target 3243095（3 s）；4457 释放；无 nvmf_tgt/spdk_tgt 残留。
 - **etcd**：我方 `/cvm/vseg_nofvseg/` 6→0、`/oplog/vseg_nofvseg/` 1228→0；yin 与 mooncake_cluster 键数不变。
 - **我方 master 重启**：PID 2462234（16:31:45），leader/serving，50056/9006，`enabled=0`；`/cvm/vseg_nofvseg/` 3 键、`/oplog/` 1 键；env `udmac0d1e2` 自证。
-- **地址/身份变化**：listener 由管理网改为 fabric；raid uuid 变化；NOF-017 register 必须用 **192.168.84.149:4457**；旧 device_identity 冲突不存在（键已清）。
+- **地址/身份变化**：listener 由管理网改为 fabric；raid uuid 变化；NOF-017 register 必须用 **node3:4457**；旧 device_identity 冲突不存在（键已清）。
 - **target 日志路径改为 `/tmp/nvmf_tgt.log`**（gap 的 `~/gap/logs/nvmf_tgt.log` 已停写）。
 - 回滚快照：node3 `~/mooncake-nof-vsegment/run/rollback_gap_target.json`（4,761 B，含 4 类 RPC 全量 + 三进程 cmdline + gap target md5）。
 - 唯一额外动作：wrapper 仅存在于 node1，已原样 scp 到 node3 `/tmp/run_vesegment_target.sh`（md5 一致）。
@@ -1614,13 +1614,13 @@ yin target 是否在 4457 起来（PID/md5）、listener 地址/NQN/ns/strip/dev
 
 ## 背景
 
-- NOF-016：yin target 在 **192.168.84.149:4457**（URMA，UDMAC0D1E2，strip 256K，11 成员）；我方 master PID 2462234（leader/serving，`enabled=0`）。
+- NOF-016：yin target 在 **node3:4457**（URMA，UDMAC0D1E2，strip 256K，11 成员）；我方 master PID 2462234（leader/serving，`enabled=0`）。
 - 本单用**新地址**重新 mount（100GiB、base 0、nsid 1），验证 1024 分区 reconcile 门禁。**不写数据**；不跑 writer/reader。
 
 ## 1. 预检（只读）
 
 1. master：PID 2462234 存活；50056/9006 LISTEN；etcd `/cvm/vseg_nofvseg/` 3 键、无 quota 快照；`/oplog/vseg_nofvseg/` 1 键。
-2. target：node1 → `192.168.84.149:4457` 建连 OK；node3 `ss -lnt` 4457 正常；`nvmf_get_subsystems` 与 NOF-016 D1 一致。
+2. target：node1 → `node3:4457` 建连 OK；node3 `ss -lnt` 4457 正常；`nvmf_get_subsystems` 与 NOF-016 D1 一致。
 3. 记录 target 日志 `/tmp/nvmf_tgt.log` 当前 W 块基线（n 应为 0）。
 
 ## 2. mount（唯一一次，零额外 env）
@@ -1628,14 +1628,14 @@ yin target 是否在 4457 起来（PID/md5）、listener 地址/NQN/ns/strip/dev
 - 在 node1 用 `nof_register`（md5 `1655b48a…`），root，输出 `run/register_r3.log`：
   ```
   <build>/mooncake-store/src/nof_register \
-    "nqn.2026-01.io.spdk:urma-gpu-test" 1 192.168.84.149 4457 URMA \
+    "nqn.2026-01.io.spdk:urma-gpu-test" 1 node3 4457 URMA \
     <node1 192.168.84.*:50056> 107374182400
   ```
 - **不要** export 额外 env。
 
 ## 3. 验证（只读）
 
-1. master 日志（≤40 行）：`SPDK initialization … init_rc=0`、`Attaching to 192.168.84.149`、`Attached`、`Opened NoF segment`、`MountNoFSegment_slow … rc[?]`；任何 attach/URMA ERROR。
+1. master 日志（≤40 行）：`SPDK initialization … init_rc=0`、`Attaching to node3`、`Attached`、`Opened NoF segment`、`MountNoFSegment_slow … rc[?]`；任何 attach/URMA ERROR。
 2. **设备映射（mount 时刻）**：`/dev/uburma` 映射数（应 >0）、`/dev/uburma/udmac0d1e2`、两个 URMA provider。
 3. 若 rc[0]：`published vsegment quota generation 1 with 1024 …`、`VSegment pool formed`、`first full reconcile sweep`；`reconcile failures`=0、`Failed to refresh vsegment ownership`=0；`reconcile stats`：`owned_by_me=1024, reconcile_fail=0`；`VSegment Status`：`enabled=1, partitions_installed=1024, vsegments=1024`；etcd quota 快照存在（~181 KB）；60 s 后复查仍 0。
 4. 若失败：贴 register 输出 + master 错误链 + target 日志对应时间窗（≤20 行），**停手**；不换参数重试。
@@ -1808,7 +1808,7 @@ R16/R4 中位 P50/P90/P99/Avg；与旧 target 同臂的差；target 读窗口 W9
 ## B. 裸 SPDK `urma_perf`（node1 → yin target）
 
 1. 定位二进制：node1 `~/gap/spdk/build/examples/urma_perf`（GAP 项目沿用；**先 `--help`** 确认目标地址/端口/NQN/nsid 参数与 `-o`/`-T`/`-b`/`-t` 语义，并记录 md5）。
-2. 连接参数：traddr `192.168.84.149`、trsvcid `4457`、NQN `nqn.2026-01.io.spdk:urma-gpu-test`、nsid 1；env `SPDK_URMA_DEV_NAME=udmac0d1e2`、`URMA_PERF_ADDR_MODE=seq`（按 `--help` 实际参数调整，**不改源码**）。
+2. 连接参数：traddr `node3`、trsvcid `4457`、NQN `nqn.2026-01.io.spdk:urma-gpu-test`、nsid 1；env `SPDK_URMA_DEV_NAME=udmac0d1e2`、`URMA_PERF_ADDR_MODE=seq`（按 `--help` 实际参数调整，**不改源码**）。
 3. 三个短探针（各 5–10 s，读，`-T 1 -b 1`）：
    - `-o 131072`（128KiB IO）
    - `-o 262144`（256KiB IO）
@@ -1849,7 +1849,7 @@ Mooncake 1t 五段 p50（尤 bdev）；裸 SPDK 128K/256K/8M 的延迟与 target
 | R1 | rand | `-b 1` |
 | R32 | rand | `-b 32` |
 
-- 连接：traddr `192.168.84.149`、trsvcid `4457`、NQN `nqn.2026-01.io.spdk:urma-gpu-test`、nsid 1；env：`SPDK_URMA_DEV_NAME=udmac0d1e2`、`SPDK_URMA_CAPSULE_TRANSPORT=urma`、随机支加 `URMA_PERF_ADDR_MODE=rand URMA_PERF_RANDOM_SEED=20261115`，`--range-bytes=107374182400`（随机范围=我们的 100GiB 段）。
+- 连接：traddr `node3`、trsvcid `4457`、NQN `nqn.2026-01.io.spdk:urma-gpu-test`、nsid 1；env：`SPDK_URMA_DEV_NAME=udmac0d1e2`、`SPDK_URMA_CAPSULE_TRANSPORT=urma`、随机支加 `URMA_PERF_ADDR_MODE=rand URMA_PERF_RANDOM_SEED=20261115`，`--range-bytes=107374182400`（随机范围=我们的 100GiB 段）。
 - 每支记录：avg/p50/p99 延迟、IOPS；**运行结束后立即采 target W 块**（W9/n/exec%）。
 - 注意：每支 preflight 都会写 LBA 0（已知）；全部探针结束后再修复（C）。
 
@@ -1930,7 +1930,7 @@ L4/L8/L16/L16W8 中位 P50/P90/P99/Avg；最优组合；target W9/n；T1 端到�
 1. 记录当前 vsegment 状态（PID 2462234、etcd 键、logical_used、数据）；停 master。
 2. 清**仅我方**键：`/cvm/vseg_nofvseg/` + `/oplog/vseg_nofvseg/`。
 3. 以 plain 参数重启 master（node1，50056/9006，`SPDK_URMA_DEV_NAME=udmac0d1e2`、`VSEG_URMA_DEVICE=udmac0d1e2`，无 vsegment 参数）；确认 leader/serving、无 quota key。
-4. `nof_register` 同命令挂载 target（192.168.84.149:4457、100GiB、base0、nsid1）→ 确认 mount rc[0]。
+4. `nof_register` 同命令挂载 target（node3:4457、100GiB、base0、nsid1）→ 确认 mount rc[0]。
 
 ## C. plain NoF 写 + 读
 
@@ -2010,7 +2010,7 @@ plain NoF 的 T1 / 16t 中位 P50/P90/P99/Avg；与 VSegment 的差；target W9�
 
 1. 停 plain master 2627750；清**仅我方**键 `/cvm/vseg_nofvseg/` + `/oplog/vseg_nofvseg/`。
 2. 启动 vsegment master：NOF-004/007 同参数（cluster `vseg_nofvseg`、50056/9006、udmac0d1e2、20 项 vsegment/HA 参数）+ **`MC_STORE_PARTITION_SLOT_COUNT=64`**。
-3. `nof_register` 同命令（192.168.84.149:4457、100GiB、base0、nsid1）；等 quota 发布 ≥20s。
+3. `nof_register` 同命令（node3:4457、100GiB、base0、nsid1）；等 quota 发布 ≥20s。
 4. 验证：quota 快照分区数 = **64**；`reconcile_fail=0`；`partitions_installed=64`、`vsegments≈64`；`logical_capacity` 记录实际值。
 
 ## C. 写 + 读（同 NOF-018/019 口径）
@@ -2061,7 +2061,7 @@ VSegment-64 的 T1/16t P50/P90/P99/Avg；target W9；与 plain 258.3/718.7 及 V
 
 1. 停 vseg-64 master（按 PID）；清**仅我方**键 `/cvm/vseg_nofvseg/` + `/oplog/vseg_nofvseg/`。
 2. 启动 vsegment master：NOF-027 同参数 + **`MC_STORE_PARTITION_SLOT_COUNT=1`**。
-3. `nof_register` 同命令（192.168.84.149:4457、100GiB、base0、nsid1）；等 quota 发布 ≥20s。
+3. `nof_register` 同命令（node3:4457、100GiB、base0、nsid1）；等 quota 发布 ≥20s。
 4. 验证：`partitions=1`、`reconcile_fail=0`、`partitions_installed=1`、`vsegments` 初始值；记录 `logical_capacity`。
 
 ## C. 写 + 读（同口径）
@@ -2156,7 +2156,7 @@ T1 writer 是否 400/0（`logical_used`、vsegments）；VSegment-1 的 T1/16t P
 
 1. 停 vseg-1 master（PID）；清**仅我方**键 `/cvm/vseg_nofvseg/` + `/oplog/vseg_nofvseg/`。
 2. 启动 master：NOF-004/007 同参数 + **`--vsegment_stripe_size=4194304`** + `MC_STORE_PARTITION_SLOT_COUNT=1024`（恢复 1024 分区，避免单分区容量问题）。
-3. `nof_register` 同命令（192.168.84.149:4457、100GiB、base0、nsid1）；等 quota ≥20s。
+3. `nof_register` 同命令（node3:4457、100GiB、base0、nsid1）；等 quota ≥20s。
 4. 验证：quota 的 `stripe_size=4194304`；partitions=1024；reconcile 0；`partitions_installed=1024`。
 
 ## C. 写 + 读（同口径）
@@ -2199,7 +2199,7 @@ quota stripe_size 是否 4194304、partitions=1024、reconcile 0；writer 400/0�
    - 我方 etcd 前缀：`/cvm/vseg_nofvseg/`（预期约 6 键）、`/oplog/vseg_nofvseg/`（约 2,400 键）是否完整；yin 与 mooncake_cluster 键未变。
    - node1 负载：`uptime`、`top -bn1 | head` 摘要（判断同事的使用是否带来明显负载）。
 2. **node3**
-   - 我方 target（PID 341038）是否存活；4457 是否 LISTEN 在 `192.168.84.149`；`/tmp/nvmf_tgt.log` 是否可写/仍在增长。
+   - 我方 target（PID 341038）是否存活；4457 是否 LISTEN 在 `node3`；`/tmp/nvmf_tgt.log` 是否可写/仍在增长。
    - 是否出现其它非本方进程；HugePages、磁盘空间现状。
 3. **判定**：若我方 master/target 任一缺失、50056/9006/4457 被他人占用、我方 etcd 键异常、或 node1 负载明显影响测试 → **停手回报，不执行实验**。
 
@@ -2207,7 +2207,7 @@ quota stripe_size 是否 4194304、partitions=1024、reconcile 0；writer 400/0�
 
 1. 停我方 vseg-1 master（按 PID）；清**仅我方**键 `/cvm/vseg_nofvseg/` + `/oplog/vseg_nofvseg/`。
 2. 启动 master：NOF-004/007 同参数 + **`--vsegment_stripe_size=4194304`** + `MC_STORE_PARTITION_SLOT_COUNT=1024`。
-3. `nof_register` 同命令（192.168.84.149:4457、100GiB、base0、nsid1）；等 quota ≥20s；验证 quota `stripe_size=4194304`、partitions=1024、`reconcile_fail=0`、`partitions_installed=1024`。
+3. `nof_register` 同命令（node3:4457、100GiB、base0、nsid1）；等 quota ≥20s；验证 quota `stripe_size=4194304`、partitions=1024、`reconcile_fail=0`、`partitions_installed=1024`。
 4. writer 400 keys × 4MiB（16 线程；vsegment flags 同 NOF-018；client slot env=1024）；确认 400/0、`logical_used=1,677,721,600`。
 5. reader：T1 × 3 遍 + 16t × 3 遍（verify=true、诊断关；client slot env=1024）；记录 Avg/P50/P90/P99/Max、failed/verify；target W 块按"下一次连接打印上一轮"对齐；`rpc_first_us` p50。
 6. 对比与回答：
@@ -3488,7 +3488,7 @@ plain 参数行数/domain/ptr 命中/child/lane/blocks；plain 的 target W9 与
    - `SPDK_URMA_STAGE_TARGET_PATH=/home/l00955908/mooncake-nof-vsegment/run/urma_stage_<tag>.bin`（**必须不存在**，O_EXCL）
    - `SPDK_URMA_STAGE_TARGET_CAPACITY=200000`
    - 注意 wrapper 在 `TARGET_TRACE_ENTRIES>0` 时会强制 `SPDK_URMA_STAGE_TARGET_SINK=quiet`：保持 `TARGET_TRACE_ENTRIES=0` 或绕过该行；**以实际 env 为准并记录**。
-3. 同一 RPC 序列（NOF-054）：iobuf → framework_start_init → `bdev_nvme_attach_controller` ×11（按 BDF/顺序）→ `nvmf_create_transport`（URMA、udmac0d1e2、max_io 8MiB 等）→ `nvmf_create_subsystem`（NQN）→ `bdev_raid_create -r raid0 -z 256` → `nvmf_subsystem_add_ns` → `nvmf_subsystem_add_listener -t URMA -f IPv4 -a 192.168.84.149 -s 4457`。
+3. 同一 RPC 序列（NOF-054）：iobuf → framework_start_init → `bdev_nvme_attach_controller` ×11（按 BDF/顺序）→ `nvmf_create_transport`（URMA、udmac0d1e2、max_io 8MiB 等）→ `nvmf_create_subsystem`（NQN）→ `bdev_raid_create -r raid0 -z 256` → `nvmf_subsystem_add_ns` → `nvmf_subsystem_add_listener -t URMA -f IPv4 -a node3 -s 4457`。
 4. 验收（缺一停手/按回退 B）：
    - 4457 LISTEN；subsystem/NQN、nsid1→URMA_RAID0、listener 正确；
    - `nvmf_get_transports`：URMA/udmac0d1e2/capsule urma；
@@ -7152,9 +7152,9 @@ vsegment 规划参数（命令行）：
 
 > **结果**：按 PID 清理 node4 master 1260028/metadata 1260073、node2 client 3204031/nvmf_tgt 3206327；端口 50056/9006/8086/4457（node4）与 50156（node2）释放，余下 `/home/ql` 他人进程未碰。node4/node2 各自 `mooncake-nof-vsegment-2`（1.1G），`nvmf_tgt=3129641f…`、`libspdk_bdev.a=4056b6bd…`、74 libs sha256 `e4737186…`、takeover `8b825b66…`、wrapper `9eea126e…`、bench md5 全部与 node3 一致。
 >
-> **target**：PID **2142228**、md5 `3129641f…`、`192.168.84.151:4457 LISTEN`；`URMA_RAID0` online/11 base/strip256K/superblock=false/新 UUID `0470fe3a-b5db-4656-8346-0159c6ba9277`；nsid1→URMA_RAID0；transport URMA/max_io 8MiB/udmac0d1e2/capsule urma/RM。hugepages 启动前 8768 页（17.1GiB），启动后 free 4476 页；11 盘 vfio，系统盘/根分区未动。
+> **target**：PID **2142228**、md5 `3129641f…`、`node4:4457 LISTEN`；`URMA_RAID0` online/11 base/strip256K/superblock=false/新 UUID `0470fe3a-b5db-4656-8346-0159c6ba9277`；nsid1→URMA_RAID0；transport URMA/max_io 8MiB/udmac0d1e2/capsule urma/RM。hugepages 启动前 8768 页（17.1GiB），启动后 free 4476 页；11 盘 vfio，系统盘/根分区未动。
 >
-> **偏差**：rsync `-e/-o` 写法首次报错，改 `RSYNC_RSH` 成功；node2↔node3/node4 无 ssh 互信，经 node4 中转；node4 系统盘为 nvme10n1（2b），11 数据盘为 nvme0–9+nvme11，target 侧映射 Nvme0..Nvme10；wrapper rc 未落盘 `[未获取]`，以 RPC 全成功 + “Target 就绪”为证据；日志唯一 `handshake rc=-104 peer=192.168.84.247` 是我方 TCP 探测建连即关的副作用。
+> **偏差**：rsync `-e/-o` 写法首次报错，改 `RSYNC_RSH` 成功；node2↔node3/node4 无 ssh 互信，经 node4 中转；node4 系统盘为 nvme10n1（2b），11 数据盘为 nvme0–9+nvme11，target 侧映射 Nvme0..Nvme10；wrapper rc 未落盘 `[未获取]`，以 RPC 全成功 + “Target 就绪”为证据；日志唯一 `handshake rc=-104 peer=node2` 是我方 TCP 探测建连即关的副作用。
 >
 > **末态**：target 保持运行供 NOF-106；未启动 master、未跑 bench、未重编、未装包、未写业务数据。
 
@@ -7206,11 +7206,19 @@ vsegment 规划参数（命令行）：
 
 ---
 
-# NOF-106（待执行 · 编译 supercache master+bench（优先 node2，空间不足才 node4），部署 node2，跑通 plain 10-key · 2026-11-25）
+# NOF-106（已关闭 · 通过：新环境 plain 400 keys + 10-key 读通 · 2026-11-25）
+
+> **结果**：node2 直接在 `/home`（余 595G）编译 **supercache-snapshot@aadab957**（dirty=0，Windows 离线打包上传）；master/bench/nof_register 全部只链接自有 `spdk-e12b7cb-src/build/lib`（`libspdk_bdev.a=4056b6bd…`，`/usr/local` 命中 0）。独立 etcd 3.4.14（127.0.0.1:2379，healthy/leader）；plain master **PID 34172**（50056/9006/8086、Keys=400、owned_slots=1、leader/serving）；`nof_register` 到 node4 4457 成功（容量 0→100GB，心跳 0 失败）；writer 400/0、1.56GiB；10-key 读 **10/10、P50 555.36µs**（node2 远端读，仅冒烟）。
+>
+> **偏差**：三台集群机无外网，源码/子模块/gtest 由 Windows 上传，gtest 用 `FETCHCONTENT_SOURCE_DIR_GOOGLETEST` 离线；etcd Go wrapper 未重编（go 版本/联网限制），复用 node3 预构建 `libetcd_wrapper.so`（源码 md5 一致）；DPDK 必须 root；实际 SPDK 路径多一层 `build/`；master 启动后 2s 一次 lease timeout，未复现。
+>
+> **环境**：target 2142228 未重启（RAID0 UUID 0470fe3a…、4457）；master 34172 运行；node2 /home 余 595G；未装包/未改内核/未重编 SPDK/未动他人进程。产物 `run/nof106_summary.txt`、master/writer/bench/etcd 日志。
+>
+> **下一步 NOF-107**：node4 本机 reader 先读 plain 400 keys 3 遍，再切 `vseg_nof107` 写 400 keys 读 3 遍；给同环境 plain/vseg P50/W9。
 
 ## 背景与目标
 
-- node4 target 已就绪：`192.168.84.151:4457`、RAID0 11 盘、nsid1 100GiB、hugepages 余 4476 页。
+- node4 target 已就绪：`node4:4457`、RAID0 11 盘、nsid1 100GiB、hugepages 余 4476 页。
 - 用户要求 Mooncake 统一用 `wangyuqi0429/Mooncake @ supercache-snapshot`（HEAD `aadab957…`），master 和 bench 必须从该分支重编，链接 `spdk-e12b7cb-src` 的 e12b7cb/bd5ee124d 静态库。
 - 本单只做：编译 → 部署 node2 → 起本地 etcd → register node4 target → plain 400 keys → 10-key bench。**不做 vseg、不做性能结论。**
 
@@ -7240,7 +7248,7 @@ vsegment 规划参数（命令行）：
 
 1. node2 起 plain master：`--cluster_id=plain_nof106`、`--rpc_port=50056`、`--metrics_port=9006`、HTTP 8086、etcd `127.0.0.1:2379`、`MC_STORE_PARTITION_SLOT_COUNT=1`、`SPDK_URMA_DEV_NAME=udmac0d1e2`、`SPDK_URMA_CAPSULE_TRANSPORT=urma`；记录 cmdline/env。
 2. 验收 50056/9006/8086 LISTEN、role=leader/serving、Keys=0、owned_slots=1。
-3. `nof_register` 到 node4：`192.168.84.151:4457`、100GiB、base0、nsid1；等 quota ≥20s；验收 mount/opened segment（记录 `Opened NoF segment` 与 qpair 数）。
+3. `nof_register` 到 node4：`node4:4457`、100GiB、base0、nsid1；等 quota ≥20s；验收 mount/opened segment（记录 `Opened NoF segment` 与 qpair 数）。
 4. plain writer：400 keys、4MiB、T1/batch1（或与历史一致的 16t/batch16，记录清楚）、verify=false；验收 master `Keys=400`、`logical_used=1,677,721,600`（**不信 bench 报数**）。
 
 ## D. 10-key bench（只做连通性/基线冒烟）
@@ -7267,3 +7275,45 @@ vsegment 规划参数（命令行）：
 - **不装包、不改系统配置、不用 `/usr/local/lib`、不用 node2/node4 的 GAP/nds 构建**。
 - 不写 vseg 数据；只写 plain 400 keys；不跑正式 400-key 性能对比。
 - 只 kill 我方旧进程；不碰 `/home/ql` 等他人进程。
+
+---
+
+# NOF-107（待执行 · 新环境 plain vs vseg 400-key 基线；node4 本机 reader · 2026-11-25）
+
+## 目标
+
+- 同一 node4 target、同一 SuperCache 构建、同一 reader 位置，给 plain 与 vseg 的 T1 400-key 基线。
+- **不修代码、不跑 16t、不做结论外推**；只回答：新环境下 vseg 是否仍约 2× 慢。
+
+## A. 预检与 reader 准备
+
+1. 记录 target 2142228/4457/RAID0 UUID；master 34172/50056/9006/8086/Keys=400/owned_slots=1；etcd healthy。
+2. 将 node2 编出的 `stress_cluster_bench`（supercache，md5 `bb4a07a3…`）及运行所需库复制到 node4 自有目录；记录 md5/依赖。
+3. **reader 在 node4 本机运行**（target 本机，master 远端 node2:50056）；先 10-key 冒烟确认 rc=0/10/10。若本机跑不起来，停手回报，不改用 node2 远端硬凑绝对值。
+
+## B. plain 基线（现有 plain_nof106，Keys=400）
+
+1. 每遍 bench 前重新 `nof_register` 到 node4 并验证挂载（`Opened NoF segment`/qpair）。
+2. 读 400 keys：T1、batch1、warmup=128、qpairs4、verify=false；跑 **3 遍**。
+3. 记录每遍 Min/Avg/P50/P90/P99/Max、failed、target W9（n/avg/exec%）；确认 400/400。
+
+## C. vseg 基线（新 cid `vseg_nof107`）
+
+1. 停 plain master；起 vseg master（node2，50056/9006/8086）：`--cluster_id=vseg_nof107`、slot=1、`MC_STORE_PARTITION_SLOT_COUNT=1`、URMA 设备/capsule、`--vsegment_auto_plan=true --vsegment_required_medium=nof --vsegment_io_alignment=4096 --vsegment_member_count=1 --vsegment_stripe_size=2097152 --vsegment_member_extent_size=67108864 --vsegment_reserved_ratio=0 --submaster_count=1`、HA/etcd 同 NOF-106。
+2. 验收 partitions=1、reconcile_fail=0、Keys=0；`nof_register` 到 node4，mount 成功。
+3. T1 writer 写 400 keys（≤3 次补齐；`VSEGMENT_CREATING` 已知机制）；验收 master `Keys=400`、`logical_used=1,677,721,600`。
+4. 每遍前重新挂载；读 400 keys，同 B 参数跑 **3 遍**；记录同 B。
+5. **不修任何代码、不启用 BUFFER**；target 保持运行。
+
+## D. 判读（必答）
+
+- plain 与 vseg 的 P50/Avg/P90/P99、W9 绝对值（µs）；
+- 比值：新环境是否仍 ~2×；若追平/反超，记录并停手（说明旧环境/旧源是问题）；
+- 若仍 ~2×，下一步才有资格继续 timing/机制定位；
+- 明确标注 reader 在 node4 本机、master 在 node2 远端；不与旧 node1/node3 数字混比。
+
+## E. 边界
+
+- target 不重启、不换设备；不重编 SPDK/Mooncake；不改 `/usr/local`；不装包。
+- 数据保留不是目标；只新建 `vseg_nof107` 写 400 keys；plain 现有数据只读。
+- 只跑 T1 400-key；16t 不在本单；失败停手回报。
