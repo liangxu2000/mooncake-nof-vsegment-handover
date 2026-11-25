@@ -97,7 +97,9 @@
 >
 > ⇒ **目前唯一「可重启且数据完好」的是 `plain_nof088`。任何新的 vseg 实验都必须新建 cid 重写数据。**
 
-- 当前任务：**NOF-096（M3-1 前置：定位重链后 ENODEV；先查静态 SPDK 版本与真实链接库集；零业务写入、target 不重启）**。NOF-095 补丁与构建成功，但 NEW/CTRL/裸重链全部 attach `rc=-19`，旧二进制正常；源码已回滚、原二进制未变。**不能直接断言“相同输入不可复现”**：旧二进制当初的真实链接命令/静态 SPDK 库集尚未证明与当前 `link.txt` 相同。NOF-096 先对比 OLD/raw 的内嵌 SPDK 版本、wire、build-id、链接命令与 `.a` md5；若发现旧库集不同，按旧库集重链补丁版并做 plain 20-key 冒烟。
+- **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
+
+- 当前任务：**NOF-097（M3-1：完成客户端 timing 测量；plain 打 `TransferData`，vseg 打 `TransferReadInternal`；e12b7cb 静态库重链）**。NOF-096 已定案 ENODEV 根因是静态 SPDK 库集：`link.txt` 的 `/usr/local/lib` 已于 2026-11-20 被替换，旧可用二进制使用 `$D/build/spdk-e12b7cb-src/build/lib`（wire v4）；换回该库集后 attach/读取恢复。plain 臂路径也已核实：`Client::Get`（3 参）→ `TransferRead` → **`TransferData`（be10be29 L5770，`future->get()` 约 L5888）**；vseg 臂走 `TransferReadInternal`（L5926）。NOF-097 两处打点、两次冒烟、各 3 遍正式读；target 905586 不重启。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -6605,7 +6607,13 @@ vsegment 规划参数（命令行）：
 
 ---
 
-# NOF-096（待执行 · M3-1 前置：定位重链后 ENODEV，先查静态 SPDK 版本与真实链接库集 · 2026-11-25）
+# NOF-096（已关闭 · L3：ENODEV 根因=静态 SPDK 库集错误；plain 打点位置需改 · 2026-11-25）
+
+> **结果**：`link.txt` 引用的 `/usr/local/lib/libspdk_*.a` 已于 **2026-11-20 21:55** 被整体替换；旧可用二进制实际使用 `/tmp/nof051/link.sh` 的 `$D/build/spdk-e12b7cb-src/build/lib`（e12b7cb / wire v4）。同一份源码仅换静态库来源：`/usr/local/lib` → 全部 attach `rc=-19`；e12b7cb 库集 → attach rc=0、20/20 读取成功。**NOF-095 的“重链不可复现”判断推翻：输入本来就不同。** 新构建 `bench-nof096`（md5 `8a7f8548…`）已验证可 attach，保留备用；源码已回滚，原二进制未变，零业务写入，target 905586 未重启。
+>
+> **plain 路径更正**：`Client::Get`（3 参）→ `TransferRead` → **`TransferData`**；4 参 `Get(src_offset)` 才走 `TransferReadInternal`，且会拒绝非 memory/vsegment 副本。plain 的 timing 应在 `TransferData` 的 `future->get()` 后输出。**回执中的 L2338/L2503 是 BatchGet 的行号，不是 TransferData；be10be29 的 `TransferData` 起点 L5770，`future->get()` 约 L5888。** vseg 现有 `TransferReadInternal`（L5926）补丁位置正确。
+>
+> **下一步 NOF-097**：plain 改打 `TransferData`，vseg 保持 `TransferReadInternal`，用 e12b7cb 静态库重链，plain/vseg 各 20-key 冒烟后完成正式测量。
 
 ## 背景与目标
 
@@ -6664,3 +6672,57 @@ vsegment 规划参数（命令行）：
 - **零业务写入**：只读 `plain_nof088` 做 20-key 冒烟；不建 `vseg_nof095`、不改 etcd、不重启 master（除非 plain master 未运行，则按完整 env 启动并 `nof_register`）。
 - 只改我方副本 `client_service.cpp`，不改同事树；原 `bench-io-params-e12` / in-tree OLD 的 md5 必须不变。
 - 构建或冒烟失败即停手回滚，不扩大实验矩阵。
+
+---
+
+# NOF-097（待执行 · M3-1：完成 `NofTransferTiming` 双路径测量 · 2026-11-25）
+
+## 背景与目标
+
+- NOF-096 已定案：ENODEV 根因是**静态 SPDK 库集错误**；必须用 `$D/build/spdk-e12b7cb-src/build/lib`（e12b7cb/wire v4，`/tmp/nof051/link.sh`），禁用 `/usr/local/lib/libspdk_*.a`。
+- plain 路径已核实：`Client::Get`（3 参）→ `TransferRead` → **`TransferData`（L5770，`future->get()` 约 L5888）**；vseg 路径：`TransferReadRange` → **`TransferReadInternal`（L5926）**。
+- 本单完成 NOF-095 未完成的测量：两个真实路径都输出 `NOF095_TIMING`，回答 lane/credit/队头阻塞/drain/最慢子 IO。
+
+## A. 基线与构建硬规范
+
+1. 在我方 `$D/mooncake-src` 记录 HEAD（必须 be10be29）、status、`client_service.cpp` md5；备份 `.orig`；记录原 `bench-io-params-e12` / in-tree OLD md5。
+2. **只允许 e12b7cb 静态库集**：使用 `/tmp/nof051/link.sh` 的库路径与链接参数；**禁止 `/usr/local/lib/libspdk_*.a`**。构建后 `strings bench-nof097 | grep spdk-e12b7cb-src` 必须命中，记录 22 个静态库路径/md5 与产物 md5。
+3. 独立产物 `bench-nof097`，原二进制不动。
+
+## B. 补丁（两处真实路径）
+
+1. **plain NoF**：在 `Client::TransferData` 的 `const ErrorCode result = future->get();` 之后，仅对 `is_read && replica_descriptor.is_nof_replica()` 输出 `NOF095_TIMING arm=plain`；保留原 SpDiag 与 `transfer_data_breakdown`。
+2. **vseg**：在 `Client::TransferReadInternal` 的 vseg 分支 `future->get()` 之后输出 `NOF095_TIMING arm=vseg`；**删除/不保留 NOF-095 加在 `TransferReadInternal` plain 分支上的无效日志**（该分支不是 plain bench 路径）。
+3. 两条日志均包含 `has_timing=0|1` 与 `NofTransferTiming` **全部字段、按定义顺序**；无 timing 也输出 `has_timing=0`，不得静默跳过。
+4. 只改 `client_service.cpp` 一个文件；用函数内 lambda 避免复制格式。
+
+## C. 执行顺序
+
+0. **plain 预检**：`plain_nof088` master 若未运行，按完整 env 启动（`MC_STORE_PARTITION_SLOT_COUNT=1`、URMA 设备/capsule）；`nof_register` 后验收 `Keys=2000`、`owned_slots=1`、`ready=1/1`。
+1. **plain 冒烟**：20 keys、`warmup_keys=0`，预期 **20 条 `NOF095_TIMING arm=plain has_timing=1`**；为 0 ⇒ 停手回滚，不继续。
+2. **plain 正式**：读前 400 keys、`warmup_keys=128`，跑 **3 遍**；每遍前重新挂载并验证；预期 **528 条/遍** timing。
+3. **建 `vseg_nof097`**：按 NOF-095 §C 完整参数组启动 vseg master（slot=1、stripe=2MiB、member_count=1、member_extent=64MiB 等）；写入前复测 etcd 余量；T1 写 400 keys，多轮补齐，验收只认 master `Keys=400` / `logical_used=1,677,721,600`。
+4. **vseg 冒烟**：20 keys、`warmup_keys=0`，预期 **20 条 `arm=vseg has_timing=1`**；为 0 ⇒ 停手回滚，不继续。
+5. **vseg 正式**：同口径跑 **3 遍**（400 keys / warmup 128 / T1 / batch1 / qpairs4 / verify=false）；每遍前重新挂载；预期 **528 条/遍** timing。
+6. 测完恢复 `.orig` 并重编回原状（或删除新产物并验证原二进制未变）；停 master，target 保持运行。
+
+## D. 解析与判据
+
+每臂报告：
+- timing 行数与 `has_timing` 分布；
+- lane 去重数、qpair/worker 分布；
+- `credit_wait_us`、`first_credit_wait_us`、`head_to_first_submit_us`、`dispatch_queue_us`、`qos_fifo_wait_us`、`worker_setup_us` 的 **p50/p90/非零占比**；
+- `first_to_last_submit_us`、`last_submit_to_complete_us`、`task_total_us`；
+- `max_sub_io_latency_us/index/cid`、`sub_io_count` 分布。
+
+判读：
+- vseg lane 更少或 credit/队头明显更大 ⇒ 客户端提交层有责任；
+- 三项相同但 drain/最慢子 IO 更大 ⇒ 客户端提交正常，target/传输/会话等待更大；
+- 全部相同 ⇒ 客户端 timing 层排除，转 target/会话受控实验。
+
+## E. 边界
+
+- **target 905586 / md5 3129641f 不重启**；不启用 BUFFER。
+- **禁止 2000 keys**；只允许新建 `vseg_nof097` 写 400 keys；写入前查 etcd，余量不足停手。
+- 不改共用 etcd、不删 `/oplog`、不改 `/etc/spdiag/spdiag.conf`。
+- 只改我方副本一个文件，原二进制 md5 必须不变；构建或冒烟失败即停手回滚，不扩大实验矩阵。
