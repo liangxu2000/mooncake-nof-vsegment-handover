@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**待用户裁决 NOF-113 路线（A：改码合并相邻 child + env 开关；B：零改码 stripe=4MiB 新写数据）。NOF-112 完成，布局假说被否**：两臂 400/400 key 的**起始 LBA 完全相同**（plain key i 占 `[i×8192, i×8192+8191]`；vseg child0/child1 占同一区间的两半，child1−child0=4096 恒等），覆盖同一 1.56GiB、11 盘分布均匀。**在完全相同的非慢区 301 个 key 上，vseg 301/301 全慢，p50 478.5 vs 179.0µs（2.67×）；慢区 99 个 key 两臂几乎相等（447.5 vs 448.5）。** ⇒ 数据落点不能解释 2×；“vseg 在每个 LBA 上都按慢区速度被服务，plain 只在真正盘首慢区才慢”。剩余候选：**请求切分边界（2MiB×2 task vs 4MiB×1 task）** 或 **vseg 会话/服务路径**。累计已排除：旧环境/源码、客户端 resolve/prepare/submit、child 串行、worker 分布+inflight、qpair 扇出、LBA 落点。三次独立实验 W9 比值均精确 2.07×。
+- 当前任务：**NOF-113（用户批准“一起上”：merge × chunk × 并发 综合矩阵；仅重建 bench，带 env 开关；零写/零重启 target）**。用户明确不做“一单一因素”，本单一次跑完：(a) 合并相邻 child（env `MC_VSEGMENT_MERGE_ADJACENT_READS`）能否消除 2×；(b) NoF 提交块 128K/256K/512K 的绝对时延与比值；(c) T4/T16 是否收敛；(d) 是否存在任何配置 vseg ≤ plain。**NOF-112 完成，布局假说被否**：两臂 400/400 key 起始 LBA 完全相同，非慢区 301 key 上 vseg 301/301 全慢（478.5 vs 179.0µs），慢区 99 key 两臂相等 ⇒ 位置不能解释 2×。剩余候选：切分边界 或 vseg 会话/路径。**用户判断：继续单因素排查太慢；且用户明确强调“即使在单 target 上，开了 vseg 也应该比 plain 更快”。** 因此本矩阵是**同一份工作**（同 target、同 LBA、同 32×128KiB）下的最后一次调参与合并尝试：若做到 vseg ≤ plain，继续优化；**若没有任何配置做到，那不是“要求不合理”，而是当前 vseg 实现/配置达不到，下一单必须改变工作方式（多 member 跨独立 target、或内存分层/缓存），不再继续调参。** vsegment 代码本身要求 `member_count>1` 时成员来自**不同 segment**（`vsegment.cpp:117-120`、成员集合按 `segment_id` 去重）；当前只注册了 1 个 NoF segment，所以是 `member_count=1` 的退化配置，没有 plain 不具备的并行资源。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -7790,6 +7790,96 @@ vsegment 规划参数（命令行）：
 1. **请求切分边界**：vseg 以 2MiB 为单元（2 个 task、各 16×128KiB） vs plain 4MiB（1 个 task、32×128KiB）。覆盖区间相同，但 task 边界不同。
 2. **vseg 会话/服务路径**：不同 cid/client 进程/NoF 会话，target 侧 qpair→lcore/缓冲区映射可能不同。
 
-**NOF-113 路线待用户裁决**：
-- **A（推荐）**：改码在 `submitVSegment` 把**物理与客户端地址都相邻**的 read child 合并成一个 task，用 env 开关（默认关）做同二进制 A/B；不写数据、不重启 target；若合并有效，直接得到修复。
-- **B**：零改码，新建 `vseg_nof113`、`stripe_size=4MiB` 写 400 keys（一 key 一 child），读 3 遍；等价于“一个 4MiB task”，但要写 1.56GiB，约 20–30 分钟，且旧 NOF-059 曾报无改善（旧环境，未复核）。
+**NOF-113 路线（用户 2026-11-25 拍板：一起上）**：不再一单一因素；把 merge、chunk、并发矩阵合并成一单一次跑完。A 路线（合并 child + env 开关）作为矩阵中的一组，另加 chunk 128K/256K/512K 与 T4/T16。若矩阵里仍没有任何配置让 vseg ≤ plain，则停止在单 target 上追 2×，转结构性方案/验收口径。
+
+---
+
+# NOF-113（待执行 · 综合矩阵：merge × chunk × 并发 · 一次跑完 · 零写/零重启 target · 2026-11-25）
+
+## 目标
+
+用户已明确“一起上，不要一单一因素”。本单一次回答四个问题：
+
+1. **merge**：把同一 key 两个物理相邻的 2MiB read child 合并成一个 4MiB NoF task（env 开关），能否消除 2×？
+2. **chunk**：NoF 提交块 128K / 256K / 512K 对两臂绝对时延与比值的影响？
+3. **并发**：T4 / T16 下 vseg 与 plain 是否收敛？
+4. **有没有任何配置 vseg ≤ plain**？若没有，记录“当前同工作/单 member 配置达不到用户要求”，下一单改为改变工作方式（多 member 跨独立 target，或内存分层/缓存），**不再继续调参**。
+
+不改数据、不重启 target；只重建 `stress_cluster_bench`（带 env 开关）。
+
+## A. 补丁与构建
+
+1. 补丁在 handover 仓根：`patches/nof113_merge_adjacent_reads.patch`。把它应用到 Mooncake 源码根（node2 的 supercache aadab957 源码树）：
+   ```bash
+   patch --dry-run -p1 < <handover>/patches/nof113_merge_adjacent_reads.patch
+   patch -p1 < <handover>/patches/nof113_merge_adjacent_reads.patch
+   ```
+   - 补丁只改 `mooncake-store/src/transfer_task.cpp` 的 `TransferSubmitter::submitVSegment` NoF 分支。
+   - 仅当 `op_code==READ` 且 env `MC_VSEGMENT_MERGE_ADJACENT_READS=1` 时，把 endpoint、segment_id、physical_offset、client_address 都连续的下一个 request 合并；**默认不设 env ⇒ 行为与原版完全一致**；写路径不受影响。
+2. 备份现有 bench（记录路径/md5，复制为 `.nof112`），用 NOF-106 同一构建树/命令重建 `stress_cluster_bench`；记录构建命令、新 binary 路径/md5、`--help` 正常。
+3. 用 `strings <bench> | grep MC_VSEGMENT_MERGE_ADJACENT_READS` 确认新 binary 含开关。
+4. 构建失败 ⇒ 恢复旧 binary、停手回报，不跑矩阵。
+
+## B. 探针（不做性能结论）
+
+1. **merge 探针**：2-key 只读、`MC_STORE_TRANSFER_DIAG=1`：
+   - OFF：每 key 应 2 条 `nof_slow_task`，`blocks=4096`、`sub_ios=16`、`child_count=2`；
+   - ON（`MC_VSEGMENT_MERGE_ADJACENT_READS=1`）：每 key 应 **1 条**，`blocks=8192`、`sub_ios=32`、`child_count=1`。
+   - 不通过 ⇒ 停手回报。
+2. **chunk 探针**：2-key、`MC_NOF_DEBUG=1`，分别 128K/256K/512K，记录 `nof_qos_create ... blocks_per_chunk=`（期望 256/512/1024）与 lane 额度；512K 若 I/O 失败/超 MDTS，记录并**删掉 512K 相关臂**。
+3. 目标：target 2142228 不重启；当前 plain master 2203377 在跑。
+
+## C. plain 矩阵（先跑，master 已在跑）
+
+固定：400 keys、4MiB、batch=1、warmup=128、qpairs=4、verify=false、sequential；diag/DEBUG 关；每遍前 register；每臂 **3 遍**；记录 Min/Avg/P50/P90/P99/Max、failed、W9。
+
+| 臂 | threads | chunk |
+|---|---|---|
+| P1 | 1 | 128K |
+| P2 | 1 | 256K |
+| P3 | 1 | 512K（若探针失败则跳过） |
+| P4 | 4 | 128K |
+| P5 | 16 | 128K |
+
+## D. vseg 矩阵（切到 `vseg_nof107`，零写入）
+
+1. 停 plain master（记录 PID），按 NOF-107 C 段同参起 vseg master；验收 Keys=400、partitions=1、reconcile_fail=0；register。
+2. 固定参数同 C；**零写入**；每遍前 register；每臂 3 遍；记录同 C。
+3. **执行顺序**（先跑最决定性的）：
+
+| 臂 | threads | chunk | merge |
+|---|---|---|---|
+| V1 | 1 | 128K | off（控制） |
+| V2 | 1 | 128K | **on** |
+| V3 | 1 | 512K | off |
+| V4 | 1 | 512K | **on** |
+| V5 | 1 | 256K | off |
+| V6 | 4 | 128K | off |
+| V7 | 16 | 128K | off |
+
+## E. 交付（必答）
+
+1. 补丁 apply / 构建命令 / 新 binary md5 / strings 证据；merge 与 chunk 探针原始行。
+2. **一张总矩阵表**：臂、threads、chunk、merge、3 遍 P50/单遍明细、W9、failed；附 plain/vseg 比值。
+3. 四个问题的直接答案：
+   - merge 在 128K/512K 各让 vseg 的 P50/W9 变化多少？是否回到 plain 档？
+   - chunk 128→256→512 对两臂绝对时延和比值的影响？
+   - T4/T16 下 vseg/plain 是否收敛？比值多少？
+   - **是否存在任何配置 vseg ≤ plain**？若有，给出最佳配置与数值；若没有，明确写“当前同工作/单 member 配置达不到用户要求”，并说明下一单必须改变工作方式（多 member 跨独立 target，或内存分层/缓存），不再继续调参。
+4. 与历史基线对照：plain 274.00/120.07、vseg 555.00/248.80（diag off，T1/128K）。
+5. 环境末态与回退命令。
+
+## F. 边界与回退
+
+- **零写入**；target 2142228 不重启；不改 SPDK、不动 `/usr/local`。
+- 只改 Mooncake 客户端并重建 bench；旧 binary 保留为 `.nof112`。
+- 本单**包含 T4/T16**（用户明确批准），不再受“只跑 T1”限制；但不跑其他线程数。
+- 回退三级：env 不设（行为同原版）→ 换回 `.nof112` binary → `patch -R -p1` / `git checkout -- mooncake-store/src/transfer_task.cpp`。
+- 任一臂出现 failed≠0、rc≠0、挂载失败：记录该臂并继续；若 merge 路径崩溃或 400/0 不成立，立即停止 merge 臂并回退，仍可完成 chunk/plain 臂。
+- 预计：构建 1–3 分钟；探针 3 分钟；36 个 pass（12 臂×3）约 10–15 分钟；总计 **≤30 分钟**。
+
+## G. 环境基线（本单开始前应确认）
+
+- target 2142228（md5 3129641f…、4457、RAID0 UUID 不变）。
+- plain master 2203377（Keys=400、owned_slots=1）；vseg 数据 `vseg_nof107` 400 keys 保留。
+- node2 无残留 bench；`vseg_nof107` 只读。

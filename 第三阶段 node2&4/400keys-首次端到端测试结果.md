@@ -394,6 +394,8 @@ MC_STORE_TRANSFER_DIAG=1
 
 **NOF-112 已完成**：两臂起始 LBA 逐值相同 400/400；在非慢区 301 个 key 上 vseg 301/301 全慢（478.5 vs 179.0µs），慢区两臂相等 ⇒ **数据落点解释力弱/被否**（见 5.5）。
 
-**NOF-113（待裁决）**：只剩“请求切分边界”与“vseg 会话/路径”两个候选。
-- A：改码在 `submitVSegment` 合并物理/客户端地址都相邻的 read child，env 开关做同二进制 A/B；不写数据、不重启 target。
-- B：零改码，新建 stripe=4MiB 的 vseg cid 写 400 keys（一 key 一 child），读 3 遍；等价于一个 4MiB task，但要写 1.56GiB。
+**NOF-113（已下发，用户批准“一起上”）**：一次跑完 merge × chunk × 并发矩阵：
+- vseg：T1 128K off/on、512K off/on、256K off、T4/T16 128K off；
+- plain：T1 128K/256K/512K、T4/T16 128K；
+- 每臂 3 遍，零写、target 不重启，只重建带 env 开关的 bench。
+- 四个问题：merge 是否消除 2×、chunk 是否改变绝对时延/比值、T4/T16 是否收敛、**是否存在任何配置 vseg ≤ plain**；若没有，说明当前同工作/单 member 配置达不到要求，下一步改工作方式（多 member/独立 target 或分层），不再调参。用户强调：即使单 target，开了 vseg 也应比 plain 快。

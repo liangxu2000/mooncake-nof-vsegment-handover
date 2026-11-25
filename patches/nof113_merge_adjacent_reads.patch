@@ -1,0 +1,51 @@
+--- a/mooncake-store/src/transfer_task.cpp
++++ b/mooncake-store/src/transfer_task.cpp
+@@ -2545,15 +2545,43 @@
+             state->started_at = std::chrono::steady_clock::now();
+             state->planned_children = plan.requests.size();
+         }
++        struct EffectiveNofRequest {
++            std::string endpoint;
++            uint64_t physical_offset;
++            uint64_t client_address;
++            uint64_t length;
++        };
++        std::vector<EffectiveNofRequest> effective;
++        effective.reserve(plan.requests.size());
++        const bool merge_adjacent =
++            op_code == TransferRequest::READ &&
++            IsTruthyEnv(std::getenv("MC_VSEGMENT_MERGE_ADJACENT_READS"));
+         for (const auto& request : plan.requests) {
++            if (merge_adjacent && !effective.empty() &&
++                effective.back().endpoint == request.endpoint &&
++                effective.back().physical_offset + effective.back().length ==
++                    request.transfer.physical_offset &&
++                effective.back().client_address + effective.back().length ==
++                    request.transfer.client_address) {
++                effective.back().length += request.transfer.length;
++                continue;
++            }
++            effective.push_back({request.endpoint,
++                                 request.transfer.physical_offset,
++                                 request.transfer.client_address,
++                                 request.transfer.length});
++        }
++        if (state->op_id) state->planned_children = effective.size();
++        for (size_t i = 0; i < effective.size(); ++i) {
++            const auto& request = effective[i];
+             AllocatedBuffer::Descriptor handle{};
+             handle.transport_endpoint_ = request.endpoint;
+-            handle.buffer_address_ = request.transfer.physical_offset;
+-            handle.size_ = request.transfer.length;
++            handle.buffer_address_ = request.physical_offset;
++            handle.size_ = request.length;
+             auto child = submitSpdkNofOperation(handle,
+-                reinterpret_cast<void*>(request.transfer.client_address),
+-                request.transfer.length, op_code, state->op_id,
+-                state->children.size(), plan.requests.size());
++                reinterpret_cast<void*>(request.client_address),
++                request.length, op_code, state->op_id,
++                i, effective.size());
+             if (!child) { state->submission_failed = true; break; }
+             state->children.push_back(std::move(*child));
+         }

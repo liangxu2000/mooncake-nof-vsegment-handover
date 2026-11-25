@@ -84,7 +84,7 @@ node2（reader + writer）                     node4（master + etcd + target）
 | **NOF-110** | 单变量 `MC_NOF_WORKERS=1` | **无改善**：vseg P50 555.00→558.50、W9 248.80→249.36；plain 274.00→266.27、W9 120.07→120.36。4 条 lane 全绑 worker0，两配置 `lane_inflight=16384`/`segment_inflight=65536` 相同 ⇒ **worker 分布、inflight 额度排除**。但 qpair 仍 4 条，连续 task 轮转 ⇒ vseg 每 key 2 条 qpair、plain 1 条，**qpair 扇出未排除** |
 | **NOF-111** | 单变量 qpair 数 | **无改善**：vseg W9 248.80→**248.87**、P50 555.00→558.74；plain W9 120.29。探针确认 1 条 lane/qpair、单 lane 额度仍 16384 ⇒ **qpair 扇出排除**。客户端组织方式累计全部排除；W9 比值三次独立实验均为 **2.07×** |
 | **NOF-112** | LBA 布局对照 | **布局假说被否**：两臂起始 LBA 逐值相同 400/400；非慢区 301 个 key 上 vseg **301/301 全慢**（p50 478.5 vs 179.0µs），慢区 99 个 key 两臂相等（447.5 vs 448.5）⇒ 位置不能解释 2× |
-| **NOF-113（待裁决）** | 切分边界 vs 会话路径 | A：改码合并物理相邻 child + env 开关（不写数据，~10–15 分钟）；B：零改码 stripe=4MiB 新写 400 keys（~20–30 分钟） |
+| **NOF-113（当前）** | 综合矩阵：merge × chunk × 并发 | 用户批准“一起上”。merge（相邻 child 合并 + env 开关）× chunk（128K/256K/512K）× T1/T4/T16，两臂 12 臂×3 遍；只重建 bench，零写、target 不重启。**用户强调即使单 target 也应更快**；本矩阵是同一份工作下的最后一次尝试，若仍无 vseg ≤ plain，则改工作方式（多 member/独立 target 或分层），不再调参 |
 
 ---
 
