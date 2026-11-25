@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-110（单变量：`MC_NOF_WORKERS=1`，让 vseg 两个 child 落同一个 worker/lane；T1 下 plain 只有 1 个 task 不受影响，作对照；两臂各 3 遍；零写/零重启/零改码）**。NOF-109 完成：三个 pass、1200/1200 op **overlap 100%**，submit_skew 中位 6.8µs、completion_gap 22.9µs，child0/child1 各约 375/394µs，op span 420µs = **1.10× 单 child**、span/(lat0+lat1)=0.52 ⇒ **“串行两波”被否，“并行但每 child 自身慢”成立**；fifo_wait 非零 0/1200。源码 `vsegment_runtime.cpp:339` 确认 `member_count=1` 时两个 child 物理相邻（base+0 / base+2MiB）⇒ 不是“远端点分散”，但它们是两个独立 NoF task、可能落在不同 worker/lane，这一点尚未操纵。前序：NOF-108 已补证 `type`（vseg 528/528、plain 528/528）、95% 差值在 `completion_wait`、plain 有 key 0–95 三遍一致前缀慢档而 vseg 全区平坦 ~470µs。
+- 当前任务：**NOF-111（单变量：`--nof_qpairs_per_segment=1` + `MC_NOF_INFLIGHT_BYTES_LIMIT=8MiB` 夹紧；判断“每 key 两个 qpair 扇出”是否是 target 慢档触发条件；两臂各 3 遍；零写/零重启/零改码）**。NOF-110 完成：`MC_NOF_WORKERS=1` 对 vseg **无改善**（P50 555.00→558.50，W9 248.80→249.36），plain 不变（274.00→266.27，W9 120.07→120.36）；`MC_NOF_DEBUG` 证明 4 条 lane 全绑到 worker0，且**两配置的 lane/segment inflight 额度相同（16384/65536）** ⇒ **worker 线程分布、inflight 额度均排除**。**但 qpair 仍是 4 条**：`transfer_task.cpp:911-916` 的 `binding.next_lane++ % lane_count` 让连续 task 轮转到不同 qpair；vseg 的两个 child 连续提交 ⇒ 每 key 用 **2 条 qpair**，plain 每 key 只用 **1 条**。所以“qpair 扇出”未被 NOF-110 排除，交给 NOF-111。前序：NOF-109 已判两 child 100% 并行、每 child 自身慢；NOF-108 已补 `type` 并定位 95% 差值在 `completion_wait`。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -7575,3 +7575,86 @@ vsegment 规划参数（命令行）：
 - **零写入**；target 不重启；不改码/不重编；不启用 diag/BUFFER；不跑 16t；不动 `/usr/local`。
 - 只切 master（plain→vseg），不碰他人进程；失败停手回报。
 - 不把 workers=1 当成性能配置对外；本单只用于机制判定。
+
+---
+
+## NOF-110 裁决（2026-11-25 · 回执已收）
+
+### 1. 结果（[事实]，diag 关，3 遍中位，µs）
+
+| 指标 | workers=4（基线） | workers=1 | 变化 |
+|---|---|---|---|
+| plain P50 | 274.00 | 266.27（261.72–276.95） | 在臂内波动内 |
+| plain W9 | 120.07 | 120.36 | +0.2% |
+| vseg P50 | 555.00 | **558.50**（553.58–568.61） | +0.6% |
+| vseg W9 | 248.80 | **249.36** | +0.2% |
+| P50 比值 | 2.03× | 2.10× | 不变 |
+| W9 比值 | 2.07× | 2.07× | 不变 |
+
+- env 生效证据：`nof_worker_thread worker_idx=0`；`nof_lane_bind` 四条 lane 全部 `worker_idx=0`、qpair 2/3/4/5；warning “4 I/O lanes but only 1 workers” 出现。
+- **额度混杂项实测排除**：workers=1 与 workers=4 的 `lane_inflight_blocks_limit=16384`、`segment_inflight_blocks_limit=65536` 完全相同。原因是公式除以 `lane_count`（=qpairs=4），不是 worker 数（`transfer_task.cpp:655-668`）。
+
+### 2. 能下的结论
+
+- **worker 线程分布不是原因（L1 排除）**：把 4 条 lane 的轮询压到 1 个 worker，vseg 无变化。
+- **inflight 额度不是原因（L1 排除）**：两配置额度相同。
+- plain 保持不变，符合“T1 每 key 只有 1 个 task”的预期。
+
+### 3. 不能下的结论（重要纠正）
+
+- 回执写“客户端侧的编排、队列归属、并发深度、inflight 额度全部可以排除”——**“队列归属/qpair 扇出”不能排除**。
+- 原因：workers=1 **只合并了 worker 线程，qpair 仍是 4 条**。`SpdkNofWorkerPool::submitTask` 用 `binding.next_lane++ % lane_count` 给每个 task 选 lane（`transfer_task.cpp:911-916`），所以：
+  - vseg：child0、child1 连续提交 ⇒ 落到**两条不同的 qpair**；
+  - plain：每 key 1 个 task ⇒ 每 key 只用**一条 qpair**（不同 key 之间轮转）。
+- 因此“每 key 两个 qpair 扇出”仍是未测变量，NOF-111 用 `--nof_qpairs_per_segment=1` 处理。
+
+### 4. 下一步
+
+**NOF-111**：把 qpairs 从 4 改为 1，让 vseg 两个 child 共享同一条 qpair；同时把 `MC_NOF_INFLIGHT_BYTES_LIMIT` 夹到 8MiB，使单 lane 额度仍为 16384（避免 qpairs=1 导致额度变 4× 的混杂）。若 vseg 变快 ⇒ qpair 扇出是触发条件，修法是合并相邻 child 为一个 4MiB task；若不变 ⇒ qpair 扇出也排除，转向 LBA/布局或 target 侧 trace。
+
+---
+
+# NOF-111（待执行 · 单变量 `--nof_qpairs_per_segment=1` + 8MiB 额度夹紧 · 零写/零重启/零改码 · 2026-11-25）
+
+## 目标
+
+- 只操纵 qpair 数：4 → 1；同时 `MC_NOF_INFLIGHT_BYTES_LIMIT=8388608`（8MiB），抵消 `lane_count=1` 导致单 lane 额度从 16384 变 65536 的混杂。
+- T1 下 plain 每 key 1 个 task，qpairs 数只影响 key 间轮转，不动单 key；vseg 的两个 child 在 qpairs=1 时必须共享同一条 qpair。
+- 只回答：**vseg 的 P50 / target W9 是否向 plain 靠近**。
+  - 若明显变快 ⇒ “每 key 两个 qpair 扇出”是 target 慢档的触发条件；修复方向：合并相邻 child 为一个 4MiB task（物理相邻，可合并），或让两个 child 绑定同一 lane/qpair。
+  - 若不变 ⇒ qpair 扇出也排除，剩余候选只有数据 LBA/布局与 target 侧服务路径。
+
+## A. 预检
+
+1. target 2142228 不重启；记录 md5/4457/RAID0 UUID。
+2. 当前应运行 vseg master 2194604（NOF-110 末态、Keys=400、partitions=1）；plain master 已停，`plain_nof107` 数据保留。
+3. `--help 2>&1 | grep -E "nof_qpairs_per_segment"` 确认旗标存在；不存在则改用 env `MC_NOF_QPAIRS_PER_SEGMENT=1`（源码 `stress_cluster_bench.cpp:3292-3294` 支持两者之一），并记录实际用法。
+4. 用 **2-key 探针 + `MC_NOF_DEBUG=1`** 记录 `nof_lane_bind` 与 `lane_inflight_blocks_limit` / `segment_inflight_blocks_limit`，确认真的是 1 条 lane/qpair、单 lane 额度 16384；探针不算性能。
+
+## B. vseg 臂（qpairs=1，先跑；vseg master 已在跑）
+
+1. 正式 reader：`--nof_qpairs_per_segment=1`（或 env），env `MC_NOF_INFLIGHT_BYTES_LIMIT=8388608`；其余同 NOF-107：400 keys、4MiB、T1（threads=1/batch=1）、sequential、warmup=128、verify=false、`--scenario=segment_read`；**diag 关、DEBUG 关**。
+2. 每遍前重新 `nof_register` 并验证挂载。
+3. 3 遍；记 Min/Avg/P50/P90/P99/Max、failed、400/400、target W9（同 NOF-107 窗口法）。
+4. 记录启动日志里的 `NoF qpairs/segment` 行，确认 1。
+
+## C. plain 臂（qpairs=1，后跑）
+
+1. 停 vseg master（记录 PID），按 NOF-107 B 段同参起 plain master（`plain_nof107`、50056/9006/8086、slot=1、etcd 127.0.0.1:2379、URMA 设备/capsule）；验收 leader/serving、Keys=400、owned_slots=1。
+2. `nof_register` 到 node4 target，验证挂载。
+3. 正式 reader 同 B（qpairs=1、8MiB inflight、diag 关）；3 遍；记录同 B。
+
+## D. 交付（必答）
+
+1. 探针：lane 数/ qpair id / lane_inflight / segment_inflight（证明单变量成立）。
+2. 两臂 × 3 遍的 Min/Avg/P50/P90/P99/Max、failed、400/400、W9。
+3. 与基线（qpairs=4：plain 274.00/120.07、vseg 555.00/248.80）的对比表；与 workers=1（plain 266.27/120.36、vseg 558.50/249.36）的对比。
+4. 判决：qpairs=1 是否让 vseg 明显变快；plain 是否保持。
+5. 若不变，明确写“qpair 扇出也不是原因”，不要外推；若变快，给出 P50/W9 的下降幅度，并注明下一步是合并 child 的实现验证。
+
+## E. 边界
+
+- **零写入**；target 不重启；不改码/不重编；不启用 diag/BUFFER；不跑 16t；不动 `/usr/local`。
+- 只切 master（vseg→plain），不碰他人进程；失败停手回报。
+- qpairs=1 只用于机制判定，不作为最终性能配置对外。
+- 注意：qpairs=1 会改变 target 看到的连接数（4→1），这本身就是本单要测的变量；不要把它和“客户端 worker 数”混为一谈。

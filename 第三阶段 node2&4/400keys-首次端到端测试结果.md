@@ -228,6 +228,29 @@ vseg:       ~465µs          │        ~470–485µs（平坦，没有快档）
 `physical_offset = member.base_offset + stripe_index × stripe_size + offset_in_stripe`（`vsegment_runtime.cpp:339`），  
 即 child0 在 base+0、child1 在 base+2MiB。所以“分散在两个远端点”不成立；但它们是**两个独立 NoF task、可能落在不同 worker/lane**，这一点尚未操纵。
 
+### 5.3 NOF-110：合并 worker 无效；qpair 扇出尚未排除
+
+`MC_NOF_WORKERS=1`（默认 4），两臂各 3 遍，diag 关：
+
+| 指标 | workers=4（基线） | workers=1 |
+|---|---|---|
+| plain P50 | 274.00 | 266.27（261.72–276.95） |
+| plain W9 | 120.07 | 120.36 |
+| vseg P50 | 555.00 | **558.50**（553.58–568.61） |
+| vseg W9 | 248.80 | **249.36** |
+| W9 比值 | 2.07× | 2.07× |
+
+- env 生效：四条 lane 全部 `worker_idx=0`，qpair 仍是 2/3/4/5。
+- **额度混杂已实测排除**：两配置的 `lane_inflight_blocks_limit=16384`、`segment_inflight_blocks_limit=65536` 完全相同（公式除以 `lane_count`=qpairs=4，不是 worker 数）。
+- 结论：**worker 线程分布不是原因（L1）**；plain 不变，符合 T1 预期。
+
+**但“队列归属/qpair 扇出”不能排除**：workers=1 只合并了 worker 线程，qpair 仍是 4 条。`transfer_task.cpp:911-916` 用 `binding.next_lane++ % lane_count` 给每个 task 选 lane/qpair：
+
+- vseg：child0、child1 连续提交 ⇒ 每 key 用 **2 条不同的 qpair**；
+- plain：每 key 只有 1 个 task ⇒ 每 key 只用 **1 条 qpair**（不同 key 之间轮转）。
+
+因此 NOF-110 的回执里“客户端编排、队列归属、并发深度全部排除”是**说过头了**；qpair 扇出留给 NOF-111（`--nof_qpairs_per_segment=1` + 8MiB 额度夹紧）。
+
 ---
 
 ## 6. 本轮顺带补掉的证据与混杂
@@ -313,7 +336,9 @@ MC_STORE_TRANSFER_DIAG=1
 
 **NOF-109 已完成**：(a) 串行被否，(b) 并行但每 child 自身慢成立（见 5.2）。
 
-**NOF-110（待执行）**：只改客户端 env `MC_NOF_WORKERS=1`，让两个 child 落到同一个 worker/lane（T1 下 plain 只有 1 个 task，不受影响），两臂各 3 遍。  
-- 若 vseg 明显变快 ⇒ 原因是“两个 task/多条 lane 的并发 IO 让 target 进入慢档”；修法是合并相邻 child 为一个 4MiB task，或让两个 child 同 lane 顺序提交。  
-- 若 vseg 不变 ⇒ 与 task/lane 分布无关，继续查 target 对 vseg IO 的服务路径。  
+**NOF-110 已完成**：`MC_NOF_WORKERS=1` 对 vseg 无改善（558.50/249.36 vs 555.00/248.80），inflight 额度两配置相同 ⇒ **worker 线程分布、额度排除**（见 5.3）。
+
+**NOF-111（待执行）**：`--nof_qpairs_per_segment=1` + `MC_NOF_INFLIGHT_BYTES_LIMIT=8MiB`，让两个 child 共享同一条 qpair（T1 下 plain 每 key 只用 1 条 qpair，作对照），两臂各 3 遍。  
+- 若 vseg 明显变快 ⇒ “每 key 两个 qpair 扇出”是 target 慢档触发条件；修法是合并相邻 child 为一个 4MiB task。  
+- 若不变 ⇒ qpair 扇出也排除，转向 LBA/布局或 target 侧 trace。  
 零写、target 不重启、零改码。
