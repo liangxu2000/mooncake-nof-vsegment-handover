@@ -7158,6 +7158,7 @@ vsegment 规划参数（命令行）：
 
 ## A. 清理我方旧进程（严格按 PID/路径）
 
+0. **只读检查 node2/node4 的 `/home/l00955908/mooncake-nof-vsegment`**：记录 `ls -ld`（owner/mode/mtime）、顶层内容、是否 git 仓库（remote/branch/HEAD/status）、是否有进程 cwd/fd 指向它、日志最后时间。**不删除、不修改**；若是我方旧遗留，记录来源与可复用资产；新环境仍用 `mooncake-nof-vsegment-2`。
 1. 记录候选进程的 PID/cmdline/owner：node4 master 1260028、metadata 1260073、node2 client 3204031、node2 `nds/spdk_v2_runtime/nvmf_tgt`，以及 `/home/l00955908/nds` 下仍存活的 `mooncake_master|mooncake_client|nvmf_tgt`。
 2. **只 kill 上述用户所属路径/PID**：先 `kill -TERM`，10s 不退再 `kill -KILL`；逐个记录。**不碰其他用户/未知路径进程**。
 3. 清端口验收：node4 50056/9006/8086/4457、node2 50156/2379 均 free（或仅剩非我方进程时停手回报）。
