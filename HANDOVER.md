@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-107（新环境 plain vs vseg 400-key 基线；reader 尽量在 node4 本机，target 不重启）**。NOF-106 通过：node2 用 `supercache-snapshot@aadab957` 本地编译 master/bench/nof_register，只链接自有 e12b7cb 静态库；独立 etcd 3.4.14 + plain master（PID 34172、50056/9006/8086、Keys=400、owned_slots=1）；register node4 4457 成功（0→100GB、心跳 0 失败）；写 400 keys 1.56GiB；10-key 10/10、P50 555.36µs（node2 远端读，仅冒烟，不作性能结论）。NOF-107 先在 node4 本机读 plain 400 keys 3 遍，再切 vseg_nof107 写 400 keys 读 3 遍，给同环境同 target 的 plain/vseg P50 与 W9；不修代码。
+- 当前任务：**NOF-107（新环境 plain vs vseg 400-key 基线；master+target 都放 node4，reader 放 node2，保证元数据和数据都跨节点；target 不重启）**。NOF-106 通过：node2 用 `supercache-snapshot@aadab957` 本地编译 master/bench/nof_register，只链接自有 e12b7cb 静态库；独立 etcd 3.4.14 + plain master（PID 34172、50056/9006/8086、Keys=400、owned_slots=1）；register node4 4457 成功（0→100GB、心跳 0 失败）；写 400 keys 1.56GiB；10-key 10/10、P50 555.36µs（node2 远端读，仅冒烟，不作性能结论）。**用户要求：reader 的元数据和数据都必须从远端读** ⇒ NOF-107 将 master 移到 node4（与 target 同机），node2 留作 reader；node2 到 master/target 都跨节点。先 plain 400 keys 3 遍，再切 vseg_nof107 写 400 读 3 遍；不修代码。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -7278,31 +7278,35 @@ vsegment 规划参数（命令行）：
 
 ---
 
-# NOF-107（待执行 · 新环境 plain vs vseg 400-key 基线；node4 本机 reader · 2026-11-25）
+# NOF-107（待执行 · 新环境 plain vs vseg 400-key 基线；master+target 在 node4，reader 在 node2 · 2026-11-25）
 
 ## 目标
 
-- 同一 node4 target、同一 SuperCache 构建、同一 reader 位置，给 plain 与 vseg 的 T1 400-key 基线。
+- **拓扑（用户指定）**：master 和 target 都放 node4；reader 放 node2。这样 reader 的元数据（到 node4 master）和数据（到 node4 target）都跨节点，不出现本地读。
+- 同一 target、同一 SuperCache 构建、同一 reader 位置，给 plain 与 vseg 的 T1 400-key 基线。
 - **不修代码、不跑 16t、不做结论外推**；只回答：新环境下 vseg 是否仍约 2× 慢。
 
-## A. 预检与 reader 准备
+## A. 拓扑迁移与预检
 
-1. 记录 target 2142228/4457/RAID0 UUID；master 34172/50056/9006/8086/Keys=400/owned_slots=1；etcd healthy。
-2. 将 node2 编出的 `stress_cluster_bench`（supercache，md5 `bb4a07a3…`）及运行所需库复制到 node4 自有目录；记录 md5/依赖。
-3. **reader 在 node4 本机运行**（target 本机，master 远端 node2:50056）；先 10-key 冒烟确认 rc=0/10/10。若本机跑不起来，停手回报，不改用 node2 远端硬凑绝对值。
+1. 记录 target 2142228/4457/RAID0；停 node2 的 plain master（34172）与 node2 etcd（可保留数据但本单不用）；target 保持运行。
+2. 把 node2 编出的 `mooncake_master`（md5 `79e30da5…`）与 etcd 二进制/启动方式复制到 node4（node4→node2 ssh 可用）；在 node4 起 **独立 etcd**（127.0.0.1:2379，data-dir 在自有目录），health+leader。
+3. 在 **node4** 起 plain master：50056/9006/8086、`--cluster_id=plain_nof107`、`MC_STORE_PARTITION_SLOT_COUNT=1`、URMA 设备/capsule、etcd 127.0.0.1:2379；验收 50056 LISTEN/leader/serving/Keys=0/owned_slots=1。
+4. `nof_register` 到 node4 target（4457、100GiB、base0、nsid1），验收 mount/opened/qpair。
+5. **reader 留在 node2**：用 node2 已编的 supercache bench（md5 `bb4a07a3…`）先跑 10-key 冒烟，确认 node2→node4 的 master 与 target 都是**跨节点**、rc=0/10/10。若不通，停手回报，不改回 node2 本地 master。
 
-## B. plain 基线（现有 plain_nof106，Keys=400）
+## B. plain 基线（plain_nof107，master 在 node4）
 
-1. 每遍 bench 前重新 `nof_register` 到 node4 并验证挂载（`Opened NoF segment`/qpair）。
-2. 读 400 keys：T1、batch1、warmup=128、qpairs4、verify=false；跑 **3 遍**。
-3. 记录每遍 Min/Avg/P50/P90/P99/Max、failed、target W9（n/avg/exec%）；确认 400/400。
+1. 在 node2 跑 writer：400 keys、4MiB、16t/batch16（记录参数）；验收 master `Keys=400`、`logical_used=1,677,721,600`。
+2. 每遍 bench 前重新 `nof_register` 到 node4 并验证挂载。
+3. node2 reader 读 400 keys：T1、batch1、warmup=128、qpairs4、verify=false；跑 **3 遍**。
+4. 记录每遍 Min/Avg/P50/P90/P99/Max、failed、target W9；确认 400/400；**记录 reader 到 master/target 均跨节点**。
 
-## C. vseg 基线（新 cid `vseg_nof107`）
+## C. vseg 基线（新 cid `vseg_nof107`，master 在 node4）
 
-1. 停 plain master；起 vseg master（node2，50056/9006/8086）：`--cluster_id=vseg_nof107`、slot=1、`MC_STORE_PARTITION_SLOT_COUNT=1`、URMA 设备/capsule、`--vsegment_auto_plan=true --vsegment_required_medium=nof --vsegment_io_alignment=4096 --vsegment_member_count=1 --vsegment_stripe_size=2097152 --vsegment_member_extent_size=67108864 --vsegment_reserved_ratio=0 --submaster_count=1`、HA/etcd 同 NOF-106。
-2. 验收 partitions=1、reconcile_fail=0、Keys=0；`nof_register` 到 node4，mount 成功。
-3. T1 writer 写 400 keys（≤3 次补齐；`VSEGMENT_CREATING` 已知机制）；验收 master `Keys=400`、`logical_used=1,677,721,600`。
-4. 每遍前重新挂载；读 400 keys，同 B 参数跑 **3 遍**；记录同 B。
+1. 停 node4 plain master；起 vseg master（node4，50056/9006/8086）：`--cluster_id=vseg_nof107`、slot=1、`MC_STORE_PARTITION_SLOT_COUNT=1`、URMA 设备/capsule、`--vsegment_auto_plan=true --vsegment_required_medium=nof --vsegment_io_alignment=4096 --vsegment_member_count=1 --vsegment_stripe_size=2097152 --vsegment_member_extent_size=67108864 --vsegment_reserved_ratio=0 --submaster_count=1`、HA/etcd 同 node4 etcd。
+2. 验收 partitions=1、reconcile_fail=0、Keys=0；`nof_register` 到 node4 target，mount 成功。
+3. 在 node2 T1 writer 写 400 keys（≤3 次补齐；`VSEGMENT_CREATING` 已知机制）；验收 master `Keys=400`、`logical_used=1,677,721,600`。
+4. 每遍前重新挂载；node2 reader 读 400 keys，同 B 参数跑 **3 遍**；记录同 B。
 5. **不修任何代码、不启用 BUFFER**；target 保持运行。
 
 ## D. 判读（必答）
@@ -7310,7 +7314,7 @@ vsegment 规划参数（命令行）：
 - plain 与 vseg 的 P50/Avg/P90/P99、W9 绝对值（µs）；
 - 比值：新环境是否仍 ~2×；若追平/反超，记录并停手（说明旧环境/旧源是问题）；
 - 若仍 ~2×，下一步才有资格继续 timing/机制定位；
-- 明确标注 reader 在 node4 本机、master 在 node2 远端；不与旧 node1/node3 数字混比。
+- 明确标注 **reader 在 node2、master 和 target 都在 node4，两者对 reader 都是远端**；不与旧 node1/node3 数字混比。
 
 ## E. 边界
 
