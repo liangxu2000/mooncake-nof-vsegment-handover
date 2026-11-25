@@ -3,7 +3,7 @@
 > **2026-11-25 接管状态（覆盖下方所有旧“当前状态 / 当前任务”）**
 >
 > - 本文正文记录到 NOF-083，之后的历史以 `../HANDOVER.md` 与 `../工作汇总.md`《结论登记表》为准。
-> - **当前任务：NOF-098**——NOF-097 plain timing 已完成（统计需排除作废 P2 后重算）；vseg 因新 cid 挂载 `rc=-101` 阻塞。历史 `vseg_nof086` 同参数能挂载，先对比新老 cid 的注册元数据/命令/env/target 首个错误；target 不重启、零业务写入。
+> - **当前任务：NOF-099**——NOF-098 证明 plain/vseg 都因 host attach EPERM 失败，target 正常；plain timing 已复核干净。现在只读查 host 首个失败 syscall、`/dev/uburma` 权限/provider/cgroup/udev/journal；不重启 target、不换设备、不清理资源。
 > - **当前主线：C18（L2）**——vseg 比 plain 慢约 **2.07×**，`read_us` **2.58×**、`query_us` 1.11×；根因未定。
 > - **已撤回**：C03/C17「vseg 无代价」、所有 4.6–5.9× 单因归因。慢程 **N=400MiB/遍** 在单 IO 层成立，但端到端不可见（1.043×），不是端到端根因。
 > - **口径**：bench 回到 **400 keys**；2000-key 数据封存，禁止跨口径比较。target 905586 不重启；etcd 约 150MB。

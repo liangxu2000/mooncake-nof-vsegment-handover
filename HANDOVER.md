@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-098（vseg 挂载 `rc=-101` 诊断：对比新老 cid 的注册元数据/命令/env/target 首个错误；只读为主 + 一次重注册，不清理资源）**。NOF-097 plain 臂完成：4 lane/qpair/worker 均匀，credit/FIFO/队头全零，时间在 drain/最慢子 IO；vseg 臂因 `vseg_nof097` 挂载 `SEGMENT_NOT_FOUND` 阻塞。**历史 `vseg_nof086` 同参数/同 target 能挂载** ⇒ 不能只归因 host 残留，先对比新老 cid 的 `nof_register` 命令、etcd segment descriptor 与 target 首个错误。target 905586 不重启、零业务写入。
+- 当前任务：**NOF-099（host 侧 URMA attach EPERM 诊断；只读 + 旧 bench 对照；不重启 target、不换设备、不清理资源）**。NOF-098 已否证“vseg 8 参数导致失败”：今日 plain 模式同样 `Operation not permitted / rc=-19 / opened=0`；最后一次成功是 2026-11-24 19:30，首次失败是当日 21:55，此后 plain/vseg 全失败。target 905586 自 11-24 12:21 未重启、subsystem/4457 正常、零错误；node1 `/dev/uburma/udmac0d1e2` 节点今日被重建。NOF-099 先查 host 侧设备权限/provider/cgroup/内核日志与首个失败 syscall，并用旧 bench 做全局性对照。plain timing 重算已完成：n=2112 与 n=2240 差异 ≤1µs，max=9121µs 来自 P4，非 P2 污染。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -6737,7 +6737,17 @@ vsegment 规划参数（命令行）：
 
 ---
 
-# NOF-098（待执行 · vseg 挂载 rc=-101 诊断：先重算 plain，再对比新老 cid 注册元数据 · 2026-11-25）
+# NOF-098（已关闭 · plain 统计复核通过；vseg 假设否证，host attach EPERM 仍未定位 · 2026-11-25）
+
+> **plain 统计复核**：只用 P1/P3/P4/P5（n=2112）与含 P2 warmup 的 n=2240 相比，各字段差异 **≤1µs**；max=9121µs 来自 **P4**，不是 P2 污染。plain timing 结果可作为干净单臂基线：4 lane/qpair/worker 均匀，credit/FIFO/队头全零，时间在 drain/最慢子 IO；但仍无 vseg 对照。
+>
+> **关键更正**：今日 **plain 模式（无任何 vsegment 参数）同样 attach 失败**：`Operation not permitted / rc=-19 / opened=0`。NOF-097 的“plain 挂载成功”结论作废——`Keys=2000` 只是 etcd 元数据，不代表有活的 NoF 挂载。
+>
+> **失败时间线**：最后一次成功 **2026-11-24 19:30 plain_nof088**；首次失败 **2026-11-24 21:55 vseg_nof091**；此后 plain/vseg 全部失败。target 905586 自 11-24 12:21 未重启，4457/subsystem/allow_any_host 正常，target 日志零连接/拒绝错误。node1 `/dev/uburma/udmac0d1e2` mtime 为今日 12:49（其余 udmac* 为 11-17），dmesg 仅周期 `ummu event 0x12`，未见 EPERM 归因行。
+>
+> **已排除**：新老 cid 命令/env（仅 cluster_id 不同）、缺失 descriptor、identity、target 资源/会话错误。**结论：host 侧 attach 链路整体失效，EPERM 上游触发点未定位。**
+>
+> **下一步 NOF-099**：只读查 host 设备权限/provider/cgroup/内核日志与首个失败 syscall，并用旧 bench 做全局性对照；不重启 target、不换设备、不清理资源。
 
 ## 背景与目标
 
@@ -6781,3 +6791,54 @@ vsegment 规划参数（命令行）：
 - **不清理 host/target 资源、不 kill 进程、不删 cid、不新建 cid、不写业务 key**。
 - target 905586 不重启；不改共用 etcd 配置；plain_nof088 保持可读。
 - 若发现需要清理/删除/重置会话层，先回报，由开发侧授权，不在本单执行。
+
+---
+
+# NOF-099（待执行 · host 侧 URMA attach EPERM 诊断：首个失败 syscall / 设备权限 / provider · 2026-11-25）
+
+## 背景与目标
+
+- NOF-098 已定案：失败与 vseg 配置无关，plain 同样 `Operation not permitted / rc=-19 / opened=0`；target 完全正常且看不到连接请求。
+- 最后成功：2026-11-24 19:30；首次失败：2026-11-24 21:55；此后所有 plain/vseg master 均失败。
+- node1 `/dev/uburma/udmac0d1e2` 节点今日被重建；dmesg 仅见周期 `ummu event 0x12`，没有 EPERM 归因。
+- 本单只查 **host 侧 attach 在哪个 syscall/权限/provider 状态失败**，不做恢复操作。
+
+## A. 全局性对照（旧 bench vs master）
+
+1. 用原可用二进制 `bench-io-params-e12`（88ad3134）在 root、相同 env/cwd 下做一次 10-key attach/读尝试；记录首个错误、rc、是否 opened。
+2. 若旧 bench 也失败 ⇒ host 链路全局失效；若旧 bench 成功而 master 失败 ⇒ 收窄到 master 进程/env/资源。
+3. 对一次失败 attempt 使用 `strace -f`（openat/ioctl/mmap/read/write 等），保存**第一个返回 EPERM 的 syscall 与参数**；不得只贴最后的 `rc=-19`。
+
+## B. `/dev/uburma` 设备状态（只读）
+
+1. 对 `udmac0d1e2` 与对照设备 `udmac0d1e3/1e4` 记录：`ls -lZ`、`stat`、`readlink -f`、`getfacl`、`getfattr`、major/minor、owner/mode/mtime。
+2. 读 `/sys/class/uburma/udmac0d1e2/` 与 `/sys/class/uburma/udmac0d1e2/device/` 的 uevent/provider/numa/reset/error 计数；与其它 udmac 设备对比。
+3. 查 udev/journal 从 **2026-11-24 19:00 至今**的 `uburma|urma|ummu|udmac0d1e2|reset|permission|EPERM` 事件，定位节点重建/设备 reset 的**首次时间**。
+
+## C. 进程权限与运行上下文（只读）
+
+1. 对失败 master/bench：`id`、`capsh --print`、`/proc/<pid>/status`、`/proc/<pid>/limits`、cgroup 路径与 device controller 规则、AppArmor/SELinux 状态、ulimit、hugepages、IOVA 模式。
+2. 对比历史成功 master 的日志/env（若有）与当前进程；重点看 21:55 启动脚本是否改过 env、cgroup、设备权限或 provider。
+3. `dmesg`/journal 查 `uburma|urma|ummu|EPERM|permission|reset`，记录最早错误；没有就写 `[未获取]`。
+
+## D. provider/工具自检（只读）
+
+- 若 `rdma`/`ibv*`/URMA CLI 存在，查询 `udmac0d1e2` 的 provider/context/device 状态；只查询，不 attach、不 reset。
+- 检查 URMA provider 模块/服务状态、`/dev/uburma` 映射数、是否残留旧进程持有设备 fd（只记录 PID/fd，不 kill）。
+
+## E. 回执必答
+
+1. 旧 bench 是否也失败；master 与 bench 是否同样全局失效；
+2. 第一个 EPERM syscall 与参数；
+3. `/dev/uburma/udmac0d1e2` 的权限/owner/sysfs/provider 与对照设备差异；
+4. 21:55 失败起点前后的 udev/journal/provider 事件；
+5. 进程 capability/cgroup/AppArmor/SELinux 是否有拒绝证据；
+6. 结论：**设备权限 / provider/cgroup / 设备 reset / master 特有 / 仍未定位**；
+7. 最小安全恢复建议（只给建议，不执行）。
+
+## F. 边界
+
+- **不重启 target、不换 `SPDK_URMA_DEV_NAME`、不 reload driver、不清理资源、不 kill 进程、不重置设备**。
+- 只读为主；唯一允许的运行是 A 段一次旧 bench attach/读尝试与一次 strace。
+- target 905586 保持不变；plain_nof088 元数据不删；新增业务写入=0。
+- 若需要重启 target/换设备/清理会话，先回报，由开发侧授权。
