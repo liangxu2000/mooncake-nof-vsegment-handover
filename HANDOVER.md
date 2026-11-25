@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-100（target 可达性对照：一次 `nof_register` 前后采集 transport/qpair/stats/日志增量；不重启、不换设备、不清理）**。NOF-099 证明 host 侧 `/dev/uburma` open/ioctl 与 TCP `connect():4457` 均成功，strace 无任何 EPERM；设备权限、EID 表、provider md5、capability/cgroup/AppArmor/SELinux 均无差异。EPERM 来自 host URMA 用户态握手或 NVMe-oF connect 应答映射（L2 候选）。下一步只在一次 register 前后比较 target 计数/日志，判断连接请求是否到达 target。plain timing 基线保持有效。
+- 当前任务：**NOF-101（host URMA/ubcore debug：捕获 qpair `err=-5` 前的真实错误码/失败操作；一次 master 重启 + 一次 register；target 不动）**。NOF-100 证明 target 侧 qpair/controller/日志零增量；host 侧 URMA qpair 0 已提交 capsule 并收到完成错误 `err=-5(EIO)`，随后 fatal disconnect。两端无 tcpdump/tshark，报文级 `[未获取]`；RC/jetty 路径仅为 L2 候选。NOF-101 用受支持的 liburma/ubcore debug 机制复现一次 attach，定位 -5 前面的 URMA 错误码与失败操作；不重启 target、不换设备、不清理资源。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -6855,7 +6855,19 @@ vsegment 规划参数（命令行）：
 
 ---
 
-# NOF-100（待执行 · target 可达性对照：一次 register 前后计数 + 可选抓包 · 2026-11-25）
+# NOF-100（已关闭 · target 零增量；host URMA qpair capsule 完成 err=-5；报文级未获取 · 2026-11-25）
+
+> **target 侧（L0）**：一次 register 前后 `admin_cum/io_cum/cur_admin/cur_io/cur_unassigned` 全部 **+0**，controller 为空；新增 17,660B 日志全是周期 timing breakdown（n=0），无 connect/ctrlr/handshake/jetty/reject/error 行。
+>
+> **host 侧关键证据**：`nvme_urma.c:1199` 记录 **qpair 0 capsule completion error err=-5(EIO)**，随后 `nvme_urma.c:1540 fatal rc=-5, disconnecting for reconnect`，最终映射为 attach EPERM。说明 capsule 已进入 URMA 提交路径并拿到完成错误。
+>
+> **报文级证据缺失**：两端无 tcpdump/tshark；`ss -tni` 0.3s 轮询 80s 两侧均 0 命中，但这不是报文证据，且可能漏掉短连接。按判据判 **“不确定”**，不判“未到达 target”。
+>
+> **L2 候选（未过三闸门）**：失败点在 host URMA RC/jetty 路径，不是 target NVMe-oF 逻辑拒绝，也不是 TCP connect 失败；具体 URMA 错误码/失败操作未定位。
+>
+> **环境**：target 905586 未重启；master plain_nof088 仍运行但 NoF 未挂载；新增业务写入=0。产物 `run/nof100_summary.txt`、register/flow 日志、target pre/post 快照。
+>
+> **下一步 NOF-101**：用受支持的 liburma/ubcore debug 机制复现一次 attach，捕获 `err=-5` 前面的真实 URMA 错误码与失败操作；不重启 target、不换设备、不清理资源。
 
 ## 背景与目标
 
@@ -6898,4 +6910,60 @@ vsegment 规划参数（命令行）：
 
 - **不重启 target、不换设备、不 reload driver、不清理资源、不 kill 进程**。
 - 只读 RPC + 一次现有 master 的 `nof_register`；可选单次抓包。
+- 不建新 cid、不写业务 key、不改 etcd 配置。
+
+---
+
+# NOF-101（待执行 · host URMA/ubcore debug：定位 capsule err=-5 前的真实错误 · 2026-11-25）
+
+## 背景与目标
+
+- NOF-100：target 零增量；host URMA qpair 0 已提交 capsule，完成错误 `err=-5(EIO)`，随后 fatal disconnect。
+- 目标：用库支持的 debug 日志抓到 **-5 前面的 URMA 错误码、失败操作、jetty/JFC/EID 上下文**。
+- 本单不修环境，只定位；不重启 target、不换设备、不清理资源。
+
+## A. 先确认受支持的 debug 机制（只读）
+
+1. 对实际加载的 `liburma-udma.so`、`liburma_ubagg.so`、`liburma.so`、`libummu.so` 使用 `strings`/帮助/配置样例，找出**文档化或二进制明确支持**的日志级别 env/config（如 URMA/UBCORE log level、log file）。
+2. 查 `/etc/urma*`、`/etc/ubcore*`、provider 文档/CLI；**不得猜 env 名**。
+3. 若没有受支持的单进程 debug 机制，或需要改系统配置/装包 ⇒ 停手回报，不继续。
+
+## B. 受控 master 重启 + 一次 register
+
+1. 记录当前 `plain_nof088` master PID/cmdline/env、Keys=2000、target PID/md5。
+2. 优雅停当前 master；用**完整正常 env + §A 找到的 debug env**启动同一 `plain_nof088`：
+   - `MC_STORE_PARTITION_SLOT_COUNT=1`
+   - `SPDK_URMA_DEV_NAME=udmac0d1e2`
+   - `SPDK_URMA_CAPSULE_TRANSPORT=urma`
+   - 其余 master/HA/etcd 参数与原进程一致。
+3. 验收 50056 LISTEN、`owned_slots=1`、`ready=1/1`、`Keys=2000`；执行**一次** `nof_register`，记录 3 次 attach 尝试窗口。
+4. 保存 master 日志、provider debug 输出、journal 中同窗口内容。
+
+## C. 解析首个 URMA 错误
+
+按时间顺序找 `nvme_urma_qpair_defer_error err=-5` **之前**的第一条 URMA/ubcore 错误，给出：
+- 错误码与名称；
+- 失败操作（jetty create/modify/rearm、send/recv、completion、EID exchange 等）；
+- 本地/远端 EID、qpair/jetty/JFC 编号；
+- 是否 timeout / reset / permission / resource / protocol；
+- 与 target 零增量是否一致。
+
+## D. 恢复
+
+1. 停 debug master；用原正常 env 重启 `plain_nof088`，验收 Keys=2000/50056/owned_slots=1。
+2. **不尝试恢复 NoF 挂载**（本单只定位）；target 905586 保持不变。
+3. 回执 debug env 名、值、来源（help/strings/文档），不得只写“开了 debug”。
+
+## E. 回执必答
+
+- 受支持 debug 机制及来源；
+- 首个 URMA 错误码/操作/上下文；
+- 是否能解释 `err=-5` 与 target 零增量；
+- 结论：**jetty/JFC / EID/握手 / send-recv / completion / 仍未定位**；
+- master 是否恢复、Keys、target 未重启、新增业务写入=0。
+
+## F. 边界
+
+- **不重启 target、不换设备、不 reload driver、不清理资源、不 kill 他人进程、不装包、不改系统配置文件**。
+- 只允许一次 plain master 重启与一次 register；debug 仅作用于该进程。
 - 不建新 cid、不写业务 key、不改 etcd 配置。

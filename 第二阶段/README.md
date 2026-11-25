@@ -3,7 +3,7 @@
 > **2026-11-25 接管状态（覆盖下方所有旧“当前状态 / 当前任务”）**
 >
 > - 本文正文记录到 NOF-083，之后的历史以 `../HANDOVER.md` 与 `../工作汇总.md`《结论登记表》为准。
-> - **当前任务：NOF-100**——NOF-099 证明 host 设备打开/ioctl/TCP connect 都成功、无 syscall EPERM；问题缩到 URMA 用户态握手/connect 应答层。现在用一次 register 的 target 前后计数/日志（可选抓包）判断连接是否到达 target；不重启、不换设备、不清理。
+> - **当前任务：NOF-101**——NOF-100 证明 target 零增量，host URMA qpair capsule 完成 `err=-5(EIO)`；RC/jetty 路径为 L2 候选。现在用受支持的 liburma/ubcore debug 抓 -5 前的真实错误码/失败操作；不重启 target、不换设备、不清理。
 > - **当前主线：C18（L2）**——vseg 比 plain 慢约 **2.07×**，`read_us` **2.58×**、`query_us` 1.11×；根因未定。
 > - **已撤回**：C03/C17「vseg 无代价」、所有 4.6–5.9× 单因归因。慢程 **N=400MiB/遍** 在单 IO 层成立，但端到端不可见（1.043×），不是端到端根因。
 > - **口径**：bench 回到 **400 keys**；2000-key 数据封存，禁止跨口径比较。target 905586 不重启；etcd 约 150MB。
