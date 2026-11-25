@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-109（纯离线：解析 NOF-108 日志里的 `nof_vsegment_child` / `nof_vsegment_operation`，判定 vseg 两个 child 是并行还是串行、每个 child 自身多慢；零环境/零写/零重启/零改码）**。NOF-108 完成：`type` 补证 **vseg 528/528 = vsegment、plain 528/528 = nof_remote**；客户端分解显示 **95% 差值在 `completion_wait`（+206.5µs）**，resolve/prepare/submit 合计 <10µs；两臂 target W9 **248.03 vs 120.08µs（2.07×）**；臂序排除（plain 后跑仍 363–372µs、W9 120.08）。**新事实：plain 出现三遍一致的 key 0–95 前缀慢档（read_us ~452µs，96+ ~250µs），vseg 无——vseg 全 key 平坦 ~470µs；在 plain 慢区两臂几乎相等（465 vs 455），2× 的绝大部分来自 plain 的快区。** 这是 node2/node4 上的**新环境实测**，但仍未做物理 LBA 对照，慢档不能归因于盘位置（L2）。diag 开销不对称（vseg +31.7、plain +91.4），**diag-on 的 1.61× 不能当真实比值，真实比值仍用 diag-off 的 2.03×**。
+- 当前任务：**NOF-110（单变量：`MC_NOF_WORKERS=1`，让 vseg 两个 child 落同一个 worker/lane；T1 下 plain 只有 1 个 task 不受影响，作对照；两臂各 3 遍；零写/零重启/零改码）**。NOF-109 完成：三个 pass、1200/1200 op **overlap 100%**，submit_skew 中位 6.8µs、completion_gap 22.9µs，child0/child1 各约 375/394µs，op span 420µs = **1.10× 单 child**、span/(lat0+lat1)=0.52 ⇒ **“串行两波”被否，“并行但每 child 自身慢”成立**；fifo_wait 非零 0/1200。源码 `vsegment_runtime.cpp:339` 确认 `member_count=1` 时两个 child 物理相邻（base+0 / base+2MiB）⇒ 不是“远端点分散”，但它们是两个独立 NoF task、可能落在不同 worker/lane，这一点尚未操纵。前序：NOF-108 已补证 `type`（vseg 528/528、plain 528/528）、95% 差值在 `completion_wait`、plain 有 key 0–95 三遍一致前缀慢档而 vseg 全区平坦 ~470µs。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -7488,3 +7488,88 @@ vsegment 规划参数（命令行）：
 - **纯离线**：不跑 bench、不写、不重启、不改码、不启动/停止任何进程；只读 NOF-108 日志与已有 summary。
 - 日志缺失/行数明显不足时停手回报（不要用新测量补）。
 - 只做描述统计，不做物理 LBA/盘位归因。
+
+---
+
+## NOF-109 裁决（2026-11-25 · 回执已收）
+
+### 1. 硬结果（[事实]，3 个 pass、1200 个 measured op）
+
+| 指标 | 实测 p50 / p90 |
+|---|---|
+| overlap（child1 提交早于 child0 完成） | **1200/1200 = 100%** |
+| submit_skew | **6.8 / 8.2µs** |
+| completion_gap | **22.9 / 94.4µs** |
+| child0 延迟 | 375 / 472µs |
+| child1 延迟 | 394 / 495µs |
+| op span（first_submit → last_completion） | **420 / 504µs** |
+| span / 单 child | **1.10×** |
+| span / (child0 + child1) | **0.52** |
+| fifo_wait 非零 child | **0 / 1200** |
+| timed_children / planned / submitted | 2/2/2，400/400；rc≠0 = 0 |
+
+### 2. 判决
+
+- **(a) 串行两波：否。** 若串行，completion_gap 应 ≈ 单 child（~380µs），实测 22.9µs；span/单 child 应 ≈ 2.0×，实测 1.10×。
+- **(b) 并行但每 child 自身慢：成立。** 两个 child 各约 375–394µs、100% 重叠，op 总时长 ≈ 单 child。
+- [推算] 每 child = 2MiB = 16×128KiB，380µs 走完 16 chunk ⇒ ~24µs/chunk 的流水推进；若 target 逐 IO 串行（16×248µs）应约 4ms ⇒ child 内部确实在流水。等效并发 32×W9/span：vseg ≈18.9、plain ≈14.9 ⇒ **两者都在流水，vseg 并发甚至更高，差别只剩 target 对每个 128KiB IO 的服务时间（248 vs 120µs）**。
+
+### 3. 源码补充（新事实）
+
+- `member_count=1` 时，`ResolveTransfer` 的映射为 `physical_offset = member.base_offset + stripe_index × stripe_size + offset_in_stripe`（`vsegment_runtime.cpp:339`）⇒ 4MiB key 的两个 2MiB child **物理相邻**（base+0 / base+2MiB）。
+- 所以“两个 child 分散在远端不同位置”不成立；但它们是 **两个独立 NoF task**，默认 4 个 worker 时可能落到不同 worker/lane，这一点尚未操纵。
+- plain 的 4MiB 是 **一个 NoF task**；vseg 是 **两个 task**。在 T1 下，plain 无论 workers=4 还是 1 都只用一个 worker；vseg 则可能用两个。
+
+### 4. 下一步
+
+**NOF-110**：只改 env `MC_NOF_WORKERS=1`，把两个 child 压到同一个 worker/lane。若 vseg 明显变快 ⇒ 原因是“两个 task/多条 lane 的并发 IO 让 target 进入慢档”，修法是合并相邻 child 为一个 4MiB task（或同 lane 顺序提交）；若不变 ⇒ 与 task/lane 分布无关，继续查 target 服务路径。
+
+---
+
+# NOF-110（待执行 · 单变量 `MC_NOF_WORKERS=1` · 零写/零重启/零改码 · 2026-11-25）
+
+## 目标
+
+- 只操纵一个客户端 env：`MC_NOF_WORKERS=1`（默认 4）。
+- T1 下 plain 每 key 只有 1 个 NoF task ⇒ workers 数不影响它，作对照；vseg 每 key 有 2 个 child task，默认可能落在两个 worker/lane，workers=1 时两个 child 必须走同一个 worker/lane。
+- 只回答：**vseg 的 P50 / target W9 是否向 plain 靠近**。
+  - 若明显变快 ⇒ “两个 task/多条 lane 的并发 IO”是 target 进入慢档的原因；下一步做合并相邻 child（一个 4MiB task）或同 lane 顺序提交。
+  - 若不变 ⇒ 与 task/lane 分布无关，继续查 target 对 vseg IO 的服务路径。
+
+## A. 预检
+
+1. target 2142228 不重启；记录 md5/4457/RAID0 UUID。
+2. 当前应运行 plain master 2171241（NOF-108 末态）、`Keys=400`；vseg 数据 `vseg_nof107` 的 400 keys 仍保留。
+3. 确认 `MC_NOF_WORKERS` 在本源码生效：`transfer_task.cpp` 的 `GetSpdkNofWorkerCount()`；启动日志/`--help` 无该 env 时，用 client 启动后的 worker 数日志或 `nof_worker_pool` 行为核对；无法确认则停手回报。
+
+## B. plain 臂（对照，workers=1，先跑）
+
+1. node2 reader：`MC_NOF_WORKERS=1`；其余同 NOF-107：400 keys、4MiB、T1（threads=1/batch=1）、sequential、warmup=128、qpairs=4、verify=false、`--scenario=segment_read`；**diag 关闭**。
+2. 每遍前重新 `nof_register` 并验证挂载。
+3. 3 遍；记 Min/Avg/P50/P90/P99/Max、failed、400/400、target W9（同 NOF-107 窗口法）。
+4. 预期（若 workers 对 plain 无影响）：P50 ~274µs、W9 ~120µs；若明显不同，说明 workers 也影响 plain，需记录并重新解释。
+
+## C. vseg 臂（workers=1，后跑）
+
+1. 停 plain master（记录 PID），按 NOF-107 C 段同参起 vseg master（`vseg_nof107`、50056/9006/8086、slot=1、stripe=2MiB、member_count=1、extent=64MiB、io_alignment=4096、required_medium=nof、reserved_ratio=0、submaster_count=1、etc 127.0.0.1:2379）；验收 leader/serving、Keys=400、partitions=1。
+2. `nof_register` 到 node4 target，验证挂载。
+3. `MC_NOF_WORKERS=1`；其余同 B；**零写入**（读已有 `vseg_nof107` 数据）。
+4. 3 遍；记录同 B。
+
+## D. 可选（只在 C 出现明显改善时做）
+
+- `MC_NOF_WORKERS=2`，仅 vseg，3 遍；看是否随 worker 数单调变化。
+
+## E. 交付（必答）
+
+1. 两臂 × 3 遍的 Min/Avg/P50/P90/P99/Max、failed、400/400、W9。
+2. 与基线（workers=4：plain 274.00/120.07、vseg 555.00/248.80）的对比表。
+3. `MC_NOF_WORKERS` 生效证据（日志/worker 数）。
+4. 判决：workers=1 是否让 vseg 明显变快；plain 是否保持不变。
+5. 若没变化，明确写“task/lane 分布不是原因”，不要外推。
+
+## F. 边界
+
+- **零写入**；target 不重启；不改码/不重编；不启用 diag/BUFFER；不跑 16t；不动 `/usr/local`。
+- 只切 master（plain→vseg），不碰他人进程；失败停手回报。
+- 不把 workers=1 当成性能配置对外；本单只用于机制判定。

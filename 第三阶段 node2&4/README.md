@@ -80,7 +80,8 @@ node2（reader + writer）                     node4（master + etcd + target）
 | **NOF-106** | supercache 编译 + node2 plain 环境 | supercache@aadab957 在 node2 编译 master/bench/nof_register，只链接自有 e12b7cb 库；etcd 3.4.14；plain master PID 34172（50056/9006/8086、Keys=400、owned_slots=1）；register node4 成功（0→100GB、心跳 0 失败）；400 keys/1.56GiB；10-key **10/10、P50 555.36µs**（node2 远端读，仅冒烟） |
 | **NOF-107** | 新环境 plain vs vseg 400-key 基线 | **master+target 都在 node4、reader 在 node2**（元数据与数据均跨节点）；target 2142228 未重启。plain **P50 274.00µs / W9 120.07µs**；vseg **P50 555.00µs / W9 248.80µs** ⇒ **2.03× / 2.07×**；两臂每遍 target IO 数相同（n≈16.9k，32×128KiB/key）。P90/P99 比值 1.07–1.11× 是 plain 自身长尾（P90/P50=2.11）所致，不是追平 |
 | **NOF-108** | vseg 2× 归因第一步 | `type` 补证 **vseg 528/528 / plain 528/528**；**95% 差值在 `completion_wait`（+206.5µs）**，客户端逻辑排除；W9 **248.03 vs 120.08µs（2.07×）**；plain 后跑不变 ⇒ 臂序排除。**plain 实测 key 0–95 三遍一致前缀慢档（~452µs vs 96+ ~250µs），vseg 全区平坦 ~470µs**；diag 开销不对称，真实比值仍用 diag-off 2.03× |
-| **NOF-109（当前）** | vsegment 子任务时序（纯离线） | 解析 NOF-108 日志的 `nof_vsegment_child` / `nof_vsegment_operation`：两 child 是否重叠、各自延迟多少 ⇒ 分离“串行两波”与“每 child 自身慢”；零环境 |
+| **NOF-109** | vsegment 子任务时序（纯离线） | **1200/1200 op overlap 100%**；submit_skew 6.8µs、completion_gap 22.9µs；child0/child1 各 ~375/394µs；op span 420µs = **1.10× 单 child**、span/(lat0+lat1)=0.52 ⇒ **“串行两波”被否，“并行但每 child 自身慢”成立**。源码确认 `member_count=1` 时两 child 物理相邻 |
+| **NOF-110（当前）** | 单变量 `MC_NOF_WORKERS=1` | 把 vseg 两个 child 压到同一 worker/lane（T1 下 plain 只有 1 task，作对照）；两臂各 3 遍。若 vseg 变快 ⇒ 合并相邻 child 为一个 4MiB task 是修复方向；若不变 ⇒ task/lane 分布不是原因。零写/零重启/零改码 |
 
 ---
 
@@ -88,9 +89,10 @@ node2（reader + writer）                     node4（master + etcd + target）
 
 1. **已回答（NOF-107）**：在新环境 + supercache-snapshot 下，**vseg 仍慢约 2×**（P50 2.03×、target W9 2.07×）⇒ 旧环境/旧源码不是必要条件。
 2. **已回答（NOF-108）**：`type` 确认走 vsegment；客户端 95% 差值在 `completion_wait`，resolve/submit 可忽略；臂序排除。**plain 有 key 0–95 前缀慢档，vseg 全区平坦 ~470µs ⇒ 2× 来自 plain 快区**。
-3. **进行中（NOF-109）**：vseg 的 2 个 child 是否重叠、每个 child 自身多慢 ⇒ 分离“串行两波”与“每 child 自身慢”。
-4. **仍未隔离**：两臂物理 LBA/写入历史不同 ⇒ 路径归因仍为 L2；只有同 LBA/同数据对照才能升到 L3。
-5. **要达成用户目标（vseg 必须快于 plain）**：若 109 指向串行，优先改 child 的提交/合并；若指向每 child 自身慢，再查 target 对 vseg IO 的执行路径。
+3. **已回答（NOF-109）**：两个 child **100% 重叠**，span = 1.10× 单 child ⇒ 不是串行两波；**每个 child 自身慢**。源码确认两 child 物理相邻。
+4. **进行中（NOF-110）**：只改 `MC_NOF_WORKERS=1`，把两个 child 压到同一 worker/lane；看 vseg 是否向 plain 靠近 ⇒ 判断“两个 task/多条 lane”是否是 target 慢档的触发条件。
+5. **仍未隔离**：两臂物理 LBA/写入历史不同 ⇒ 路径归因仍为 L2；只有同 LBA/同数据对照才能升到 L3。
+6. **要达成用户目标（vseg 必须快于 plain）**：若 110 显示 lane 分布是原因，合并相邻 child 为一个 4MiB task；若否，继续查 target 对 vseg IO 的服务路径。
 
 **注意**：NOF-106 的 10-key P50 555.36µs 是 node2 远端读、10 个 key 的冒烟，含冷启动/远端路径，不能当性能基线。正式数字只看 NOF-107/108 的 400-key 3 遍。
 

@@ -110,7 +110,7 @@ T1 get_into(key)                                        （RealClient::get_into�
 ```text
 plain：1 个 4MiB NoF task  → 32 × 128KiB sub-IO
 vseg ：2 个 2MiB NoF child → 每 child 16 × 128KiB sub-IO（共 32）
-        └─ 两个 child 是并行还是串行，本轮未测（NOF-109）
+        └─ 两个 child **并行**（NOF-109：1200/1200 overlap，span 1.10× 单 child）
 ```
 
 ### 4.2 分段表（NOF-108，measured 中位，µs）
@@ -191,7 +191,42 @@ vseg:       ~465µs          │        ~470–485µs（平坦，没有快档）
 两者对“怎么修”完全不同：  
 (a) 改 child 的提交/分配或合并相邻 child；  
 (b) 要查 target 对 vseg IO 的执行路径。  
-**NOF-109 用已有日志里的 `nof_vsegment_child` 时间戳来分离，不需要新测量。**
+**NOF-109 已用已有日志里的 `nof_vsegment_child` 时间戳分离，结论见 5.2。**
+
+### 5.2 NOF-109 判决：两个 child 并行，不是串行
+
+三个 pass、1200 个 measured op（每 op 2 个 child）：
+
+| 指标 | 实测（p50 / p90） |
+|---|---|
+| overlap（child1 提交早于 child0 完成） | **1200/1200 = 100%** |
+| submit_skew | **6.8 / 8.2µs** |
+| completion_gap | **22.9 / 94.4µs** |
+| child0 延迟 | 375 / 472µs |
+| child1 延迟 | 394 / 495µs |
+| op span（first_submit → last_completion） | 420 / 504µs |
+| span / 单 child | **1.10×** |
+| span / (child0 + child1) | **0.52** |
+| `fifo_wait_us` 非零的 child | **0 / 1200** |
+
+判据对照：
+
+| 判据 | 实测 | 若是串行 (a) | 若是并行 (b) |
+|---|---|---|---|
+| overlap | 100% | ~0% | 100% |
+| submit_skew | 6.8µs | ≈ 单 child 延迟（~380µs） | ≈ 0 |
+| completion_gap | 22.9µs | ≈ 单 child 延迟（~380µs） | ≈ 0 |
+| span / 单 child | 1.10× | ≈ 2.0× | ≈ 1.0× |
+| span / (lat0+lat1) | 0.52 | 1.0 | 0.5 |
+
+⇒ **(a) 串行两波被否；(b) 并行但每 child 自身慢成立。**  
+两个 child 各约 380–394µs、完全重叠，op 总时长 ≈ 单 child（1.10×），不是两次相加。
+
+补充：[推算] 每个 child = 2MiB = 16×128KiB，380µs 走完 16 个 chunk ⇒ 平均 ~24µs/chunk 的流水推进；若 target 逐 IO 串行（16×248µs）应约 4ms，实测只有 380µs ⇒ **child 内部确实在流水**。等效并发 ≈ 32×W9/span：vseg 32×248/420 ≈ 18.9，plain 32×120/257 ≈ 14.9 ⇒ 两者都在流水，vseg 并发甚至更高；差别只剩 **target 对每个 128KiB IO 的服务时间（248 vs 120µs）**。
+
+源码上两个 child 是**物理相邻**的：`member_count=1` 时 `ResolveTransfer` 的映射为  
+`physical_offset = member.base_offset + stripe_index × stripe_size + offset_in_stripe`（`vsegment_runtime.cpp:339`），  
+即 child0 在 base+0、child1 在 base+2MiB。所以“分散在两个远端点”不成立；但它们是**两个独立 NoF task、可能落在不同 worker/lane**，这一点尚未操纵。
 
 ---
 
@@ -276,4 +311,9 @@ MC_STORE_TRANSFER_DIAG=1
 
 ### 8.3 下一步
 
-**NOF-109（纯离线）**：解析 `nof_vsegment_child` / `nof_vsegment_operation`，看两个 child 的提交/完成时间是否重叠、各自延迟多少，判定 (a) 还是 (b)。判决后再决定是改 child 提交/合并，还是查 target 对 vseg IO 的执行路径。
+**NOF-109 已完成**：(a) 串行被否，(b) 并行但每 child 自身慢成立（见 5.2）。
+
+**NOF-110（待执行）**：只改客户端 env `MC_NOF_WORKERS=1`，让两个 child 落到同一个 worker/lane（T1 下 plain 只有 1 个 task，不受影响），两臂各 3 遍。  
+- 若 vseg 明显变快 ⇒ 原因是“两个 task/多条 lane 的并发 IO 让 target 进入慢档”；修法是合并相邻 child 为一个 4MiB task，或让两个 child 同 lane 顺序提交。  
+- 若 vseg 不变 ⇒ 与 task/lane 分布无关，继续查 target 对 vseg IO 的服务路径。  
+零写、target 不重启、零改码。
