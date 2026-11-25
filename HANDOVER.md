@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-102（恢复 bench：同二进制重启 target；plain 挂载失败则新建 plain cid 写 400 keys；用户已批准）**。NOF-101 证明 URMA provider 初始化成功，13.2ms 后 capsule `err=-5`，继续加日志收益低。**数据保留不是本单目标**：只备份 target 二进制/启动/RPC 配置/日志尾部，重启同一 target；先试现有 plain，若因 UUID/元数据变化失败，直接新建 `plain_nof102` 写 400 keys（约 178KB oplog）把 bench 跑通；若仍 EPERM/err=-5，则 target 状态排除，转 host 处理。用户已明确批准 target 重启。
+- 当前任务：**NOF-103（用户已批准：重启 node1，复位 host URMA，恢复 10-key bench；node3 target 保持运行）**。NOF-102 已用同二进制/同 RPC 重启 target 并全项验收，但 host 错误逐字不变（`nvme_urma.c:1199 err=-5 → Operation not permitted`），target qpair 仍零增量 ⇒ **target 会话/资源状态排除**。新建 plain cid 不能修复同一 host 错误。用户已批准重启 node1，完整复位 host URMA provider/内核状态；恢复 etcd/plain master 后 register + 10-key bench。数据保留不是目标；仍失败则转 URMA 驱动/固件/系统配置问题，不再加日志。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -6980,7 +6980,17 @@ vsegment 规划参数（命令行）：
 
 ---
 
-# NOF-102（待执行 · 恢复 bench：同二进制重启 target；plain 失败则新建 cid 写 400 keys · 2026-11-25）
+# NOF-102（已关闭 · target 同二进制重启后仍 err=-5；target 状态排除 · 2026-11-25）
+
+> **target 重启成功**：旧 PID 905586 → 新 PID **2810360**，二进制 md5 前后均 `3129641f…`；4457/NQN/nsid1/RAID0(11 盘 BDF 升序/strip256K)/transport 全部验收通过；新 namespace UUID `1e71527b…`（旧 `b66fe5ea…`）。
+>
+> **恢复失败且与重启前逐字同型**：plain_nof088 master 重启正常（Keys=2000、owned_slots=1、ready=1/1），一次 register 后 `opened=0 / attach_fail=3 / defer_error=3`；host `nvme_urma.c:1199 capsule completion err=-5 → nvme.c:834 Operation not permitted`；target 6 个 poll group qpair/stats 全 0、日志零错误。
+>
+> **结论（L1）**：target 会话/资源状态排除；剩余问题在 node1 host URMA provider/内核数据通路。新建 plain cid 不能修复同一 host 错误，故未执行 D.3；未跑 bench、新增业务写入=0、etcd dbSize 未变。
+>
+> **偏差**：首次重启因盘仍在 vfio、`/sys/block/nvme0n1` 不存在被 takeover 拒绝；用脚本自带 `-r -y` 还原 11 盘到 nvme 后重跑成功，根分区仍 rw。全部优雅 TERM，无 SIGKILL。
+>
+> **下一步待用户批准 NOF-103**：重启 node1，完整复位 host URMA provider/内核会话；node3 target 保持运行。若恢复 ⇒ host 状态问题；若仍失败 ⇒ URMA 驱动/固件/系统配置问题，转环境侧，不再加日志。
 
 ## 授权与目标
 
@@ -7039,3 +7049,41 @@ vsegment 规划参数（命令行）：
 - 用户已批准 target 重启；**不得更换 target 二进制版本、不得启用 BUFFER、不得换 URMA 设备**。
 - **数据保留不是目标**：不保护旧 cid 数据、不修复 vseg 元数据；允许新建 `plain_nof102` 写 400 keys 作为恢复 fallback。
 - 不改 etcd 配置、不清理 host/target 资源；plain 写入前复测 etcd 余量。
+
+---
+
+# NOF-103（待执行 · 用户已批准：重启 node1，复位 host URMA，恢复 10-key bench · 2026-11-25）
+
+## 授权与目标
+
+- **用户已明确批准重启 node1**，要求尽快恢复 bench。
+- 目的：完整复位 node1 host URMA provider/内核会话；node3 target 保持运行。
+- 成功标准：plain 能 attach 并完成 10/10 读取；数据保留不是目标。
+
+## A. 重启前（只读 + 停我方进程）
+
+1. 记录 node1 我方 master PID/cmdline/env、bench/脚本残留；记录 etcd PID/service/data dir/端口/dbSize。
+2. 记录 node3 target PID **2810360**、md5 `3129641f…`、4457、RAID0 UUID；本单不重启 target。
+3. 优雅停我方 master；确认无我方 bench。**不停止他人进程**。
+
+## B. 重启 node1
+
+1. `sudo -n reboot`；等待 SSH 恢复（最多 5 分钟，超时回报）。
+2. 重启后验证：主机/网络/URMA 设备节点、etcd endpoint health、dbSize；node3 target 仍在运行。
+
+## C. 恢复 plain 并跑通 bench
+
+1. 用完整 env 启动 `plain_nof088`（slot=1、URMA 设备/capsule、HA/etcd）；验收 Keys=2000、owned_slots=1、ready=1/1；一次 `nof_register`。
+2. 若仅元数据/UUID 问题导致不可用 ⇒ 新建 `plain_nof103`，写 **400 keys**（约 178KB oplog），验收 Keys=400/logical_used 精确。
+3. 在 node3 用 `bench-io-params-e12` 跑 **10 keys / warmup=0 / verify=false**，记录 rc/attachfail/读取数/P50。
+
+## D. 判决
+
+- **10/10 成功** ⇒ host 状态是根因，bench 恢复；本单结束，下一步回 timing 主线。
+- **仍 EPERM/err=-5** ⇒ host 简单复位无效，停止加日志，转 URMA 驱动/固件/系统配置问题（环境侧）。
+
+## E. 边界
+
+- node1 重启已获用户批准；**target 不重启、不换设备、不清理资源、不改内核参数**。
+- 数据保留不是目标；允许 fallback 新建 plain_nof103 写 400 keys；不修复 vseg 元数据。
+- 不碰他人 cid/进程；etcd 只验证，不改配置。
