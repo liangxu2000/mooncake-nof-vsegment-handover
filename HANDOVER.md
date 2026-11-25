@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-109（纯离线：解析 NOF-108 日志里的 `nof_vsegment_child` / `nof_vsegment_operation`，判定 vseg 两个 child 是并行还是串行、每个 child 自身多慢；零环境/零写/零重启/零改码）**。NOF-108 完成：`type` 补证 **vseg 528/528 = vsegment、plain 528/528 = nof_remote**；客户端分解显示 **95% 差值在 `completion_wait`（+206.5µs）**，resolve/prepare/submit 合计 <10µs；两臂 target W9 **248.03 vs 120.08µs（2.07×）**；臂序排除（plain 后跑仍 363–372µs、W9 120.08）。**新事实：plain 出现三遍一致的 key 0–95 前缀慢档（read_us ~452µs，96+ ~250µs），vseg 无——vseg 全 key 平坦 ~470µs；在 plain 慢区两臂几乎相等（465 vs 455），2× 完全来自 plain 的快区。** 这是 node2/node4 上的**新环境实测**，但仍未做物理 LBA 对照，慢档不能归因于盘位置（L2）。diag 开销不对称（vseg +31.7、plain +91.4），**diag-on 的 1.61× 不能当真实比值，真实比值仍用 diag-off 的 2.03×**。
+- 当前任务：**NOF-109（纯离线：解析 NOF-108 日志里的 `nof_vsegment_child` / `nof_vsegment_operation`，判定 vseg 两个 child 是并行还是串行、每个 child 自身多慢；零环境/零写/零重启/零改码）**。NOF-108 完成：`type` 补证 **vseg 528/528 = vsegment、plain 528/528 = nof_remote**；客户端分解显示 **95% 差值在 `completion_wait`（+206.5µs）**，resolve/prepare/submit 合计 <10µs；两臂 target W9 **248.03 vs 120.08µs（2.07×）**；臂序排除（plain 后跑仍 363–372µs、W9 120.08）。**新事实：plain 出现三遍一致的 key 0–95 前缀慢档（read_us ~452µs，96+ ~250µs），vseg 无——vseg 全 key 平坦 ~470µs；在 plain 慢区两臂几乎相等（465 vs 455），2× 的绝大部分来自 plain 的快区。** 这是 node2/node4 上的**新环境实测**，但仍未做物理 LBA 对照，慢档不能归因于盘位置（L2）。diag 开销不对称（vseg +31.7、plain +91.4），**diag-on 的 1.61× 不能当真实比值，真实比值仍用 diag-off 的 2.03×**。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -7357,7 +7357,7 @@ vsegment 规划参数（命令行）：
 ### 3. 仍不能下的结论（防过度归因）
 
 - **仍为 L2，不是 L3**：两臂数据由不同写入路径产生（plain 16t/batch16、vseg T1），**物理 LBA 未对齐、写入并发不同**；本单没有同 LBA/同数据对照，不能排除“布局/写入历史”是差异源。
-- **vseg reader 未带 vseg flag**：C4 用 `--scenario=segment_read`；源码 `stress_cluster_bench.cpp:3449` 禁止该场景与 `--vsegment_nof_io` 同用，且 `real_client.cpp:4598-4601` 表明 `type` 取 master 返回的 `replica_type` ⇒ 机制上 vseg 数据仍走 vseg 路径，但回执未直接给出逐 key `type` 证据（[未获取]）⇒ NOF-108 补。
+- **vseg reader 未带 vseg flag**：C4 用 `--scenario=segment_read`；源码 `stress_cluster_bench.cpp:3449` 禁止该场景与 `--vsegment_nof_io` 同用，且 `real_client.cpp:4623-4626`（supercache aadab957；旧 be10be29 为 4598-4601）表明 `type` 取 master 返回的 `replica_type` ⇒ 机制上 vseg 数据仍走 vseg 路径，但回执未直接给出逐 key `type` 证据（[未获取]）⇒ NOF-108 补。
 - **node4 上 master/etcd 与 target 同机**：CPU/网络混叠未测，不能排除它放大 W9；NOF-108 用 plain 后跑 + 同机条件作对照。
 - **vseg writer 23+2 次 `VSEGMENT_CREATING` 失败后补齐**：最终 Keys=400 达成，但写入历史与 plain 不同，作为布局混杂记录。
 
@@ -7425,7 +7425,7 @@ vsegment 规划参数（命令行）：
 | 客户端分段（measured 中位，µs） | vseg vs plain：`query` 95.5/96、`resolve` 2/0、`nof_prepare` 4/3、`nof_submit` 9/3、**`completion_wait` 449.5/243（+206.5）**、`unattributed` 10/7；`read_us` 475.5/257（+218.5） |
 | target W9 | **248.03 vs 120.08µs（2.07×）**，与 NOF-107 的 248.80/120.07 逐位一致 |
 | 臂序 | plain 后跑（vseg master 已停）仍 **363–372µs、W9 120.08** ⇒ 臂序、master 进程、target 运行时长均排除 |
-| 逐 key 分布 | **plain：key 0–95 read_us ~452µs（三遍一致），96+ ~250µs；vseg：全 key 平坦 ~470µs（447–521）**；在 plain 慢区两臂几乎相等（vseg 465 vs plain 455），2× 全部来自 plain 快区 |
+| 逐 key 分布 | **plain：key 0–95 read_us ~452µs（三遍一致），96+ ~250µs；vseg：全 key 平坦 ~470µs（447–521）**；在 plain 慢区两臂几乎相等（vseg 465 vs plain 455，配对差仅 +2.5~+17.5µs），2× 的绝大部分来自 plain 快区 |
 
 ### 2. 判读
 
