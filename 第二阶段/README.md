@@ -3,7 +3,7 @@
 > **2026-11-25 接管状态（覆盖下方所有旧“当前状态 / 当前任务”）**
 >
 > - 本文正文记录到 NOF-083，之后的历史以 `../HANDOVER.md` 与 `../工作汇总.md`《结论登记表》为准。
-> - **当前任务：NOF-103（用户已批准 node1 重启）**——NOF-102 同二进制重启 target 后仍 `err=-5`，target 状态排除。现在重启 node1 完整复位 host URMA provider/内核会话，恢复 etcd/plain master 后做 10-key bench；target 保持运行，数据保留不是目标。
+> - **当前任务：NOF-104（迁移评估）**——用户决定 node1/node3 他人要用，取消 NOF-103，改用 node2/node4 独占，目标不变。先只读盘点两台机器的 URMA 设备/provider、NVMe 数据盘/BDF/NUMA、CPU/内存/hugepages、网络/端口、Mooncake/SPDK 构建与 etcd、权限与现有进程，确定 target/master 角色与迁移资产。换 host 只解决 attach 阻塞，vseg 2.07× 仍需重新基线化。
 > - **当前主线：C18（L2）**——vseg 比 plain 慢约 **2.07×**，`read_us` **2.58×**、`query_us` 1.11×；根因未定。
 > - **已撤回**：C03/C17「vseg 无代价」、所有 4.6–5.9× 单因归因。慢程 **N=400MiB/遍** 在单 IO 层成立，但端到端不可见（1.043×），不是端到端根因。
 > - **口径**：bench 回到 **400 keys**；2000-key 数据封存，禁止跨口径比较。target 905586 不重启；etcd 约 150MB。

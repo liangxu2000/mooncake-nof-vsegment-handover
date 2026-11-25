@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-103（用户已批准：重启 node1，复位 host URMA，恢复 10-key bench；node3 target 保持运行）**。NOF-102 已用同二进制/同 RPC 重启 target 并全项验收，但 host 错误逐字不变（`nvme_urma.c:1199 err=-5 → Operation not permitted`），target qpair 仍零增量 ⇒ **target 会话/资源状态排除**。新建 plain cid 不能修复同一 host 错误。用户已批准重启 node1，完整复位 host URMA provider/内核状态；恢复 etcd/plain master 后 register + 10-key bench。数据保留不是目标；仍失败则转 URMA 驱动/固件/系统配置问题，不再加日志。
+- 当前任务：**NOF-104（node2/node4 只读盘点与迁移可行性；NOF-103 已取消）**。用户 2026-11-25 决定：node1/node3 他人要用，**取消 NOF-103 node1 重启**，改用 **node2/node4（独占）** 继续；目标不变。先只读盘点两台机器的 URMA 设备/provider、NVMe 数据盘/BDF/NUMA、CPU/内存/hugepages、网络/端口、Mooncake/SPDK 构建与 etcd、root/sudo 与现有进程；据此确定 target/master 角色、需要复制/重建的资产和迁移步骤。**全只读、不重启、不绑盘、不写数据。** 如果 node2/4 缺少 NVMe 数据盘或 URMA 设备，则此路不可行，需及时回报。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -7052,7 +7052,9 @@ vsegment 规划参数（命令行）：
 
 ---
 
-# NOF-103（待执行 · 用户已批准：重启 node1，复位 host URMA，恢复 10-key bench · 2026-11-25）
+# NOF-103（已取消 · 用户 2026-11-25 决定改用 node2/node4，不重启 node1 · 2026-11-25）
+
+> **取消原因**：node1/node3 他人要用；用户决定切换至 node2/node4 独占环境继续，目标不变。本单未执行，node1 未重启、node3 target 未动。**迁移评估见 NOF-104。**
 
 ## 授权与目标
 
@@ -7087,3 +7089,41 @@ vsegment 规划参数（命令行）：
 - node1 重启已获用户批准；**target 不重启、不换设备、不清理资源、不改内核参数**。
 - 数据保留不是目标；允许 fallback 新建 plain_nof103 写 400 keys；不修复 vseg 元数据。
 - 不碰他人 cid/进程；etcd 只验证，不改配置。
+
+---
+
+# NOF-104（待执行 · node2/node4 只读盘点与迁移可行性 · 2026-11-25）
+
+## 背景与目标
+
+- 用户 2026-11-25 决定：node1/node3 他人要用，**取消 NOF-103 node1 重启**；改用 **node2/node4（独占）** 继续，目标不变（vseg 读不慢于 plain、最终更快）。
+- 当前 blocker 是 node1 host attach EPERM；换到全新 host 可能直接恢复 bench，但 vseg 2.07× 的性能差距仍需重新基线化。
+- 本单**只读盘点**，不重启、不绑盘、不写数据、不装包、不改配置。
+
+## A. 接入与硬件（两台分别记录）
+
+1. 接入方式由用户提供；记录主机角色、OS/kernel/arch、root/`sudo -n`、是否独占、磁盘空间。
+2. CPU/NUMA：核数/节点/距离；内存/hugepages total/free。
+3. URMA：`/dev/uburma/*`、provider 库路径/md5、EID 表、`rdma`/`urma_admin` 可用性、设备 NUMA；node2↔node4 连通性与 4457/50056/9006/50156 端口状态。
+4. **NVMe 数据盘（决定 target 可行性）**：`lsblk`、`lspci -nn`、BDF、型号/容量、当前驱动（nvme/vfio）、NUMA、系统盘识别；可用数据盘数量。**至少需要能组成 RAID0 的多块数据盘；若没有，及时回报“不可行”。**
+
+## B. 软件与资产（只读）
+
+1. 是否已有 Mooncake/SPDK 源码或构建、`nvmf_tgt`、`bench-io-params-e12`、etcd；各自路径/md5/版本。
+2. 是否能从 node1/node3 复制我们自己的资产（target 二进制 `3129641f…`、bench、be10be29 源码、e12b7cb 静态库）；若不能，记录需要重建的清单。
+3. 现有进程/端口占用；node2/node4 是否有他人 etcd/master/target。
+4. 系统依赖：liburma/UMDK/DPDK/SPDK 版本、gcc/cmake、hugepages 配置。
+
+## C. 迁移方案输出（必答）
+
+1. **角色建议**：哪台做 target（有数据盘/URMA/vfio）、哪台做 master+client；若两台都不满足，给出缺项。
+2. 需要复制/重建的资产清单与顺序（etcd → master → target → bench）。
+3. 预计端口/NQN/RAID0 参数与数据盘 BDF 清单；是否可沿用 4457/50056/9006。
+4. 迁移后第一轮验收：plain attach + 10-key bench；再 plain/vseg 400-key 重基线。
+5. 风险：数据盘被他人占用、URMA EID 未配置、源码/构建缺失、node2/4 网络不通。
+
+## D. 边界
+
+- **全只读**：不重启、不绑 vfio、不写数据、不装包、不改系统配置、不动他人进程。
+- 不把内网 IP/账号写入公开仓；用 node2/node4 指代。
+- 若关键项无法获取，记 `[未获取]` 并说明；不猜。
