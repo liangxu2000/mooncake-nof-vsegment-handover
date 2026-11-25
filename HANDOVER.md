@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-101（host URMA/ubcore debug：捕获 qpair `err=-5` 前的真实错误码/失败操作；一次 master 重启 + 一次 register；target 不动）**。NOF-100 证明 target 侧 qpair/controller/日志零增量；host 侧 URMA qpair 0 已提交 capsule 并收到完成错误 `err=-5(EIO)`，随后 fatal disconnect。两端无 tcpdump/tshark，报文级 `[未获取]`；RC/jetty 路径仅为 L2 候选。NOF-101 用受支持的 liburma/ubcore debug 机制复现一次 attach，定位 -5 前面的 URMA 错误码与失败操作；不重启 target、不换设备、不清理资源。
+- 当前任务：**NOF-102（恢复 bench：同二进制重启 target；plain 挂载失败则新建 plain cid 写 400 keys；用户已批准）**。NOF-101 证明 URMA provider 初始化成功，13.2ms 后 capsule `err=-5`，继续加日志收益低。**数据保留不是本单目标**：只备份 target 二进制/启动/RPC 配置/日志尾部，重启同一 target；先试现有 plain，若因 UUID/元数据变化失败，直接新建 `plain_nof102` 写 400 keys（约 178KB oplog）把 bench 跑通；若仍 EPERM/err=-5，则 target 状态排除，转 host 处理。用户已明确批准 target 重启。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -6914,7 +6914,17 @@ vsegment 规划参数（命令行）：
 
 ---
 
-# NOF-101（待执行 · host URMA/ubcore debug：定位 capsule err=-5 前的真实错误 · 2026-11-25）
+# NOF-101（已关闭 · provider 初始化成功，13.2ms 后 capsule err=-5；底层错误仍未定位 · 2026-11-25）
+
+> **时序结果（L0）**：urma_open_drivers、udma/ub_agg/bondp provider 注册与初始化全部成功；**13.2ms 空窗后** capsule completion `err=-5(EIO)`；provider unregister/close 发生在报错之后 **8.2ms**，是清理，不是原因。
+>
+> **debug 结果**：`URMA_LOG_LEVEL=debug` 生效（journal 98 条 `[URMA]`），但没有底层错误码；`UDMA_LOG_LEVEL=debug` 零 `[UDMA]` 输出，实际生效性未证实；内核 ubcore 无错误行。唯一可证实失败阶段仍是 **capsule completion**，EID/jetty/JFC 编号 `[未获取]`。
+>
+> **偏差**：第一次停 master 因非 root 信号被拒，改 `sudo -n kill -TERM`；启动脚本第一次非 root 失败后残留，第二次 sudo 启动成功，导致实际发出 2 次 register RPC（第二次未新增 attach），已杀掉我方残留脚本进程。违反“一次 register”，如实记账。
+>
+> **环境**：debug master 已恢复为正常 env（PID 482472、Keys=2000、owned_slots=1、ready=1/1、无 debug env 残留）；target 905586 未重启；新增业务写入=0。产物 `run/nof101_summary.txt`、debug/register/journal 日志。
+>
+> **结论**：继续加日志收益低。**用户已批准 NOF-102**：同二进制/同 RPC 重启 target，用 plain 10-key attach 做恢复对照；成功⇒target 会话状态，失败⇒host URMA 数据通路。
 
 ## 背景与目标
 
@@ -6967,3 +6977,65 @@ vsegment 规划参数（命令行）：
 - **不重启 target、不换设备、不 reload driver、不清理资源、不 kill 他人进程、不装包、不改系统配置文件**。
 - 只允许一次 plain master 重启与一次 register；debug 仅作用于该进程。
 - 不建新 cid、不写业务 key、不改 etcd 配置。
+
+---
+
+# NOF-102（待执行 · 恢复 bench：同二进制重启 target；plain 失败则新建 cid 写 400 keys · 2026-11-25）
+
+## 授权与目标
+
+- **用户已明确批准重启 node3 target**，唯一目的是恢复 bench。
+- **数据保留不是本单目标**：不做旧数据/旧 vseg 元数据保护工程；只保存重启所需的二进制、配置和日志。
+- 成功标准：plain bench 能 attach 并完成 10/10 读取。
+- 若现有 plain 因 UUID/元数据变化失败，允许新建 `plain_nof102` 写 400 keys（plain oplog 约 178KB），继续跑通；不修复旧 vseg 元数据。
+
+## A. 最小重启预检
+
+1. target：记录 PID 905586、`/proc/<pid>/exe` 路径/md5（必须 `3129641f…`）、cmdline/env；若为 deleted，复制该二进制到 `run/nof102_nvmf_tgt`。
+2. 保存 RPC 配置文本（NQN/nsid1/RAID0/11 BDF/strip/listener/transport）与 `/tmp/nvmf_tgt.log` 尾部；**不备份业务数据、不保护旧 cid**。
+3. 记录 plain master PID/cmdline/env/Keys=2000；etcd 当前 dbSize（新建 plain 前复测）。
+
+## B. 停服（顺序）
+
+1. 优雅停 `plain_nof088` master（root/TERM），确认退出。
+2. 优雅停 target 905586（TERM）；等待退出。30s 不退则记录并停手回报，不擅自 SIGKILL。
+3. 确认 4457 与 spdk.sock 释放；记录盘状态。
+
+## C. 用同一二进制/RPC 重启 target
+
+1. 使用 §A 保存的同一二进制、同一 args/env（**不启用 BUFFER**），按 NOF-055/064 的 wrapper/RPC 序列启动。
+2. 验收：
+   - 新 PID、`/proc/<pid>/exe` md5 仍为 `3129641f…`；
+   - 4457 LISTEN、NQN/nsid1/URMA_RAID0 正常；
+   - 11 base bdev/BDF 升序、strip 256K、online；
+   - transport URMA/udmac0d1e2/capsule urma；
+   - 无 handshake/attach 错误。
+3. 记录新 RAID0 namespace UUID（预期变化）；**不尝试修复旧 vseg 元数据**。
+
+## D. 恢复 bench（现有 plain 优先，失败则新建 plain）
+
+1. 用完整正常 env 启动 `plain_nof088` master（`MC_STORE_PARTITION_SLOT_COUNT=1`、URMA 设备/capsule、HA/etcd 参数）；验收 Keys=2000、owned_slots=1、ready=1/1；执行**一次** `nof_register`。
+2. 若 attach 仍为 EPERM/`err=-5` ⇒ **target 重启无效**，记录首个错误并停手，不重复 register、不换设备。
+3. 若仅因 UUID/identity/元数据变化挂不上 ⇒ **新建 `plain_nof102`**（完整 env、slot=1、无 vsegment 参数），register 后写 **400 keys**（plain，约 178KB oplog），验收 `Keys=400`、`logical_used=1,677,721,600`。
+4. 挂载成功后，在 node3 用 `bench-io-params-e12`（88ad3134）跑 **10 keys / warmup=0 / verify=false**，记录 rc、attachfail、读取数、P50。
+
+## E. 判决（二选一）
+
+- **bench 跑通**：现有 plain 或新建 `plain_nof102` 任一能 attach 并 10/10 读取 ⇒ target 会话/资源状态是根因；本单结束，不跑 vseg/正式 timing。
+- **仍失败**：现有 plain 与新建 plain 都 EPERM/`err=-5` ⇒ target 状态排除；本单结束，转 host URMA provider/session reset 或节点重启方案（需另行批准）。
+
+## F. 回执必答
+
+- 旧/新 target PID、二进制 md5、启动时刻；
+- RPC/RAID0/BDF/transport 验收；
+- 新 namespace UUID；
+- 现有 plain 的挂载结果；若失败，`plain_nof102` 的 Keys/oplog 增量；
+- 10-key attach/读取结果或首个失败错误；
+- 二选一判决；
+- 未换设备、未修复 vseg 元数据；新增写入仅限 fallback 的 plain 400 keys。
+
+## G. 边界
+
+- 用户已批准 target 重启；**不得更换 target 二进制版本、不得启用 BUFFER、不得换 URMA 设备**。
+- **数据保留不是目标**：不保护旧 cid 数据、不修复 vseg 元数据；允许新建 `plain_nof102` 写 400 keys 作为恢复 fallback。
+- 不改 etcd 配置、不清理 host/target 资源；plain 写入前复测 etcd 余量。
