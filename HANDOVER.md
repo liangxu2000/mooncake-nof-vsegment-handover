@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-097（M3-1：完成客户端 timing 测量；plain 打 `TransferData`，vseg 打 `TransferReadInternal`；e12b7cb 静态库重链）**。NOF-096 已定案 ENODEV 根因是静态 SPDK 库集：`link.txt` 的 `/usr/local/lib` 已于 2026-11-20 被替换，旧可用二进制使用 `$D/build/spdk-e12b7cb-src/build/lib`（wire v4）；换回该库集后 attach/读取恢复。plain 臂路径也已核实：`Client::Get`（3 参）→ `TransferRead` → **`TransferData`（be10be29 L5770，`future->get()` 约 L5888）**；vseg 臂走 `TransferReadInternal`（L5926）。NOF-097 两处打点、两次冒烟、各 3 遍正式读；target 905586 不重启。
+- 当前任务：**NOF-098（vseg 挂载 `rc=-101` 诊断：对比新老 cid 的注册元数据/命令/env/target 首个错误；只读为主 + 一次重注册，不清理资源）**。NOF-097 plain 臂完成：4 lane/qpair/worker 均匀，credit/FIFO/队头全零，时间在 drain/最慢子 IO；vseg 臂因 `vseg_nof097` 挂载 `SEGMENT_NOT_FOUND` 阻塞。**历史 `vseg_nof086` 同参数/同 target 能挂载** ⇒ 不能只归因 host 残留，先对比新老 cid 的 `nof_register` 命令、etcd segment descriptor 与 target 首个错误。target 905586 不重启、零业务写入。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -6675,7 +6675,15 @@ vsegment 规划参数（命令行）：
 
 ---
 
-# NOF-097（待执行 · M3-1：完成 `NofTransferTiming` 双路径测量 · 2026-11-25）
+# NOF-097（已关闭 · plain timing 完成但统计需重算；vseg 挂载 rc=-101 阻塞 · 2026-11-25）
+
+> **plain 臂结果（L0，待重算）**：`TransferData` 打点成功，4 遍有效正式读（P1/P3/P4/P5）各 528 条；lane 0–3、qpair 2–5、worker 0–3 各 560，完全均匀；`sub_io_count=32`。初算 `credit_wait_us` / `first_credit_wait_us` / `qos_fifo_wait_us` / `qos_tasks_ahead` 非零占比 0%，`head_to_first_submit_us` p50=1µs，`dispatch_queue_us` p50=11µs，`first_to_last_submit_us` p50=27µs；时间集中在 drain（p50 106µs，占 total 78.5%）与最慢子 IO（p50 109µs）。**但回执统计 n=2240 = 4×528 + P2 的 128 条 warmup，和“P2 未混入判读”自相矛盾；max=9121µs 等尾部数字可能被污染。NOF-098 必须先只用 P1/P3/P4/P5 重算（n=2112），再引用 plain 结论。**
+>
+> **vseg 臂阻塞**：`vseg_nof097` master 启动正常（owned_slots=1、ready=1/1），但 `MountNoFSegment rc=-101 SEGMENT_NOT_FOUND`，master 侧 `Failed to attach nvme ctrlr`，`discovered_segments=0`。plain 同二进制/同 target 可挂载；target subsystem 正常；`exclusive=true` 不可去。**关键对照：历史 `vseg_nof086` 同参数/同 `nof_register` 能挂载（rc=0）⇒ 不能只归因 host 残留，先查新老 cid 的注册元数据/命令/env 与 target 首个错误。**
+>
+> **环境**：源码已回滚（md5 `a147b489…`），原二进制未变；`bench-nof097`（md5 `6757c001…`）保留；target 905586 未重启；`vseg_nof097` 0 keys、仅元数据；plain_nof088 Keys=2000、挂载已恢复；新增业务写入=0。产物 `run/nof097_summary.txt` + 5 个日志 gz。
+>
+> **下一步 NOF-098**：先重算 plain（排除 P2），再对比 `vseg_nof097` 与 `vseg_nof086` 的 register/env/etcd descriptor/target 错误；不清理资源、不写业务数据。
 
 ## 背景与目标
 
@@ -6726,3 +6734,50 @@ vsegment 规划参数（命令行）：
 - **禁止 2000 keys**；只允许新建 `vseg_nof097` 写 400 keys；写入前查 etcd，余量不足停手。
 - 不改共用 etcd、不删 `/oplog`、不改 `/etc/spdiag/spdiag.conf`。
 - 只改我方副本一个文件，原二进制 md5 必须不变；构建或冒烟失败即停手回滚，不扩大实验矩阵。
+
+---
+
+# NOF-098（待执行 · vseg 挂载 rc=-101 诊断：先重算 plain，再对比新老 cid 注册元数据 · 2026-11-25）
+
+## 背景与目标
+
+- NOF-097 plain 打点成功，但统计 `n=2240` 混入了作废 P2 的 128 条 warmup；必须先重算。
+- `vseg_nof097` 挂载 `rc=-101 SEGMENT_NOT_FOUND`，master attach NVMe controller 失败；plain 同环境可挂载，target subsystem 正常。
+- **历史 `vseg_nof086` 同参数/同 `nof_register` 能挂载** ⇒ “host 残留”不是唯一嫌疑，可能是新 cid 的注册元数据/命令/env 或 target 会话状态差异。
+- 本单只定位失败点，不做资源清理、不写业务数据。
+
+## A. plain 统计重算（零环境，先做）
+
+1. 只用 NOF-097 的 **P1/P3/P4/P5** 四遍正式日志（`n=4×528=2112`）重算全部 timing 字段；**排除 P2 的 128 条 warmup**。
+2. 对比初算 n=2240 的 p50/p90/max/非零占比，明确哪些数字被 P2 污染。
+3. 形成 plain 的干净基线表；在此之前不得引用 max=9121µs 等尾部数字。
+
+## B. 新老 cid 注册/挂载对比（只读）
+
+1. **命令/env**：找出 `vseg_nof097` 与历史 `vseg_nof086` 的 master 启动命令、`/proc/<pid>/environ`、`nof_register` 命令；逐项对比 cluster_id、slot_count、URMA 设备/capsule、vsegment 8 参数、etcd/master 地址、segment name/base/nsid/capacity。
+2. **etcd 元数据**：对比 `/cvm/vseg_nof097/` 与 `/cvm/vseg_nof086/` 的 key 集合、value 大小/hash；重点 `segments/`、`nof_identities`、quota/profile、device_identity、base_offset、capacity。若可解码，给出字段级差异；不可解码则给 key 名/大小/hash，不猜。
+3. **日志**：对齐两次 `nof_register` / `MountNoFSegment` 的完整错误链，给出 **target 侧第一个错误**（不是最后的 rc=-101）；对比时间、endpoint、subnqn、nsid、device_identity。
+4. **target 会话资源（只读）**：记录 URMA controller/qpair/jetty/JFC 相关 RPC 计数、`/dev/uburma` 映射、target 日志中的 handshake/jetty/resource 错误；与历史成功时日志对照（若有）。
+
+## C. 一次受控重注册（不清理、不新建 cid）
+
+1. 完成 B 段快照后，对**现有 `vseg_nof097`** 重跑一次 `nof_register` + mount，记录完整日志与 etcd key 变化。
+2. 若挂载成功：记录 rc/discovered_segments/Keys=0，**停在本单**，不写 key、不跑 timing。
+3. 若仍失败：停手，给出“缺失/无效 descriptor / identity 不匹配 / target 资源或会话错误 / 仍未定位”四选一。
+
+## D. 回执必答
+
+- plain 重算 n=2112 的完整表与 n=2240 的差异；
+- 新老 cid 的注册命令/env 差异；
+- etcd segment descriptor 的 key/大小/hash/字段差异；
+- target 侧第一个错误；
+- 重注册结果；
+- 结论四选一；
+- 新增业务写入=0、target 905586 未重启、原二进制未变。
+
+## E. 边界
+
+- **只读为主**；唯一状态变更是 C 段一次现有 cid 的 `nof_register` + mount。
+- **不清理 host/target 资源、不 kill 进程、不删 cid、不新建 cid、不写业务 key**。
+- target 905586 不重启；不改共用 etcd 配置；plain_nof088 保持可读。
+- 若发现需要清理/删除/重置会话层，先回报，由开发侧授权，不在本单执行。
