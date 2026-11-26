@@ -67,10 +67,10 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 |---|---|
 | target A（node3） | **正常**：PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR |
 | target B（node4） | **已重建**：PID 2458315；NQN `...urma-gpu-test`、SN `URMAGPU0001`；**新 UUID 50d6259e-51a6-4599-adf3-68defc0c5a53**；RAID0 strip 256K、online 11/11、4457、ERROR=0 |
-| master | **`vseg_nof134v1` 运行中**：Keys=60000、enabled=1（q1 诊断环境，先保留）；正式配置仍为 q4 |
+| master | **`vseg_nof134v1` 运行中**：Keys=60000、enabled=1（q1 诊断环境）；NOF-135 将停它、起 `vseg_nof135v` |
 | etcd | 2455814；`--max-request-bytes=67108864`；dbSize 1778.46MiB、raftIndex 2,081,968 |
 | node2 | 无 bench/register 残留；客户端 md5 bb4a07a3…（未重编） |
-| 当前任务 | **无在途任务（NOF-134 完成；q1 不采用、正式配置保持 q4；vsegment 读优化线收口）** |
+| 当前任务 | **NOF-135（m=1 一整块：写 60k、只读前 400 keys + plain 400 同环境对照；看旧 400-key 2× 是否复现）** |
 | 风险 | node4 非独占：外部用户 `computin` 16:20–16:50 多次登录；本次重建后未被清；若再次清场/资源争用，停手回报 |
 
 ---

@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**无在途任务（NOF-134 完成；q1 不采用，正式配置保持 q4；vsegment 读优化线收口）**。NOF-134 三组：plain P50 254.13；V4（q4）264.48（1.041×，P99 386.49=1.356×）；V1（q1）261.30（1.028×，P99 383.47=1.345×）；q1 vs q4 仅快 0.7–1.2%，小于 spread，且 P99 未达 ≤1.05 ⇒ q1 无效。剩余 2.8–4.1%（P50/P90）与 1.345（P99）判结构性：target W9 vseg 39–40µs 已快于 plain 47µs，差在客户端聚合/路径；当前约束（不改码/拓扑/stripe/member/第三 target）下无合法旋钮。正式结果仍为 NOF-127（P50 1.034×/Avg 1.040×/P90 1.046×/P99 1.371×）。环境 `vseg_nof134v1` 运行（Keys=60000），target A/B、etcd 未动。
+- 当前任务：**NOF-135（m=1 一整块：写 60k、只读前 400 keys + plain 400 同环境对照；看旧 400-key 2× 是否复现；2026-11-26）**。背景：NOF-134 q1 不采用、正式配置保持 q4、读优化线已收口；旧 NOF-113R 的 400 keys **551.93 vs plain 270.52** 是**旧 target 2142228（vseg W9 286.6–288.7）+ 64MiB 小 extent（400 keys 跨 ~25 vseg）**，与当前不可直接比。本单在**当前 target B 2458315、m=1、一整块 256GiB**下写 60k 但只读前 400 keys，V/P 各 4 轮，V 另加 1 遍 60k 同数据对照；若 V400≈P400 ⇒ 旧 2× 不是 400-key 规模造成。不改码/不重启 target/etcd；预计 20–25 分钟。环境 `vseg_nof134v1` 运行（Keys=60000），target A/B、etcd 未动。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -9823,3 +9823,47 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - `vseg_nof134v1` master 运行中（PID 回执未列，需在环境内确认）：Keys=60000、enabled=1；**先保留**作为当前 vseg 环境；target A 3329243 / target B 2458315 / etcd 2455814 未动。
 - etcd：64MiB、dbSize **1778.46MiB**、raftIndex 2,081,968；target B online 11/11、ERROR=0；node2 无 bench。
 - 未改码/未重编/未装包/未重启 target/etcd。
+
+---
+
+# NOF-135（待执行 · m=1 一整块 60k 数据只读前 400 keys + plain 400 对照 · 2026-11-26）
+
+## 目标
+
+- 在当前重建后的 target B、m=1、一整块 vsegment（extent=256GiB）下，**写 60k 但只读前 400 keys**，看旧 NOF-113R 的 400-key 2× 会不会复现；同时给 plain 400 keys 同环境对照。
+- 回答：**旧 2× 是“400 keys 这个规模”造成的，还是旧 target/旧 64MiB 配置造成的？**
+- 不改码/不重启 target/etcd；只 stop/start master 与 bench。
+
+## A. 切换
+
+1. 停当前 `vseg_nof134v1` master；target A/B、etcd 2455814 不动；node2 无残留。
+2. 记录 target B（2458315）W9 基线。
+
+## B. V 组：m=1 一整块，写 60k、读前 400 keys
+
+1. 起 `vseg_nof135v`：`member_count=1 / stripe=2MiB / extent=256GiB / qpairs=4`；注册 target B 512GiB；等 enabled=1。
+2. 写 60k（T1/batch1、`--num_keys=60000`，只有一个 segment）；验收 Keys=60000。
+3. 读 **前 400 keys**：`--num_keys=400`、T1、warmup=128、qpairs=4、verify=false、diag 关；**4 轮**；记录 Avg/P50/P90/P99、failed、墙钟、target B W9/n。
+4. 追加 **1 遍 60k** 同数据对照（`--num_keys=60000`，同参数；只作上下文，不并入 400 聚合）。
+
+## C. P 组：plain，写 60k、读前 400 keys
+
+1. 停 vseg；起 `plain_nof135p`；注册 B 512GiB；写 60k（16t/batch16）；验收 Keys=60000。
+2. 读前 400 keys：`--num_keys=400`、T1、warmup=128、qpairs=4、verify=false、diag 关；4 轮；记录同指标。
+
+## D. 交付与判读
+
+1. V400、P400、V60k（1 遍）三组数值；V400/P400 比值。
+2. 与旧 NOF-113R（vseg 551.93 / plain 270.52，旧 target + 64MiB×25 vseg）并列，但标注不可直接比。
+3. 与 NOF-133 m=1 60k（C 270.01）对比：400 keys 是否与 60k 不同。
+4. 判读：
+   - V400 若 ≈P400（~1.0–1.1×）⇒ 旧 2× **不是 400-key 规模造成的**，是旧 target/旧 64MiB 配置；
+   - V400 若 ≈2× ⇒ 400-key 规模/前缀本身能复现，需继续查；
+   - 同时给 target W9，确认是否旧 287µs 的值复现。
+5. 配置自证（vsegments=1、extent、qpairs、`--num_keys=400`）、环境末态。
+
+## E. 边界
+
+- 不改码/不重编/不装包/不重启 target/etcd；只 target B；target A 不动。
+- 写 60k 但只读 400（V/P 各 4 轮）；V 追加 1 遍 60k 对照；每轮一遍，禁止 duration；不补写。
+- 预计 **20–25 分钟**。
