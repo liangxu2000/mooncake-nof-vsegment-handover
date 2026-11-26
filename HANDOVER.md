@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-114R（用户已授权 node2/3/4 独占“佛挡杀佛”：清理 node3 第三方 royi 进程 + 重启 node3 target A 换唯一 NQN/SN + 验证；不 register/不写数据/不动 node4）**。NOF-114 已完成：node3 target A 已就绪（PID 2810360、md5 同 node4、11 盘 RAID0 strip256K、nsid1、4457、0 ERROR、空转 n=0），但 **NQN/SN 与 node4 相同**（`nqn.2026-01.io.spdk:urma-gpu-test` / `URMAGPU0001`）且 node3 有 royi master/client。用户 2026-11-26 明确：**node2/3/4 我们独占，佛挡杀佛** ⇒ 清理 royi；重启 target A 换唯一 NQN/SN（空转无数据，3–5 分钟，UUID 变）。之后 NOF-115：keys=400、extent=50GiB、member_count=2、plain 单 target、oplog/HA 保持。
+- 当前任务：**NOF-115（双 target vsegment 就绪 + 2-key 冒烟 · 不跑性能/不写 400 · 2026-11-26）**。NOF-114R 完成：node3 的 royi master/client/构建循环已清理；target A 已用唯一 NQN/SN 重启（PID 3329243、`nqn.2026-01.io.spdk:urma-gpu-test-node3` / `URMAGPU0003`、RAID0 UUID `2c5bf1f2…`、11/11、4457、0 ERROR、零 IO）；node4 target B 2142228 未动（ERROR 6）。**NOF-115 只做**：停旧 `vseg_nof107` master；起新 master `vseg_nof115`，注册 node3 A + node4 B 两个 segment；用 `member_count=2 / extent=50GiB / stripe=2MiB / required_medium=nof` 发布 quota；写 **2 keys** 冒烟，确认每个 key 两个 child 分落 node3/node4，target A/B 各收到约 32 个 128KiB IO。400-key plain/vseg 性能留给 NOF-116。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -8147,3 +8147,74 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 
 - 记录 node3 target A 的新 endpoint（node 标签）、NQN、SN、nsid、UUID。
 - 只查 `nof_register --help` 是否支持按 endpoint+NQN 注册两个 segment（**不执行注册**）。
+
+---
+
+# NOF-115（待执行 · 双 target vsegment 就绪 + 2-key 冒烟 · 不跑性能/不写 400 · 2026-11-26）
+
+## 目标
+
+- 用 **node3 target A + node4 target B** 组成 `member_count=2` 的 vseg。
+- 验证三件事：
+  1. 两个 target 都能注册成**不同 segment**（不同 traddr/NQN）；
+  2. quota 能以 `member_count=2 / extent=50GiB / stripe=2MiB / required_medium=nof` 发布；
+  3. 每个 key 的 2 个 child **分别落到 node3 和 node4**。
+- **只写 2 keys 做冒烟**；400-key 性能、plain 基线留给 NOF-116。
+
+## A. 预检
+
+1. target A：node3 PID 3329243、NQN `nqn.2026-01.io.spdk:urma-gpu-test-node3`、SN `URMAGPU0003`、nsid1、4457、RAID0 UUID `2c5bf1f2…`、11/11、0 ERROR。
+2. target B：node4 PID 2142228、NQN `nqn.2026-01.io.spdk:urma-gpu-test`、SN `URMAGPU0001`、nsid1、4457、UUID `0470fe3a…`；**不动**。
+3. 当前 `vseg_nof107` master 在 node4 运行（记录 PID/Keys=400）；node2 无 bench。
+4. `nof_register --help`：确认能分别指定 **traddr/trsvcid/NQN/nsid**（或等价的 endpoint 字符串）；记录用法。若不支持区分两个 NQN，停手回报。
+
+## B. 停旧 master，注册两个 segment
+
+1. 停 `vseg_nof107` master（记录 PID/退出码）；node4 target B 不动。
+2. 在 node4 起新 vseg master **`vseg_nof115`**，先 `--vsegment_auto_plan=false`：
+   - 50056/9006/8086、slot=1、HA/etcd 127.0.0.1:2379、URMA 设备/capsule、`--cvm_segments_vsegment_exclusive=true`、`--submaster_count=1`；
+   - 验收 leader/serving、Keys=0、owned_slots=1。
+3. 用 `nof_register` 分别注册：
+   - target B（node4）：NQN `nqn.2026-01.io.spdk:urma-gpu-test`，nsid1，4457；
+   - target A（node3）：NQN `nqn.2026-01.io.spdk:urma-gpu-test-node3`，nsid1，4457。
+   - 记录两次 registration 的 segment name（含 traddr/node 标签），确认 master 侧有 **2 个不同 segment**。
+4. 若第二个注册被拒、覆盖、同名，或 master 只看到 1 个 segment：**停手回报**，不自行改 NQN/端口/注册方式。
+
+## C. 发布 member_count=2 的 quota
+
+1. 停新 master；用 `--vsegment_auto_plan=true` + 以下参数重启：
+   - `--vsegment_member_count=2`
+   - `--vsegment_member_extent_size=53687091200`（50GiB）
+   - `--vsegment_stripe_size=2097152`
+   - `--vsegment_required_medium=nof`
+   - `--vsegment_reserved_ratio=0`
+   - `--vsegment_io_alignment=4096`
+   - `--submaster_count=1`、`--cvm_segments_vsegment_exclusive=true`
+2. 验收：partitions=1、reconcile_fail=0、Keys=0、`logical_capacity=100GiB`（50G×2）、vsegments=0。
+3. 若 auto_plan 无法在 2 个 segment 上发布 quota（报 member_count/medium/空间不足），停手回报；可尝试手工 `vsegment_quota_planner --publish` 或 HTTP `/vsegment_quota`，但必须在回执里写明实际方式与返回。
+4. 不写数据前确认 quota 已发布、owned_slots=1。
+
+## D. 2-key 冒烟（只写 2 keys）
+
+1. T1 writer 写 **2 keys**（4MiB）；`VSEGMENT_CREATING` 可重试，最多 3 轮；验收 `Keys=2`、`logical_used=8,388,608`（2×4MiB）。
+2. 读 2 keys（`warmup_keys=0`、T1/threads=1/batch=1、qpairs=4、verify=false），开 `MC_STORE_TRANSFER_DIAG=1` 或 `MC_NOF_SLOW_TRACE_THRESHOLD_US=1`：
+   - 每 key 应有 **2 个 child**，`child_count=2`、`blocks=4096`、`sub_ios=16`；
+   - 两个 child 的 `endpoint` 必须**分属 node3/node4**（回执用 node 标签，不写 IP）；
+   - target A/B 各收到约 **32 个 128KiB IO**（2 keys×16），记录 n。
+3. 记录 master：`partitions=1`、`vsegments=1`、`Keys=2`、`logical_used=8,388,608`。
+4. 若两个 child 落在同一 target、或某个 target 只收到一半/零 IO：停手回报。
+
+## E. 交付（必答）
+
+1. 旧 master 停止记录；新 master 两次启动参数/PID/ports。
+2. 两次 register 的 segment name/endpoints（node 标签）、master 侧 segment 数=2。
+3. quota 发布方式与验收：partitions/logical_capacity/reconcile_fail/vsegments。
+4. 2-key 写读：Keys/logical_used、每 key child_count/blocks/sub_ios、两个 child 的 endpoint（node 标签）、target A/B 的 n。
+5. 环境末态：target A/B 未重启/未动；未写 400、未跑性能、未改码。
+
+## F. 边界
+
+- **只写 2 keys**；不跑 400-key 性能；不跑 plain 基线（NOF-116）。
+- 不改 vseg 逻辑代码、不重编、不装包；不动 target A/B 进程；不 register 除两个 endpoint 之外的任何东西。
+- 任何一步失败停手回报；不要把失败写成成功。
+- 预计 **20–30 分钟**。

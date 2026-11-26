@@ -97,7 +97,8 @@ node2（reader + writer）                node4（master + etcd + target B）
 | **NOF-112** | LBA 布局对照 | **布局假说被否**：两臂起始 LBA 逐值相同 400/400；非慢区 301 个 key 上 vseg **301/301 全慢**（p50 478.5 vs 179.0µs），慢区 99 个 key 两臂相等（447.5 vs 448.5）⇒ 位置不能解释 2× |
 | **NOF-113R** | 纯配置：vseg 大 IO vs plain | **配置路径到顶**：vseg@2M **551.93** vs plain@128K **270.52µs（2.04×）**、vs plain@2M 277.73（1.99×）；chunk 对 vseg 无影响，W9 反而 250→287（plain 120→143）⇒ **2× 按字节计，不是每 IO 固定开销**；target 单 IO 在 ≥256K 时被夹到 256KiB（n 16898→8450）。parity 未达成 |
 | **NOF-114** | node3 第二个 target 部署与就绪 | **已就绪、无需部署**：PID 2810360、md5 同 node4、11 盘 RAID0 strip256K、nsid1、4457、0 ERROR、空转 n=0；但 NQN/SN 与 node4 相同 |
-| **NOF-114R（当前）** | node3 独占清理 + target A 换唯一 NQN | 用户授权“佛挡杀佛”：清 royi master/client；重启 target A 换 `urma-gpu-test-node3`/`URMAGPU0003`，保持 11 盘 RAID0/4457/nsid1；不 register/不写/不动 node4 |
+| **NOF-114R** | node3 独占清理 + target A 换唯一 NQN | **完成**：royi master/client/构建循环已清；target A 重启为 PID 3329243、`urma-gpu-test-node3`/`URMAGPU0003`、UUID `2c5bf1f2…`、11/11、4457、0 ERROR、零 IO；node4 未动 |
+| **NOF-115（当前）** | 双 target 就绪 + 2-key 冒烟 | 停旧 vseg_nof107；起 `vseg_nof115`，注册 node3 A + node4 B 两个 segment；`member_count=2 / extent=50GiB / stripe=2MiB / required_medium=nof` 发布 quota；写 2 keys 验证两个 child 分落两 target、各约 32 个 IO。不跑性能，400-key 留 NOF-116 |
 | **NOF-115（待下发）** | 双 target vsegment 测量 | 参数：`member_count=2`、**extent=50GiB**、**keys=400（先跑通）**、oplog/HA 保持现状。register node3+node4 两个 NoF segment；写 400 keys（4MiB→2×2MiB 跨两个 target）；plain 单 target 400 keys 对照；验收 parity（≤ plain×1.05）。1000/20k 等跑通后再试 |
 
 ---
