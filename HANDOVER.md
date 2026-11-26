@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-134（正式 2-member：qpairs=4 vs qpairs=1 + plain 同会话；60k、4+4+4 轮；2026-11-26）**。背景：NOF-133 矩阵——单 task（B）P50 1.022× plain、双 task+q1（D）1.015×/P99 1.030× 均在 1.05 内；双 task+q4（C）P50 1.055×、P99 2.301×，拆 task 成本主要在尾部，q1 反而全面更快，“同 lane 争用”不成立。本单在**正式 2-member** 配置下只改 qpairs（4 vs 1），加 plain 同会话基线，验证 q1 是否把 P50/P90/P99 拉进 1.05；若有效则正式配置改用 q1，否则 3.4% 结构性收口。停 `vseg_nof133d`；不改码/不改 member/stripe/拓扑；预计 25–35 分钟。
+- 当前任务：**无在途任务（NOF-134 完成；q1 不采用，正式配置保持 q4；vsegment 读优化线收口）**。NOF-134 三组：plain P50 254.13；V4（q4）264.48（1.041×，P99 386.49=1.356×）；V1（q1）261.30（1.028×，P99 383.47=1.345×）；q1 vs q4 仅快 0.7–1.2%，小于 spread，且 P99 未达 ≤1.05 ⇒ q1 无效。剩余 2.8–4.1%（P50/P90）与 1.345（P99）判结构性：target W9 vseg 39–40µs 已快于 plain 47µs，差在客户端聚合/路径；当前约束（不改码/拓扑/stripe/member/第三 target）下无合法旋钮。正式结果仍为 NOF-127（P50 1.034×/Avg 1.040×/P90 1.046×/P99 1.371×）。环境 `vseg_nof134v1` 运行（Keys=60000），target A/B、etcd 未动。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -9789,3 +9789,37 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 正式 2-member 配置不变（member=2、stripe=2M、extent=256G）；只改 qpairs。
 - 每组 4 轮；每轮一遍 60k≈20s，禁止 duration；不补写；失败停手。
 - 预计 **25–35 分钟**。
+
+---
+
+## NOF-134 裁决（2026-11-26 · q1 无效；正式配置保持 q4；本线收口）
+
+### 1. 结果（[事实]；三组 12 轮 failed 全 0）
+
+| 组 | 配置 | 轮数 | Avg | P50 | P90 | P99 | spread（Avg/P50/P90/P99） |
+|---|---|---|---|---|---|---|---|
+| P | plain / q4 | 4 | 260.87 | 254.13 | 266.57 | 285.03 | 7.1 / 6.7 / 6.6 / 9.1% |
+| V4 | vseg 2-member / q4 | 4 | 268.69 | 264.48 | 274.29 | 386.49 | 4.1 / 4.2 / 5.3 / **12.4%** |
+| V1 | vseg 2-member / q1 | 4 | 270.17 | 261.30 | 272.39 | 383.47 | 6.7 / 6.9 / 6.9 / 9.4% |
+
+- **V4→V1（q4→q1）**：P50 0.988×、P90 0.993×、P99 0.992×、Avg 1.006× ⇒ q1 三项略快，但幅度 **0.7–1.2% < 轮间 spread（4.1–12.4%）** ⇒ 不显著。
+- **plain→V4**：P50 1.041×、P90 1.029×、P99 **1.356×**。
+- **plain→V1**：P50 **1.028×**、P90 **1.022×**、P99 **1.345×**。
+- 判据“P50/P90/P99 均 ≤1.05 且优于 V4”**未满足（P99 ✗）** ⇒ **q1 不采用**。
+- target W9：P 47,352ns（4.5%）；V4 B 40,178（2.1%）/A 39,102（1.1%）；V1 B 39,512（4.7%）/A 39,475（3.0%）。vseg 单 IO 比 plain 低约 **15–17%**，端到端反而慢 ⇒ 差额在客户端聚合/路径，与 NOF-130/133 三次观测一致。
+- V4 的 P99 spread 12.4% >10% ⇒ 按方法 V4 格不进正式表，仅诊断；P/V1 spread >3%，同向线索是 target W9 只 1.1–4.7%、端到端 2–3 倍 ⇒ 波动不在 target。
+- qpairs 自证：P/V4 `io_qpairs=4`；V1 `io_qpairs=1`。
+
+### 2. 判读与决策
+
+1. **q1 有效但不显著**：0.7–1.2% 的改善小于 spread，继续加轮数才能判定，收益不值得；**不做**。
+2. **正式配置保持 qpairs=4**；正式结果仍为 NOF-127（P50 1.034×、Avg 1.040×、P90 1.046×、P99 1.371×）。
+3. **剩余 2.8–4.1%（P50/P90）与 1.345（P99）判为结构性**：target 单 IO 已经更快（39–40 vs 47µs），差距在客户端两 child 聚合/路径；在你“不改码、不改拓扑、不改 stripe/member、不加第三 target”的约束下**没有合法旋钮**，本线收口。
+4. P99 仍不达 parity，按既定边界不追；不再用单遍/单轮代表阶段结果。
+5. 偏差：`nof134_run.sh` 被本地 PowerShell 重写带入 UTF-8 BOM，出现一次 `#!/binn/bash` 报错；driver 用 `bash script` 调用，三组 rc=0、数据无影响；已清 BOM。qpairs 自证第一版看错节点，已改 node2 复查。
+
+### 3. 环境末态
+
+- `vseg_nof134v1` master 运行中（PID 回执未列，需在环境内确认）：Keys=60000、enabled=1；**先保留**作为当前 vseg 环境；target A 3329243 / target B 2458315 / etcd 2455814 未动。
+- etcd：64MiB、dbSize **1778.46MiB**、raftIndex 2,081,968；target B online 11/11、ERROR=0；node2 无 bench。
+- 未改码/未重编/未装包/未重启 target/etcd。

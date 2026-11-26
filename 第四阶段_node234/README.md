@@ -67,10 +67,10 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 |---|---|
 | target A（node3） | **正常**：PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR |
 | target B（node4） | **已重建**：PID 2458315；NQN `...urma-gpu-test`、SN `URMAGPU0001`；**新 UUID 50d6259e-51a6-4599-adf3-68defc0c5a53**；RAID0 strip 256K、online 11/11、4457、ERROR=0 |
-| master | **`vseg_nof133d` 2491062/2491065 运行中**：Keys=60000、enabled=1、vsegments=1；NOF-134 将停它 |
-| etcd | 2455814；`--max-request-bytes=67108864`；dbSize 1531.26MiB、raftIndex 1,783,020 |
+| master | **`vseg_nof134v1` 运行中**：Keys=60000、enabled=1（q1 诊断环境，先保留）；正式配置仍为 q4 |
+| etcd | 2455814；`--max-request-bytes=67108864`；dbSize 1778.46MiB、raftIndex 2,081,968 |
 | node2 | 无 bench/register 残留；客户端 md5 bb4a07a3…（未重编） |
-| 当前任务 | **NOF-134（正式 2-member：qpairs=4 vs qpairs=1 + plain 同会话；60k、4+4+4 轮）** |
+| 当前任务 | **无在途任务（NOF-134 完成；q1 不采用、正式配置保持 q4；vsegment 读优化线收口）** |
 | 风险 | node4 非独占：外部用户 `computin` 16:20–16:50 多次登录；本次重建后未被清；若再次清场/资源争用，停手回报 |
 
 ---
@@ -370,6 +370,20 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - **A→C**：P50 1.055×、P99 2.301× ⇒ 双 task+q4 不达。
 - child 数 probe [未获取]；按配置/代码 B=1 child、C/D=2 child（仅语义）。
 - 结论：正式 2-member 下值得试 **qpairs=1**；下发 NOF-134。
+
+### NOF-134 结果（2026-11-26，正式 2-member q4 vs q1；q1 不采用）
+
+| 组 | 配置 | Avg | P50 | P90 | P99 | P50 spread |
+|---|---|---|---|---|---|---|
+| P | plain/q4 | 260.87 | 254.13 | 266.57 | 285.03 | 6.7% |
+| V4 | vseg 2-member/q4 | 268.69 | 264.48 | 274.29 | 386.49 | 4.2% |
+| V1 | vseg 2-member/q1 | 270.17 | 261.30 | 272.39 | 383.47 | 6.9% |
+
+- **V4→V1**：P50 0.988×、P90 0.993×、P99 0.992× ⇒ 仅快 0.7–1.2%，小于 spread ⇒ 不显著。
+- **plain→V4**：1.041 / 1.029 / **1.356**；**plain→V1**：**1.028 / 1.022 / 1.345**。
+- 判据要求三项全 ≤1.05，V1 的 P99 **未过** ⇒ **q1 不采用**；正式配置保持 q4，正式结果仍为 NOF-127。
+- target W9：plain 47.4µs；vseg 39–40µs（vseg 单 IO 更快 15–17%）⇒ 差额在客户端聚合/路径；剩余 2.8–4.1%（P50/P90）与 1.345（P99）判结构性，本线收口。
+- V4 P99 spread 12.4% >10% ⇒ 该格仅诊断。
 
 ---
 
