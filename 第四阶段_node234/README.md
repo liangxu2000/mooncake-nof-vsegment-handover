@@ -105,8 +105,8 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 1. key = 4MiB，**60,000 keys**；400 keys 不再使用。
 2. vseg = **一整块**：`extent=256GiB/member`（274877906944），逻辑 512GiB；`member_count=2 / stripe=2MiB`；50G/3vseg 仅历史对照。
 3. plain = 单 target B。
-4. 读 = T1（threads=1/batch=1）、warmup=128、qpairs=4、verify=false、diag 关、sequential；vseg `--num_keys=30000`/segment。
-5. 稳定性：每臂 ≥6 轮读，至少 2 个交替周期（V3→P3→V3→P3）；逐轮报 Avg/P50/P90/P99；**不报吞吐，不写 P50 均值/中位**。
+4. 读 = T1（threads=1/batch=1）、warmup=128、qpairs=4、verify=false、diag 关、sequential；vsegment `--num_keys=30000`/segment；**每轮只读一遍 60k keys（约 20s），禁止 `--duration` 连续循环读**。
+5. 稳定性：每臂 ≥6 轮读，至少 2 个交替周期（V3→P3→V3→P3）；**回执正文不逐轮罗列**：每臂给轮数 + 各指标 min–max + 超阈轮数；**不做跨轮 P50 合并**（无逐笔导出）；不报吞吐、不写 P50 均值/中位。
 6. 第四阶段第一个正式结果 = NOF-127。
 
 ---
