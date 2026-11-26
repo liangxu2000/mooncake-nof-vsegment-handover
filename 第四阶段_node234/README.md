@@ -61,16 +61,16 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 
 ---
 
-## 3. 当前环境状态（2026-11-26 NOF-126 起）
+## 3. 当前环境状态（2026-11-26 NOF-126 完成后）
 
 | 对象 | 状态 |
 |---|---|
-| target A（node3） | PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR、零 IO |
+| target A（node3） | PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR |
 | target B（node4） | **已重建**：PID 2391418；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `c19b91e1…`；11/11、strip 256KiB、nsid1、4457；0 ERROR |
-| master | **`vseg_nof125` 2416799/2416802 运行中**：Keys=60000、vsegments=1、extent=256GiB/member、logical_capacity=512GiB；NOF-126 将先零写复读、再切 vseg50 / plain |
-| etcd | 2408033/2408036；`--max-request-bytes=67108864`；dbSize 387.75MiB |
+| master | **`plain_nof126p` 2427483/2427487 运行中**：Keys=60000、NVMe-oF SSD 234.38GB/512GB；vseg50 数据已被 plain 覆盖（A 半边不完整） |
+| etcd | 2408033/2408036；`--max-request-bytes=67108864`；dbSize 568.55MiB |
 | node2 | 无 bench/register 残留 |
-| 当前任务 | **NOF-126（同会话三臂：vseg256 复读 vs vseg50 重写 vs plain 重写；判 extent 影响与同会话 parity）** |
+| 当前任务 | **无在途任务（NOF-126 完成；50GiB/3vseg 定为读 parity 默认配置）** |
 
 ---
 
@@ -296,15 +296,24 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - 读侧：1.068× 未达 parity；但**单遍 + 跨会话**，10.6% 差异落在历史会话漂移（~9%）量级内，**不能归因 extent**。
 - target W9 反而低 3%、端到端却高 10.6% ⇒ 劣化不在 target 单 IO。
 - “读 IO +58%”不可采信为事实：理论 60k×16=960,000/target；两单实测分别为 841k/822k（86%/87%）与 535k/515k（54%/56%），计数本身不完整、窗口口径不同。
-- 决策：50G/3vseg 暂为 parity 配置；NOF-126 同会话三臂复核后再定。
+- 决策：50G/3vseg 暂为 parity 配置；NOF-126 同会话三臂复核后再定。**（已复核：见 NOF-126；extent 无显著影响，50G 定为读默认）**
 
-### 当前 NOF-126（同会话三臂）
+### NOF-126 结果（2026-11-26，同会话三臂；extent 无显著影响）
 
-1. **A（零写）**：`vseg_nof125`（256G，60k）复读 **3 遍**。
-2. **B（重写）**：新 `vseg_nof126_50g`（extent=50GiB，其余同），写 60k、读 **3 遍**。
-3. **C（重写）**：`plain_nof126p`（单 target B），写 60k、读 **3 遍**。
-4. 判：A 的稳定性；A vs B 的 extent 影响（>5% 稳定慢才算）；A/B 各自 vs C 的同会话 parity（≤1.05×）；逐遍 target n 验证 +58% 真伪。
-5. 边界：零改码、不重启 target/etcd、不补写、不追长尾；顺序固定 A→B→C（后写会覆盖前数据）。
+| 指标 | plain（C） | vseg50（B） | vseg256（A） | vseg50/plain | vseg256/plain |
+|---|---|---|---|---|---|
+| **P50 均值** | 252.11 | 261.33 | 264.30 | **1.037×** | **1.048×** |
+| **P50 中位** | 250.98 | 256.72 | 265.70 | **1.023×** | **1.059×** |
+| Avg / P90 / P99 | 253.66 / 260.64 / 281.49 | 266.65 / 271.51 / 380.91 | 272.20 / 277.38 / 377.97 | 1.051 / 1.042 / 1.353 | 1.073 / 1.064 / 1.343 |
+| target W9avg | 44.1–45.0 | 39.0–39.5 | 39.0–39.6 | ≈0.88× | ≈0.88× |
+| failed | 0 | 33 | 0 | — | — |
+| 每遍 P50 | 262.50/242.86/250.98 | 272.75/254.51/256.72 | 265.70/260.74/266.47 | — | — |
+
+- **extent 影响**：vseg256 vs vseg50 P50 均值 +1.1%、中位 +3.5%、Avg +2.1%、P90 +2.2%、P99 −0.8%，全部小于臂内极差（2.2% / 7.1% / 7.8%）⇒ **无显著影响**。
+- NOF-125 的 272.37 未复现（A 臂均值 264.30，低 3.0%）；+10.6% 主要是会话漂移。
+- “+58% IO”查实为 target dump 的**块内计数伪影**（非累计）：plain 第 3 遍同一负载只有 1,034,594（前两遍 1,923,395/1,924,099）；同会话 vseg256 的 n 反而低于 vseg50。
+- **决策**：读默认 **50G/3vseg**（同会话均值/中位双过 1.05；NOF-124 也 0.966）；256G 仅作写侧可选（读中位 1.059 贴线超）；不追 P99/Max。
+- 偏差：B 臂第 2 轮补写被人工中止（bench 从 key 0 重写，Keys 恒 59,967）；最终 59,967/60,000，33 失败（0.055%）未补写。A 臂 target B 的 n 未取到（脚本缺口）。
 
 ---
 

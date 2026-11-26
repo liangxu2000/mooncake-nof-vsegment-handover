@@ -148,7 +148,7 @@
 - 一整块 = 不再创建第 2 个 vsegment ⇒ 写入过程中不触发这次 full-state；初始 checkpoint（0 keys）很小，后续都是 delta。
 - 为什么是 256GiB 而不是 128GiB：128GiB/member（逻辑 256GiB）也够装 234.375GiB，但只剩 9% 余量；当前每 target 已注册 512GiB，256GiB/member 留一半余量且无需扩大注册（再大才要扩 segment 注册，对 60k 无收益）。
 - **只解决写入过程**：master 重启/恢复仍会做一次 full-state（60k≈31MB），etcd 默认 2MiB 仍不够 ⇒ 恢复/HA 仍需 etcd 64MiB 或改码；NOF-125 保持 etcd 64MiB 不动（本次不隔离该变量）。
-- **NOF-125 实测（2026-11-26）**：60,000/0 failed；vsegments 全程 1；`VSegment created`=1；value_max 9,087B、full_state 日志 0、ResourceExhausted 0 ⇒ **写侧目标完全达成**，H2 验证。读侧 P50 272.37µs（跨会话 plain 1.068×）未达 parity，但与 extent 的归因待 NOF-126 同会话三臂复核。
+- **NOF-125 实测（2026-11-26）**：60,000/0 failed；vsegments 全程 1；`VSegment created`=1；value_max 9,087B、full_state 日志 0、ResourceExhausted 0 ⇒ **写侧目标完全达成**，H2 验证。读侧 P50 272.37µs（跨会话 plain 1.068×）未达 parity；**NOF-126 同会话三臂已判：extent 50↔256 对读无显著影响（P50 均值 +1.1%、中位 +3.5%，小于臂内极差），272.37 为会话偏高；50G 定为读默认**。
 
 ---
 
@@ -224,7 +224,7 @@
 
 - **写侧目标完全达成**：一整块不再创建第 2 个 vsegment，NOF-122 的 H2（full-state 来自跨 vsegment 扩容）得到验证；即使一整块，master 重启恢复仍会做 60k≈31MB full-state，**etcd 64MiB 仍不可撤**。
 - **读侧未达 parity**（1.068× vs 跨会话 plain），但与 NOF-124 的 10.6% 差异落在会话漂移量级内，**不能归因 extent**；target W9 反而低 3%；“读 IO +58%”因 target 计数不完整/窗口不同，不作事实采信。
-- NOF-126 同会话三臂（vseg256 复读 / vseg50 重写 / plain 重写）复核后再定配置。
+- **NOF-126 同会话三臂（2026-11-26）**：plain 252.11 / vseg50 261.33（1.037×，中位 1.023×）/ vseg256 264.30（1.048×，中位 1.059×）；extent 50↔256 对读无显著影响；NOF-125 的 272.37 未复现（264.30，−3.0%）；“+58% IO”查实为 target dump 块内计数伪影。**决策：读路径默认 50G/3vseg；256G 仅作写侧可选。**
 
 ---
 
@@ -262,4 +262,5 @@
 - 2026-11-26：NOF-123 E1 成功，写入墙解除；NOF-124 P50/Avg/P90 parity 达成，P99/Max 待清洁数据。
 - 2026-11-26：NOF-125 下发——一整块 vsegment（extent=256GiB/member、逻辑 512GiB），验证写入期不再出现第 2 个 vsegment 的 full-state，并复核读 parity。
 - 2026-11-26：NOF-125 回执——写侧完全达成（60,000/0、vsegments=1、value_max 9,087B、无 full-state 大事务）；读侧 272.37µs（跨会话 plain 1.068×）未达 parity，但与 extent 的归因待 NOF-126 同会话三臂。
-- **遗留**：NOF-124 的 69 个缺失 key 未回填（NOF-125 已重写为 60k/0）；P99/Max 未平，暂不归因 vseg 路径；extent 对读的影响待 NOF-126 判决。
+- 2026-11-26：NOF-126 同会话三臂——extent 50↔256 对读无显著影响（P50 均值 +1.1%/中位 +3.5%，小于臂内极差）；NOF-125 的 272.37 为会话偏高；“+58% IO”为计数伪影；**读默认定为 50G/3vseg**，256G 仅作写侧可选。
+- **遗留**：NOF-124 的 69 个缺失 key 已由 NOF-125 重写清零；NOF-126 的 50G 臂有 33 个缺失 key（0.055%，未补写）；P99/Max 未平，暂不归因 vseg 路径。
