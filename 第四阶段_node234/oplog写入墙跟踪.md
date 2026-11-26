@@ -1,7 +1,7 @@
 # 大数据写入的 oplog 墙：跟踪记录
 
 - 开始日期：2026-11-26
-- 状态：**NOF-123 待执行/待回执**（最终解决段留空，后续更新）
+- 状态：**NOF-123 执行中**（按已下发版本：etcd 64MiB + extent=50GiB；最终解决段留空，后续更新）
 - 一句话：目标 **60,000 keys（240GiB）**，在 **25.6k keys（约 100GiB）** 撞上 etcd 单事务上限；不是总空间，不是批条数，而是 **vsegment full-state 快照作为一条 oplog entry** 太大。
 - 关联任务：NOF-119 A / NOF-120 / NOF-121 / NOF-122 / **NOF-123（当前）**
 
@@ -124,6 +124,15 @@
 
 - etcd 启动失败/数据异常：恢复原参数重启，停手回报；
 - 64MiB 仍被拒：停手，附 etcd flag/错误原文；下一步才考虑改码（拆分/省略 full-state）或退回 20k。
+
+### 5.3 下一单候选（未下发，等 NOF-123 回执）
+
+**一整块 vsegment**：`member_extent_size=128GiB`（逻辑 256GiB），60k/240GiB 全部装进 1 个 vsegment。
+
+- 依据（L2 假说）：当前 50GiB×2=100GiB/vsegment，25,600 keys 填满，第 25,601 个 key 触发第 2 个 vsegment 创建；full-state checkpoint 恰在此时出现（25,632 keys/13.3MB）。
+- 一整块 = 不再创建第 2 个 vsegment ⇒ 写入过程中不触发这次 full-state；初始 checkpoint（0 keys）很小，后续都是 delta。
+- **只解决写入过程**：master 重启/恢复仍会做一次 full-state（60k≈31MB），etcd 默认 2MiB 仍不够 ⇒ 恢复/HA 仍需 etcd 64MiB 或改码。
+- 变量隔离：如果先在一整块上测试，可保持 etcd 默认 2MiB，避免“extent + etcd”两个变量混在一起；NOF-123 先验证 etcd 64MiB + 50G。
 
 ---
 
