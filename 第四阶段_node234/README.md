@@ -61,16 +61,16 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 
 ---
 
-## 3. 当前环境状态（2026-11-26 NOF-126 完成后）
+## 3. 当前环境状态（2026-11-26 NOF-127 起）
 
 | 对象 | 状态 |
 |---|---|
 | target A（node3） | PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR |
 | target B（node4） | **已重建**：PID 2391418；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `c19b91e1…`；11/11、strip 256KiB、nsid1、4457；0 ERROR |
-| master | **`plain_nof126p` 2427483/2427487 运行中**：Keys=60000、NVMe-oF SSD 234.38GB/512GB；vseg50 数据已被 plain 覆盖（A 半边不完整） |
+| master | `plain_nof126p` 2427483/2427487 运行中（Keys=60000）；NOF-127 将停它，起 `vseg_nof127a` |
 | etcd | 2408033/2408036；`--max-request-bytes=67108864`；dbSize 568.55MiB |
 | node2 | 无 bench/register 残留 |
-| 当前任务 | **无在途任务（NOF-126 完成；50GiB/3vseg 定为读 parity 默认配置）** |
+| 当前任务 | **NOF-127（正式条件稳定性测量：60k、一整块 vseg256 vs plain；V3→P3→V3→P3 共 12 轮，交逐轮 Avg/P50/P90/P99）** |
 
 ---
 
@@ -99,6 +99,15 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - worker、inflight、qpair、数据 LBA 均排除。
 - **2× 是按字节的服务成本，不是每 IO 固定开销**；chunk 加大不降时延，W9 反而变差；target 单 IO 在 ≥256KiB 时被夹到 256KiB。
 - 剩余解释：target 对 vseg 请求的每字节服务路径（尚未拆 W9）。
+
+### 4.4 正式测试口径（2026-11-26 用户定，后续默认）
+
+1. key = 4MiB，**60,000 keys**；400 keys 不再使用。
+2. vseg = **一整块**：`extent=256GiB/member`（274877906944），逻辑 512GiB；`member_count=2 / stripe=2MiB`；50G/3vseg 仅历史对照。
+3. plain = 单 target B。
+4. 读 = T1（threads=1/batch=1）、warmup=128、qpairs=4、verify=false、diag 关、sequential；vseg `--num_keys=30000`/segment。
+5. 稳定性：每臂 ≥6 轮读，至少 2 个交替周期（V3→P3→V3→P3）；逐轮报 Avg/P50/P90/P99；**不报吞吐，不写 P50 均值/中位**。
+6. 第四阶段第一个正式结果 = NOF-127。
 
 ---
 

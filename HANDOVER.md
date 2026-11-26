@@ -101,7 +101,9 @@
 
 - **回执指标硬规则（2026-11-26 用户定规，后续所有 NOF 任务生效）**：每次测试**逐遍**报 **Avg / P50 / P90 / P99** 的绝对值（µs）；**不报吞吐**；**禁止计算或书写“P50 均值”“P50 中位”**（百分位不可跨遍平均）；多遍就逐遍列；同一会话的 vseg/plain 放**同一张表**；验收按**逐遍 P50 对逐遍 P50 的比值**，每一遍写明是否 ≤1.05。
 
-- 当前任务：**无在途任务（NOF-126 完成；50GiB/3vseg 定为读 parity 默认配置）**。**NOF-126 同会话三臂（逐遍 P50）**：plain **262.50 / 242.86 / 250.98**；vseg50 **272.75 / 254.51 / 256.72**，逐遍比 **1.039 / 1.048 / 1.023（全部 ≤1.05）**；vseg256 **265.70 / 260.74 / 266.47**，逐遍比 **1.012 / 1.074 / 1.062（两遍超）**。extent 256 vs 50 的逐遍 P50 比 **−2.6% / +2.4% / +3.8%**，小于各自臂内极差（8.0% / 7.1% / 2.2%）⇒ **extent 无显著影响**。NOF-125 的 272.37 高于同会话三遍 260.74–266.47，未复现；其 +10.6% 主要是会话漂移；“读 IO +58%”为 target dump 块内计数伪影（同一 plain 臂第 3 遍 1.03M vs 前两遍 1.92M；同会话 256G n 反而低于 50G）。**决策**：读默认 **50G/3vseg**；256G 仅作写侧可选；不追 P99/Max。环境停在 plain `plain_nof126p`（Keys=60000）；vseg50 常驻需另立单重建。第四阶段文档、关键结果、oplog 跟踪均已更新。
+- **正式测试口径（2026-11-26 用户定，后续默认）**：① key=4MiB，**60,000 keys**，不再用 400 keys；② vseg 用**一整块**：`extent=256GiB/member`（274877906944），逻辑 512GiB，`member_count=2 / stripe=2MiB / required_medium=nof / reserved_ratio=0 / io_alignment=4096 / slot=1`；50G/3vseg 仅作历史对照，不再默认；③ plain 单 target B；④ 读 = T1（threads=1/batch=1）、warmup=128、qpairs=4、verify=false、diag 关、sequential；vseg `--num_keys=30000`/segment；⑤ **稳定性**：每臂 ≥6 轮读，至少 2 个交替周期（V3→P3→V3→P3）以抵消时间漂移；逐轮报 Avg/P50/P90/P99，不报吞吐、不写 P50 均值/中位；⑥ 第四阶段第一个正式结果 = NOF-127。
+
+- 当前任务：**NOF-127（正式条件稳定性测量：60k keys、一整块 vseg256、plain；V3→P3→V3→P3 共 12 轮，交付两臂逐轮 Avg/P50/P90/P99 与稳定区间；2026-11-26）**。目的：按用户定下的正式条件测“vsegment 和 plain 的稳定时延”，作为第四阶段第一个正式结果；50G/3vseg 仅历史对照。任务书见文末。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -9217,3 +9219,62 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - target A 3329243 / target B 2391418 未重启；node2/node4 无残留。
 - 未改码/未重编/未装包/未重启 target/未重启 etcd。
 - 偏差：B 臂第 2 轮补写被人工中止（bench 从 key 0 重写，Keys 恒 59,967，继续只会空转）；B 最终 59,967/60,000，未补写，33 个失败按 0.055% 接受。
+
+---
+
+# NOF-127（待执行 · 正式条件稳定性测量 · 60k · 一整块 vseg256 vs plain · 多轮 · 2026-11-26）
+
+## 目标
+
+- 按**正式条件**（HANDOVER 顶部“正式测试口径”）：60,000 keys × 4MiB；vseg = **一整块**（extent=256GiB/member、逻辑 512GiB）；plain = 单 target B；T1 读。
+- 用 **2 个交替周期（V3→P3→V3→P3）** 共 **12 轮读**（每臂 6 轮），抵消时间漂移；交付两臂**逐轮 Avg/P50/P90/P99** 与 **P50 稳定区间**，作为第四阶段第一个正式结果。
+- **不报吞吐，不计算/不写 P50 均值/中位**；每轮单独一行。
+- 不改码、不重启 target/etcd；每个 phase 用新 cluster 重写 60k（后写覆盖前数据）。
+
+## A. 预检
+
+1. 当前 `plain_nof126p`（2427483/2427487，Keys=60000）运行中；记录 PID 后停止，释放 50056/9006/8086。
+2. target A（3329243）/ target B（2391418）运行、4457 LISTEN；**均不重启**。
+3. etcd 2408033/2408036 运行，`--max-request-bytes=67108864`；**不重启**。
+4. node2 无 bench/register 残留；记录客户端二进制 md5（不重编）。
+
+## B. Phase 1：vseg256（`vseg_nof127a`，3 轮读）
+
+1. 起 vseg master `vseg_nof127a`（node4，50056/9006/8086、slot=1、etcd、URMA、HA+oplog on、`--oplog_batch_max_entries=64`）：`member_count=2 / extent=274877906944 / stripe=2MiB / required_medium=nof / reserved_ratio=0 / io_alignment=4096 / submaster_count=1`；若 etcd 存在同名 `/cvm/`、`/oplog/` 键，两处都删；不删其它 cluster 键。
+2. 注册 B→A 各 512GiB；等 quota ≥20s；验收 `member_extent_size=274877906944`、`logical_capacity=549755813888`、partitions=1、reconcile_fail=0。
+3. 写 60k：`--num_keys=30000`/segment、T1/batch1、4MiB；验收 **Keys=60000**（记录 failed 与错误码；**不补写**；不记录写入性能）。
+4. 读 3 轮（p1/p2/p3）：`--num_keys=30000`/segment（60k queries）、T1/threads=1/batch=1、warmup=128、qpairs=4、verify=false、diag 关；每轮记录 **Avg/P50/P90/P99、failed、墙钟**；target A/B 的 W9 附记（注明是 target 侧口径）。
+
+## C. Phase 2：plain（`plain_nof127a`，3 轮读）
+
+1. 停 `vseg_nof127a`；起 `plain_nof127a`（50056/9006/8086、slot=1、etcd、URMA、HA+oplog、batch=64）；若存在同名 `/cvm/`、`/oplog/` 键，两处都删；注册 B 512GiB。
+2. 写 60k：16t/batch16、4MiB；验收 **Keys=60000**（记录 failed；不补写；不记录写入性能）。
+3. 读 3 轮（p1/p2/p3）：60k keys、T1、warmup=128、qpairs=4、verify=false、diag 关；记录 **Avg/P50/P90/P99、failed、墙钟**；target B 的 W9 附记。
+
+## D. Phase 3：vseg256 复测（`vseg_nof127b`，3 轮读）
+
+- 停 plain；按 B 段完整重做（新 cluster、extent 256GiB、注册 B→A、写 60k、读 3 轮 p4/p5/p6）。
+- 目的：让 vseg 的 6 轮分布跨两个时间窗口，抵消单向漂移。
+
+## E. Phase 4：plain 复测（`plain_nof127b`，3 轮读）
+
+- 停 vseg；按 C 段完整重做（新 cluster、单 target B、写 60k、读 3 轮 p4/p5/p6）。
+
+## F. 交付（必答）
+
+1. **12 轮逐轮表**：`臂 | phase | 轮 | Avg | P50 | P90 | P99 | failed | 墙钟`；每臂 6 行，不聚合。
+2. 每臂 6 轮的 **P50 原始值列表 + min–max 区间**；Avg/P90/P99 同样给原始列表。
+3. 稳定性判读：
+   - vseg 的 P50 区间 [min,max] 与 plain 的 P50 区间 [min,max]；
+   - 两区间是否重叠/分离；给出 vseg/plain 的区间比（min/max 与 max/min 两端）；
+   - **不写均值/中位、不写吞吐**。
+4. 每个 phase 的配置验收（extent、capacity、vsegments）、数据完整性（Keys/failed）。
+5. 环境末态（master/target/etcd PID）；未改码/未重启 target/etcd。
+
+## G. 边界
+
+- **不改码/不重编/不装包/不重启 target/不重启 etcd**；只重启 master 与 bench。
+- 不再跑 400 keys；不跑 T4/T16、不跑 20k；不补写；不调 chunk/qpairs；不追 P99/Max（只如实报）。
+- 顺序固定 V3→P3→V3→P3；每个 phase 写后必须用 master `Keys` 验收；若失败 >0.2% 或 wedged，停手回报。
+- 每次 master 重启后必须按 B→A 重注册；注册后等 quota ≥20s。
+- 预计 **35–45 分钟**。
