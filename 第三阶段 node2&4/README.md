@@ -98,7 +98,8 @@ node2（reader + writer）                node4（master + etcd + target B）
 | **NOF-113R** | 纯配置：vseg 大 IO vs plain | **配置路径到顶**：vseg@2M **551.93** vs plain@128K **270.52µs（2.04×）**、vs plain@2M 277.73（1.99×）；chunk 对 vseg 无影响，W9 反而 250→287（plain 120→143）⇒ **2× 按字节计，不是每 IO 固定开销**；target 单 IO 在 ≥256K 时被夹到 256KiB（n 16898→8450）。parity 未达成 |
 | **NOF-114** | node3 第二个 target 部署与就绪 | **已就绪、无需部署**：PID 2810360、md5 同 node4、11 盘 RAID0 strip256K、nsid1、4457、0 ERROR、空转 n=0；但 NQN/SN 与 node4 相同 |
 | **NOF-114R** | node3 独占清理 + target A 换唯一 NQN | **完成**：royi master/client/构建循环已清；target A 重启为 PID 3329243、`urma-gpu-test-node3`/`URMAGPU0003`、UUID `2c5bf1f2…`、11/11、4457、0 ERROR、零 IO；node4 未动 |
-| **NOF-115（当前）** | 双 target 就绪 + 2-key 冒烟 | 停旧 vseg_nof107；起 `vseg_nof115`，注册 node3 A + node4 B 两个 segment；`member_count=2 / extent=50GiB / stripe=2MiB / required_medium=nof` 发布 quota；写 2 keys 验证两个 child 分落两 target、各约 32 个 IO。不跑性能，400-key 留 NOF-116 |
+| **NOF-115** | 双 target 就绪 + 2-key 冒烟 | **完成**：2 segment 注册成功；quota member_count=2/extent=50G/stripe=2M、logical_capacity=100G、reconcile_fail=0；写读通过，每 key 2 child（4096 blocks/16 sub-io），两 target 各约 66 IO 均分。注册不持久，需保持心跳 |
+| **NOF-116（当前）** | 双 target 400-key 性能 | plain 400 keys 单 target 先测；vseg 400 keys 双 target（`--num_keys=200` 每 segment，总 400）；T1×3 遍、diag 关；验收 parity（vseg P50 ≤ plain×1.05）。每次 bench/重启后重注册 B→A |
 | **NOF-115（待下发）** | 双 target vsegment 测量 | 参数：`member_count=2`、**extent=50GiB**、**keys=400（先跑通）**、oplog/HA 保持现状。register node3+node4 两个 NoF segment；写 400 keys（4MiB→2×2MiB 跨两个 target）；plain 单 target 400 keys 对照；验收 parity（≤ plain×1.05）。1000/20k 等跑通后再试 |
 
 ---

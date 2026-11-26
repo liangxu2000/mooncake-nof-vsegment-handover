@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-115（双 target vsegment 就绪 + 2-key 冒烟 · 不跑性能/不写 400 · 2026-11-26）**。NOF-114R 完成：node3 的 royi master/client/构建循环已清理；target A 已用唯一 NQN/SN 重启（PID 3329243、`nqn.2026-01.io.spdk:urma-gpu-test-node3` / `URMAGPU0003`、RAID0 UUID `2c5bf1f2…`、11/11、4457、0 ERROR、零 IO）；node4 target B 2142228 未动（ERROR 6）。**NOF-115 只做**：停旧 `vseg_nof107` master；起新 master `vseg_nof115`，注册 node3 A + node4 B 两个 segment；用 `member_count=2 / extent=50GiB / stripe=2MiB / required_medium=nof` 发布 quota；写 **2 keys** 冒烟，确认每个 key 两个 child 分落 node3/node4，target A/B 各收到约 32 个 128KiB IO。400-key plain/vseg 性能留给 NOF-116。
+- 当前任务：**NOF-116（双 target 400-key 性能：plain 单 target vs vseg member_count=2，T1×3 遍，parity 验收）**。NOF-115 完成：**双 target vseg 已打通**——node3 A + node4 B 注册为 2 个不同 segment（traddr/NQN 均不同）；quota generation=1、member_count=2、extent=50GiB、stripe=2MiB、partitions=1、logical_capacity=100GiB、reconcile_fail=0；写读通过，每 key 2 child（blocks=4096、sub_ios=16），两个 target 各约 66 IO（4 keys）均分。**关键口径**：① segment 注册**不持久**，注册进程退出即失效 ⇒ 每次 bench/每次 master 重启后必须按 node4 B → node3 A 重注册，并在整臂期间保持注册进程存活；② `segment_write` 下 `--num_keys=N` 是**每 segment N keys** ⇒ vseg 两 segment 要写 400 keys 用 `--num_keys=200`（预期 Keys=400）；③ `vsegments=1` 是 quota 发布时预建，正常；④ `logical_used` gauge 1000s 才刷新，验收以 Keys/写日志为准。NOF-116：plain 400 keys 单 target 先测，再 vseg 400 keys 双 target；400/50G、不改码、不重启 target。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -8218,3 +8218,81 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 不改 vseg 逻辑代码、不重编、不装包；不动 target A/B 进程；不 register 除两个 endpoint 之外的任何东西。
 - 任何一步失败停手回报；不要把失败写成成功。
 - 预计 **20–30 分钟**。
+
+---
+
+## NOF-115 裁决（2026-11-26 · 回执已收）
+
+### 1. 结果（[事实]）
+
+- **两个 segment 注册成功且不覆盖**：node4 B（`traddr:node4 … subnqn:…urma-gpu-test … ns:1`）与 node3 A（`traddr:node3 … subnqn:…urma-gpu-test-node3 … ns:1`），各 100GiB；`master_total_nof_capacity_bytes=214748364800`、segment 数=2。
+- **quota 发布成功**：generation=1、partitions=1、profiles=1、discovered_segments=2、reconcile_fail=0；profile `medium=nof, member_count=2, stripe_size=2097152, member_extent_size=53687091200`；`logical_capacity=107374182400`（100GiB=2×50GiB）；vsegments=1（发布即预建，正常）。
+- **写读通过**：`--num_keys=2` 在 segment_write 下是每 segment 2 keys ⇒ 总 Keys=4、16MiB；`type` 全 vsegment；每 key `child_count=2`、`blocks=4096`、`sub_ios=16`；两个 target 各收到约 66 IO（≈4×16=64+探测），**均分**。
+- 读 diag 开 P50 838µs（4 keys，不作性能）；target 读窗口 W9：node4 ~232–234µs、node3 ~226–228µs；写窗口 ~54–56µs。
+
+### 2. 关键口径（必须继承）
+
+1. **segment 注册不持久**：NoF segment 由注册进程心跳续期，进程退出即失效；master 重启后 segment 归零，必须**重新注册**。NOF-116 每次 bench/每次 master 重启后按 **node4 B → node3 A** 顺序重注册，并在整臂期间保持注册进程存活。
+2. `segment_write` 的 `--num_keys=N` 是**每 segment N keys**：vseg 两 segment 要 400 keys 用 `--num_keys=200`（预期 Keys=400）；plain 单 segment 400 keys 用 `--num_keys=400`。
+3. `vsegments=1` 是 quota 发布时预建，不是异常；写数据不会新增（400 keys 仍在 100GiB 的同一 vsegment 内）。
+4. `logical_used` gauge 受 1000s 刷新限制；验收以 master `Keys` + writer 日志为准。
+5. child→target 的 endpoint 不在 `nof_slow_task` 里；落点均分证据用**两个 target 的 IO 计数相等**（NOF-115 66 vs 66）。
+6. node3 target ERROR 的 2 条是 TCP 探测导致的 handshake failed，不是故障。
+
+### 3. 下一步
+
+**NOF-116**：400-key plain（node4 单 target）vs vseg（node3+node4，member_count=2）性能对比，T1×3 遍，diag 关，验收 parity（vseg P50 ≤ plain×1.05）。
+
+---
+
+# NOF-116（待执行 · 双 target 400-key 性能：plain 单 target vs vseg member_count=2 · 2026-11-26）
+
+## 目标
+
+- 同一 target B（node4）上：plain 400 keys 基线；vseg 400 keys 跨 node3+node4 两 target，`member_count=2 / extent=50GiB / stripe=2MiB`。
+- T1 读 3 遍，diag 关；给两臂 P50/W9；验收 **parity：vseg P50 ≤ plain P50×1.05**（W9 同时报）。
+- 不改码、不重启 target；允许写数据（400 keys）和 master 重启。
+
+## A. 预检
+
+1. target A（node3 PID 3329243，新 NQN/SN）、target B（node4 PID 2142228）运行；**都不重启**。
+2. 当前 `vseg_nof115` master 2355509/2355512 运行（Keys=4、2 segments、quota 100GiB）；准备停它给 plain 让端口。
+3. 确认 `nof_register` 的**守护/心跳方式**：注册进程必须整臂存活；若工具退出即失效，用循环/后台 keepalive，记录方式。
+4. node2 无 bench/register 残留；磁盘/日志空间足够。
+
+## B. Plain 基线（node4 单 target，先测）
+
+1. 停 `vseg_nof115` master（记录 PID/退出码）；target B 不动。
+2. 起 **plain master `plain_nof116`**（node4，50056/9006/8086、slot=1、etcd 127.0.0.1:2379、URMA 设备/capsule）；验收 leader/serving、Keys=0、owned_slots=1。
+3. 注册 **target B**；保持注册进程存活；确认 master segment=1。
+4. Writer：400 keys×4MiB、**16t/batch16**、plain；验收 `Keys=400`、`logical_used=1,677,721,600`；记录 target B 写窗口 n≈12,800。
+5. Reader：**3 遍**，T1（threads=1/batch=1）、warmup=128、qpairs=4、verify=false、diag 关；每遍前确认注册存活/挂载有效；记录 Min/Avg/P50/P90/P99/Max、failed、target B W9（期望 n≈16,896）。
+6. 记录后停 plain master 与注册进程；数据保留（会被 vseg 覆盖）。
+
+## C. Vseg 双 target 400 keys
+
+1. 起 **vseg master `vseg_nof116`**（node4，新 cluster_id；先 `auto_plan=false`，参数 `member_count=2 / extent=50GiB / stripe=2MiB / required_medium=nof / reserved_ratio=0 / io_alignment=4096 / slot=1 / HA+etcd`）；验收 leader/serving。
+2. 注册 **node4 B → node3 A**；保持两个注册进程存活；确认 master segment=2。
+3. 停 master；以 `auto_plan=true` + 同组参数重启；**重新注册 B → A**（不持久）；保持存活；验收 quota：generation≥1、partitions=1、logical_capacity=100GiB、reconcile_fail=0、vsegments=1。
+4. Writer：vseg segment_write，**`--num_keys=200`（每 segment 200，预期总 Keys=400）**、T1/batch1、4MiB；`VSEGMENT_CREATING` 最多重试 3 轮；验收 `Keys=400`、`logical_used=1,677,721,600`；target A/B 写窗口各≈6,400（400×16）。
+   - 若 Keys 不是 400（例如 200 或 800），**停手回报**，不要自行改 num_keys 继续。
+5. Reader：**3 遍**，T1 400 keys、warmup=128、qpairs=4、verify=false、diag 关；每遍前确认两个注册进程存活、master segment=2；记录 Min/Avg/P50/P90/P99/Max、failed、target A/B W9（各期望 n≈8,448）。
+6. 与 plain 对比：P50、W9、比值；判 parity。
+
+## D. 交付（必答）
+
+1. 两阶段 master 配置/PID/segment 数/quota 验收。
+2. Plain：Keys/logical_used、3 遍 P50/W9、target B n。
+3. Vseg：Keys/logical_used、3 遍 P50、target A/B W9 与 n（应均分）、每 key child 抽检。
+4. **判读**：vseg/plain 的 P50 与 W9 比值；是否达到 parity（≤1.05×）。
+   - 若达到 ⇒ 双 target 形态达标，记录最佳配置。
+   - 若仍差很多 ⇒ 记录“双 target 未消除差距”，为后续（拆 W9/改代码）提供数据；不继续调旋钮。
+5. 环境末态；未改码/未重启 target。
+
+## E. 边界
+
+- 只写 400 keys；不跑 1000/20k；不跑 T4/T16；不改 vseg 逻辑代码/不重编/不装包。
+- 不重启 target A/B；master 重启允许，但每次必须重注册两 segment。
+- 注册进程必须整臂存活；若中途失效（segment 数掉到 0/1），停手回报。
+- 不要混用 plain/vseg 的 Keys 语义：plain 单 segment 400；vseg 每 segment 200（总 400）。
+- 预计 **30–40 分钟**。
