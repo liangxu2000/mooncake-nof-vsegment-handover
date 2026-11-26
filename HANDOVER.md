@@ -103,7 +103,7 @@
 
 - **正式测试口径（2026-11-26 用户定，后续默认）**：① key=4MiB，**60,000 keys**，不再用 400 keys；② vsegment 用**一整块**：`extent=256GiB/member`（274877906944），逻辑 512GiB，`member_count=2 / stripe=2MiB / required_medium=nof / reserved_ratio=0 / io_alignment=4096 / slot=1`；50G/3vseg 仅作历史对照，不再默认；③ plain 单 target B；④ 读 = T1（threads=1/batch=1）、warmup=128、qpairs=4、verify=false、diag 关、sequential；vsegment `--num_keys=30000`/segment；**每轮只读一遍 60k keys（约 20s），禁止用 `--duration` 连续循环读**；⑤ **稳定性**：每臂 ≥6 轮，至少 2 个交替周期（V3→P3→V3→P3）；**回执正文不逐轮罗列，按 `测试结果聚合方法_20261112.md` 给聚合值（Avg 均值、分位中位）+ spread**；⑥ 第四阶段第一个正式结果 = NOF-127。
 
-- 当前任务：**无在途任务（NOF-129 完成；环境已重建；NOF-127 仍为第一正式结果）**。NOF-129：node4 etcd/target B 重建成功（etcd 64MiB、dbSize 873.65→968.22MiB；target B 新 UUID 50d6259e…、11/11、ERROR=0）；vsegment 60k/0 十轮：**P50 260.59µs（spread 11.1%）、Avg 266.93（12.7%）、P90 269.12（10.2%）、P99 383.08（30.8%）**；target W9 B/A spread **1.9%/2.7%** ⇒ 端到端/target=4.1×，**波动在客户端/系统，不在 target**。**按 2026-11-12 方法 Avg spread 12.7% >10% ⇒ NOF-129 不进正式表，仅诊断**；正式结果仍为 NOF-127（P50 257.01/248.51=1.034×、Avg 1.040×、P90 1.046×、P99 1.371×；Avg spread 6.2/6.4）。vsegment 跨会话可复现（NOF-129 vs 127 P50 +1.4%）。客户端侧具体成因未测。环境 `vseg_nof128` 运行（Keys=60000）。
+- 当前任务：**NOF-130（补测 plain：当前重建环境、60k、10 轮，按 2026-11-12 方法聚合；2026-11-26）**。背景：当前环境 vsegment 10 轮（NOF-129）Avg 266.93 / P50 260.59，但 spread 12.7%/11.1% >10% 仅诊断；plain 旧值 NOF-127 Avg 254.14 / P50 248.51 是 **node4 重建前、旧 target B**，不能直接比。本单补同一重建环境的 plain 10 轮，得到可比比值；不改码/不重启 target/etcd/不补写。环境 `vseg_nof128` 运行（Keys=60000）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -9473,3 +9473,42 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - target B 2458315（新 UUID 50d6259e…）、target A 3329243；master `vseg_nof128` 2458697/2458700、Keys=60,000、E=1 FATAL=0。
 - node2 无残留；客户端 md5 bb4a07a3…（未重编）。
 - 偏差：W9 主口径用每轮窗口末块；窗口内全块口径（B 23 块 spread 13.1%、A 28 块 8.2%）含 10s 分段边界块，仅参考；plain 基线沿用 NOF-127（跨会话）；客户端侧成因未测。
+
+---
+
+# NOF-130（待执行 · 补测 plain · 当前重建环境 · 60k · 10 轮 · 2026-11-26）
+
+## 目标
+
+- 当前 node4 重建后，vsegment 10 轮已测（NOF-129：Avg 266.93 / P50 260.59 / P90 269.12 / P99 383.08）。
+- 补测**同一重建环境**的 plain 10 轮，得到可比的 plain 聚合值与 spread；按 `测试结果聚合方法_20261112.md`（Avg=各轮均值、分位=各轮同分位中位）。
+- 只补 plain；不再写/测 vsegment；plain 写入会覆盖 target B 上的 vsegment 半边，NOF-129 结果已保存。
+
+## A. 切换
+
+1. 停 `vseg_nof128` master（2458697/2458700）；target A（3329243）/ target B（2458315）/ etcd（2455814）均不动。
+2. 起 `plain_nof130`（node4，50056/9006/8086、slot=1、etcd、URMA、HA+oplog、batch=64）；若 etcd 存在同名 `/cvm/`、`/oplog/` 键，两处都删；注册 target B 512GiB。
+
+## B. 写 60k
+
+- 60,000 keys × 4MiB，16t/batch16；验收 **Keys=60000**（记录 failed；不补写；不记录写入性能）。
+
+## C. 读 10 轮
+
+- 每轮：60k keys、T1/threads=1/batch=1、warmup=128、qpairs=4、verify=false、diag 关、sequential；每轮一遍≈20s。
+- 记录 **Avg/P50/P90/P99、failed、墙钟**；**每轮取 target B 的 W9avg/n**（与 vsegment 的 W9 对照）。
+
+## D. 聚合与对比
+
+1. 按 2026-11-12 方法聚合 + spread；正文只给聚合表，不逐轮罗列。
+2. 对比：
+   - vsegment（NOF-129，同重建环境，10 轮）：Avg 266.93 / P50 260.59 / P90 269.12 / P99 383.08；
+   - plain（本单）：Avg/P50/P90/P99；
+   - 旧 plain（NOF-127，旧 target B，跨环境）Avg 254.14 / P50 248.51：仅历史参考，不作正式对比。
+3. 给出 plain/vsegment 与 vsegment/plain 的比值；按方法标注 spread（>3% 说明原因、>10% 不进表）。
+
+## E. 边界
+
+- 不重启 target/etcd；不改码/不重编/不装包；不补写；不跑 T4/T16。
+- 只读一遍 60k/轮（≈20s），禁止 `--duration`；每轮取 W9。
+- 预计 **15–20 分钟**（写 60k + 10×20s + 切换）。
