@@ -69,7 +69,7 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 | target B（node4） | PID 2142228（11-25 15:20:22 起）；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `0470fe3a…`；11/11、strip 256KiB、nsid1、4457；ERROR 6 条（历史 pci_event socket read error 105） |
 | master | `vseg_nof116` 运行中（2360608/2360611）；Keys=400；2 个 segment；quota generation=1、member_count=2、extent=50GiB、logical_capacity=100GiB |
 | node2 | 无 bench/register 残留 |
-| 当前任务 | **NOF-119：单遍 ~20s/60k keys；先验证 512GiB segment + oplog off，再 plain/vseg 单遍读** |
+| 当前任务 | **NOF-119：单遍 ~20s/60k keys；先验证 512GiB segment + 所选 oplog 配置，再 plain/vseg 单遍读** |
 
 ---
 
@@ -161,7 +161,8 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - 按当前 Avg：20s ≈ 50–60k keys；取 **60,000 keys = 240GiB**。
 - **先过两道门**：
   1. NoF segment 容量从 100GiB 扩到 **512GiB**（若注册/目标支持，不重启 target）；
-  2. `enable_ha=true + enable_oplog=false` 可发布 quota（60k 不能走 oplog）。
+  2. **本单选择** `enable_ha=true + enable_oplog=false`，先验证能发布 quota。  
+     关 oplog 是配置选择（不把 HA 日志变成大测试变量），不是断言当前环境 60k 会爆；旧 node1/3 的 942MB 不外推。
 - A 段只做容量/oplog 探针 + 2-key 高 LBA 验证；不写 60k。失败即停。
 - 通过后：plain 60k 单遍（node4，240G），vseg 60k 单遍（node3+node4，每 target 120G，`--num_keys=30000`/segment）；T1、warmup=128、qpairs=4、diag 关；各 1 遍约 20s。
 - 验收 parity（vseg P50 ≤ plain×1.05）；不达则记录，不调 key 数重跑。

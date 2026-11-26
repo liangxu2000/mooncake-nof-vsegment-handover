@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-119（单遍 ~20s 大数据集：60k keys/240GiB；先验证 NoF segment 容量可扩到 512GiB + `enable_oplog=false`，再 plain/vseg 单遍读；2026-11-26）**。用户要求：**400 keys 太少，要很多 keys，最好一遍连续读 20s**。按当前 plain Avg 338.5µs、vseg Avg 371–400µs，20s 需 **~50–60k keys**；取 **60k keys = 240GiB**。**容量硬墙**：当前每 target NoF segment 只有 **100GiB**，60k 需 240GiB（plain 单 target 240G、vseg 每 target 120G）⇒ 必须先把 segment 容量扩到 **512GiB**；若 `nof_register`/target 不支持扩容，停手回报，另议 target 重建或退回多遍。**oplog 硬墙**：60k keys 必须 `--enable_ha=true --enable_oplog=false`（旧 2k keys 已 942MB oplog）。NOF-118（400-key 剩余 25µs 诊断）**暂缓**，先纠正 key 规模。**第四阶段文档：`第四阶段_node234/README.md`。**
+- 当前任务：**NOF-119（单遍 ~20s 大数据集：60k keys/240GiB；先验证 NoF segment 容量可扩到 512GiB，再 plain/vseg 单遍读；2026-11-26）**。用户要求：**400 keys 太少，要很多 keys，最好一遍连续读 20s**。按当前 plain Avg 338.5µs、vseg Avg 371–400µs，20s 需 **~50–60k keys**；取 **60k keys = 240GiB**。**容量硬墙（当前环境事实）**：每 target NoF segment 现在注册为 **100GiB**，60k 需 plain 单 target 240G / vseg 每 target 120G ⇒ 先验证能否把 segment 注册容量扩到 **512GiB**（target bdev 77TB；若不行试 256G，仍不行停手回报）。**oplog 选择**：本单**主动选择** `enable_ha=true + enable_oplog=false`，目的只是不把 HA 日志变成 60k 大测试的变量；**不是断言当前环境 60k 会爆**（旧 node1/3 的 942MB 不外推）。A 段实测该配置能发布 quota；失败则回退手工 quota 或另议，不擅自开 oplog 写 60k。NOF-118（400-key 剩余 25µs 诊断）**暂缓**，先纠正 key 规模。**第四阶段文档：`第四阶段_node234/README.md`。**
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -8505,7 +8505,8 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 按当前 plain Avg 338.5µs、vseg Avg 371–400µs：20s ≈ **50–60k keys**；本单取 **60,000 keys ×4MiB = 240GiB**（plain 单 target 240G；vseg 每 target 120G）。
 - 两个前提必须先验证，不通过就停：
   1. **NoF segment 容量扩到 512GiB**（当前 100GiB；target bdev 77TB，可能只需注册时改容量，不用重启 target）；
-  2. **`--enable_ha=true --enable_oplog=false`** 可正常发布 vseg quota（60k keys 不能走 oplog）。
+  2. **本单选择 `--enable_ha=true --enable_oplog=false`**，先验证它能正常发布 vseg quota。  
+     说明：关 oplog 是**配置选择**（不把 HA 日志变成 60k 大测试的变量），**不是**断言当前环境 60k 一定会爆；旧 node1/3 的 942MB 不外推。若 A 段验证失败，回退手工 quota 或另议。
 - 先 plain 后 vseg，各 **1 遍** 读（60k samples）；验收 parity（vseg P50 ≤ plain×1.05）。
 
 ## A. 容量 / oplog 可行性（不写 60k）
@@ -8545,7 +8546,7 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 ## E. 边界
 
 - **必须先过 A**；512G/256G 都失败就停手，不写 60k。
-- `enable_oplog=false` 必须；若 etcd/oplog 仍增长或 auto_plan 失败，停手回报。
+- oplog off 是本单的配置选择；若 A 段 auto_plan/quota 失败，停手回报，回退手工 quota 或另议；**不擅自开 oplog 写 60k**。
 - 不重启 target；不改码/不重编/不装包；只写 60k 数据（plain 240G + vseg 240G，顺序覆盖）。
 - 容量：target 512G/segment；plain 240G、vseg 120G/target；extent 50G → 约 3 个 vsegment，per target 150G，留余量。
 - 单遍读 60k，不再加第 2 遍（用户要单遍 20s）；若时长明显 <15s 或 >30s，记录实际值，不调整 key 数重跑。
