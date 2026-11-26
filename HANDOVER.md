@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-131（vsegment vs plain 客户端分段拆解：同环境、diag on、各 3 轮；找 3–4% 差距落在哪一段；零改码/零拓扑变更；2026-11-26）**。背景：同环境 vseg/plain **P50 1.034× / Avg 1.044× / P90 1.030×**（P99 1.393×），都在 1.05 内；但 vseg spread 12.7%/11.1%/10.2% >10%，按方法同环境这对**不进正式表**，只作诊断；正式结果仍为 NOF-127（1.034×/1.040×/1.046×/1.371×）。target W9 vsegment 39.6µs vs plain 47.6µs（vseg 每 IO 更快）⇒ 差距在客户端聚合/两跳。本单拆 query/resolve/prepare/submit/completion_wait + 两 child 完成差；若落在 completion_wait/child 差，当前约束下无合法旋钮；若落在 submit/prepare，再试 node2 绑核/governor。环境 `plain_nof130` 运行（Keys=60000）。
+- 当前任务：**NOF-132（任务拆分/lane 矩阵：A plain/q4；B vseg member=1 stripe=4M/q4；C member=1 stripe=2M/q4；D member=1 stripe=2M/q1；60k、每组 4 轮；2026-11-26）**。目的：用 **member=1（只 target B）** 拿掉“跨 target”，只比“4MiB 是否拆成两个 child task”（B vs C）和“两个 task 是否共用 lane”（C vs D），验证剩余 3–4% 是否来自客户端 task/lane。**替代 NOF-131**（若已启动停掉，其数据作废）。背景：NOF-130 同环境 vseg/plain P50 1.034×；target W9 vsegment 39.6µs vs plain 47.6µs（vseg 每 IO 更快）⇒ 差距在客户端；正式结果仍为 NOF-127。不改码/不重启 target/etcd；member=1/stripe=4M 仅本诊断。环境 `plain_nof130` 运行（Keys=60000）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -9585,3 +9585,65 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 不改码/不重编/不装包/不重启 target/etcd；不改 stripe/member_count/extent。
 - 每轮一遍 60k≈20s，禁止 duration；diag on 只作归因。
 - 3+3 轮；失败停手；不补写；预计 20–30 分钟。
+
+---
+
+# NOF-132（待执行 · 任务拆分 / lane 矩阵 · plain vs vseg member=1 三配置 · 2026-11-26）
+
+## 目标
+
+- 用 **member_count=1（只 target B）** 拿掉“跨 target”变量，单独验证 vsegment 剩余的 3–4% 是否来自：
+  - 4MiB get 被拆成两个 child task（stripe=4MiB vs 2MiB）；
+  - 两个 task 是否共用 lane（qpairs=4 vs 1）。
+- 四组：A plain（基线）；B vseg member=1/stripe=4MiB/qpairs=4；C vseg member=1/stripe=2MiB/qpairs=4；D vseg member=1/stripe=2MiB/qpairs=1。
+- **本单替代 NOF-131**；若 NOF-131 已启动，停掉，其数据作废。
+- 不改码/不重启 target/etcd；member=1 与 stripe=4MiB **仅用于本诊断**，不改正式 2-member 配置。
+
+## 共同条件
+
+- 60,000 keys × 4MiB；T1（threads=1/batch=1）；warmup=128；qpairs 按组；verify=false；diag 关；sequential；每轮一遍 60k≈20s。
+- target 只用 **target B（node4，UUID 50d6259e…）**；target A 不动；master+etcd node4；etcd 64MiB。
+- 每组新 cluster、重写 60k；写后验收 Keys=60000；不补写；每组 4 轮读。
+- 组顺序 A→B→C→D；每组停上一 master、起新 master、注册 target B 512GiB（vseg 只注册 B）。
+- vseg extent=274877906944（256GiB/member），logical=256GiB，vsegments=1；plain 单 target B。
+
+## A. plain（qpairs=4）
+
+- `plain_nof132a`：注册 B 512GiB；写 60k（16t/batch16）；读 4 轮（60k、qpairs=4）。
+- 记录每轮 Avg/P50/P90/P99、failed、墙钟、target B W9avg/n。
+
+## B. vseg member=1 / stripe=4MiB / qpairs=4
+
+- `vseg_nof132b`：`member_count=1 / stripe=4MiB / extent=256GiB / qpairs=4`；注册 B 512GiB；写 60k（T1/batch1、`--num_keys=60000`，只有一个 segment）；读 4 轮（qpairs=4）。
+- 验收 vsegments=1、logical_capacity=274877906944；确认 4MiB key 只生成 1 个 child task（日志/probe）。
+
+## C. vseg member=1 / stripe=2MiB / qpairs=4
+
+- `vseg_nof132c`：`member_count=1 / stripe=2MiB / extent=256GiB / qpairs=4`；注册 B；写 60k；读 4 轮。
+- 确认 4MiB key 生成 **2 个 child task**（均落 target B）。
+
+## D. vseg member=1 / stripe=2MiB / qpairs=1
+
+- `vseg_nof132d`：`member_count=1 / stripe=2MiB / extent=256GiB / qpairs=1`；注册 B；写 60k；读 4 轮。
+- 确认 qpairs=1 生效（日志 `NoF qpairs/segment`），两个 child task 共用 1 条 lane。
+
+## E. 交付
+
+1. 四组聚合表（µs；按 2026-11-12 方法：Avg=各轮均值、分位=各轮同分位中位）：
+   `组 | 配置 | 轮数 | Avg | P50 | P90 | P99 | spread`。
+2. 逐轮原始值落盘 `run/nof132_rounds.csv`，正文不逐轮罗列。
+3. 对比与判读：
+   - **B vs C**：4MiB 单 task vs 2×2MiB 双 task（同 qpairs=4）⇒ 拆 task 的成本；
+   - **C vs D**：双 task 不同 lane vs 同一 lane ⇒ lane 争用的成本；
+   - **A vs B**：单 task 的 vsegment 是否接近 plain；
+   - 若 B≈A、C>B、D>C ⇒ 拆 task + 同 lane 是主因；
+   - 若 B/C/D 相近 ⇒ 不是 task/lane，另找。
+4. 配置自证：vsegments=1、extent、stripe、qpairs、child 数；target W9；环境末态。
+5. 不报吞吐；不追 P99/Max；不改正式配置。
+
+## F. 边界
+
+- 不改码/不重编/不装包/不重启 target/etcd；只停/起 master 和 bench。
+- 只 target B；target A 不动；member=1 与 stripe=4MiB 仅本诊断。
+- 每组 4 轮；每轮一遍 60k≈20s，禁止 duration；不补写；失败停手。
+- 预计 **25–35 分钟**（4 组写 + 16 轮读 + 切换）。
