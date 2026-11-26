@@ -69,7 +69,7 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 | target B（node4） | PID 2142228（11-25 15:20:22 起）；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `0470fe3a…`；11/11、strip 256KiB、nsid1、4457；ERROR 6 条（历史 pci_event socket read error 105） |
 | master | `vseg_nof116` 运行中（2360608/2360611）；Keys=400；2 个 segment；quota generation=1、member_count=2、extent=50GiB、logical_capacity=100GiB |
 | node2 | 无 bench/register 残留 |
-| 当前任务 | **NOF-117：vseg 只读，chunk 128K vs 64K，3 遍交替，看能否到 parity** |
+| 当前任务 | **待裁决 NOF-117 后续：接受 1.08–1.10 近 parity / 查剩余 ~25µs / 改码** |
 
 ---
 
@@ -128,16 +128,20 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - 双 target 把单 target 的 **2.03×** 压到约 **1.1×**，但**未达 parity（≤1.05×）**。
 - 两个 target 写 n=6400/6402、读 n≈8450，均分；`type` 全 vsegment。
 
-### 当前 NOF-117（只读，零写/零重启）
+### NOF-117（已完成，未达 parity）
 
-- 现有 `vseg_nof116` 数据只读；不重启 master/target。
-- reader：`--num_keys=200`（每 segment，共 400 queries）、T1、warmup=128、qpairs=4、verify=false、diag 关。
-- 6 遍交替：chunk 128KiB / 64KiB / 128K / 64K / 128K / 64K。
-  - 128KiB：每 child 16 个子 IO，每 target 16 IO/key；
-  - 64KiB：每 child 32 个子 IO，每 target 32 IO/key（与 plain 的每 target 32 IO 对齐）。
-- 验收：vseg@64K 是否 ≤ plain×1.05 ≈ **279.7µs**。
-- 若 64K 明显改善但未到 parity，可再试 32K；若不变，停止调 chunk，转第三 target 或 target 侧 W9 trace。
-- 边界：零写、不改码、不重启 target。
+| 项 | vseg@128K | vseg@64K | plain@128K |
+|---|---|---|---|
+| P50 均值 | 293.90 | **286.91（−2.38%）** | 266.36 |
+| P50 中位 | 291.37 | 293.91（+0.9%） | 266.49 |
+| Avg / P90 | 392.48 / 537.46 | 371.10 / 508.84（−5.4% / −5.3%） | 338.51 / ~567 |
+| target W9 | 157.58 | **130.50（−17.2%）** | 120.33 |
+| 每 target n | ~8,449 | ~16,897 | 16,898 |
+
+- vseg@64K / plain：P50 均值 **1.077×**、中位约 **1.10×**；单遍 272.27（1.022×）达线，另两遍 294 未达。
+- **target W9 明显改善，但 P50 不动** ⇒ 队列深度/每 target IO 数不是 P50 剩余差距的主因，停止调 chunk。
+- 剩余 ~25µs 不在 target 单 IO 执行段；更可能在客户端两 child 聚合/等待、两跳网络差异、或 64K 带来的客户端开销翻倍。
+- 当前待裁决：A 接受 1.08–1.10 近 parity；B 零写查剩余 ~25µs（diag/child timing）；C 改码或第三 target（均不轻）。
 
 ---
 
