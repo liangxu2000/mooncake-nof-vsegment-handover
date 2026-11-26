@@ -67,10 +67,10 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 |---|---|
 | target A（node3） | **正常**：PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR |
 | target B（node4） | **已重建**：PID 2458315；NQN `...urma-gpu-test`、SN `URMAGPU0001`；**新 UUID 50d6259e-51a6-4599-adf3-68defc0c5a53**；RAID0 strip 256K、online 11/11、4457、ERROR=0 |
-| master | **残留 `vseg_nof132d` 2484180/2484183**（enabled=0、未注册、无数据）；NOF-133 将停它并重跑 A/B/C/D |
-| etcd | 2455814；`--max-request-bytes=67108864`；NOF-132 期间未重启 |
+| master | **`vseg_nof133d` 2491062/2491065 运行中**：Keys=60000、enabled=1、vsegments=1；NOF-134 将停它 |
+| etcd | 2455814；`--max-request-bytes=67108864`；dbSize 1531.26MiB、raftIndex 1,783,020 |
 | node2 | 无 bench/register 残留；客户端 md5 bb4a07a3…（未重编） |
-| 当前任务 | **NOF-133（NOF-132 修正重跑：先注册→等 enabled=1→写→读；A/B/C/D 四组各 4 轮）** |
+| 当前任务 | **NOF-134（正式 2-member：qpairs=4 vs qpairs=1 + plain 同会话；60k、4+4+4 轮）** |
 | 风险 | node4 非独占：外部用户 `computin` 16:20–16:50 多次登录；本次重建后未被清；若再次清场/资源争用，停手回报 |
 
 ---
@@ -354,6 +354,22 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - 两臂 spread >3%；**vsegment >10% ⇒ 按方法不进正式表**；同环境比值 1.034/1.044/1.030 **与 NOF-127 一致**，作为佐证，不替换正式表。
 - 不盲目补测到 spread ≤10%；若要正式同环境格，先做 node2 稳定化再重跑。
 - 不单独立项查“plain target W9 更慢”：vsegment 每 IO 已更快，target 不能解释 vsegment 端到端更慢。
+
+### NOF-133 矩阵结果（2026-11-26，member=1，task/lane 四组）
+
+| 组 | 配置 | Avg | P50 | P90 | P99 | P50 spread | W9 |
+|---|---|---|---|---|---|---|---|
+| A | plain/q4 | 258.30 | 255.99 | 263.90 | 276.31 | 8.1% | 46,920ns |
+| B | vseg m=1 / 4M / q4 | 264.69 | 261.63 | 270.31 | 282.40 | 4.1% | 47,845ns |
+| C | vseg m=1 / 2M / q4 | 346.87 | 270.01 | 499.33 | 635.78 | 2.9% | 60,202ns |
+| D | vseg m=1 / 2M / q1 | 263.26 | 259.88 | 268.69 | 284.62 | 3.5% | 44,922ns |
+
+- **B→C**：P50 1.032×、P90 1.847×、P99 2.251× ⇒ 拆 2 child 的成本主要在尾部。
+- **C→D**：P50 0.962×、P90 0.538×、P99 0.448× ⇒ q1 全面更快，**“同 lane 争用”不成立**。
+- **A→B**：P50 1.022×、P99 1.022×；**A→D**：P50 1.015×、P99 1.030× ⇒ 单 task 和双 task+q1 都在 plain 1.05 内。
+- **A→C**：P50 1.055×、P99 2.301× ⇒ 双 task+q4 不达。
+- child 数 probe [未获取]；按配置/代码 B=1 child、C/D=2 child（仅语义）。
+- 结论：正式 2-member 下值得试 **qpairs=1**；下发 NOF-134。
 
 ---
 

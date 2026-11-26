@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-133（NOF-132 修正重跑：A plain/q4；B vseg member=1 stripe=4M/q4；C member=1 stripe=2M/q4；D member=1 stripe=2M/q1；60k、每组 4 轮；2026-11-26）**。背景：NOF-132 因脚本把“等 quota”放在“注册 target B”之前，B 组写 0 keys、读全失败；A 有效、C 无读、D 未跑。本单修正为**先注册 → 等 enabled=1 → 写 → 读**，写失败立即中止整组；**A/B/C/D 全部重跑**（A 旧数据归档、不作矩阵），停残留 `vseg_nof132d` master 2484180/2484183。目的不变：member=1 拿掉跨 target，只比拆 task（B vs C）与同 lane（C vs D）。不改码/不重启 target/etcd；预计 30–40 分钟。
+- 当前任务：**NOF-134（正式 2-member：qpairs=4 vs qpairs=1 + plain 同会话；60k、4+4+4 轮；2026-11-26）**。背景：NOF-133 矩阵——单 task（B）P50 1.022× plain、双 task+q1（D）1.015×/P99 1.030× 均在 1.05 内；双 task+q4（C）P50 1.055×、P99 2.301×，拆 task 成本主要在尾部，q1 反而全面更快，“同 lane 争用”不成立。本单在**正式 2-member** 配置下只改 qpairs（4 vs 1），加 plain 同会话基线，验证 q1 是否把 P50/P90/P99 拉进 1.05；若有效则正式配置改用 q1，否则 3.4% 结构性收口。停 `vseg_nof133d`；不改码/不改 member/stripe/拓扑；预计 25–35 分钟。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -9712,3 +9712,80 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 只 target B；target A 不动；member=1/stripe=4M 仅本诊断。
 - 每组 4 轮；每轮一遍 60k≈20s，禁止 duration；写失败立即停手；不补写。
 - 预计 **30–40 分钟**。
+
+---
+
+## NOF-133 裁决（2026-11-26 · 四组跑通；q1 反而更快；拆 task 成本在尾部）
+
+### 1. 结果（[事实]；16/16 轮 failed=0，四组 Keys=60000）
+
+| 组 | 配置 | Avg | P50 | P90 | P99 | P50 spread | target B W9 |
+|---|---|---|---|---|---|---|---|
+| A | plain / q4 | 258.30 | 255.99 | 263.90 | 276.31 | 8.1% | 46,920ns（4.9%） |
+| B | vseg m=1 / stripe=4M / q4 | 264.69 | 261.63 | 270.31 | 282.40 | 4.1% | 47,845ns（0.2%） |
+| C | vseg m=1 / stripe=2M / q4 | 346.87 | 270.01 | 499.33 | 635.78 | 2.9% | 60,202ns（10.7%） |
+| D | vseg m=1 / stripe=2M / q1 | 263.26 | 259.88 | 268.69 | 284.62 | 3.5% | 44,922ns（1.5%） |
+
+- **B→C（拆 2 child，同 q4）**：P50 1.032×、P90 1.847×、P99 2.251×、Avg 1.310× ⇒ **拆 task 的成本几乎全在尾部**；C 的 target W9 也最高（60.2µs）。
+- **C→D（同 lane q1）**：P50 0.962×、P90 0.538×、P99 0.448×、Avg 0.759× ⇒ **q1 全面更快；“同 lane 争用”假说不成立**；q1 的 target W9 44.9µs，低于 q4 的 60.2µs。
+- **A→B（单 task vseg vs plain）**：P50 1.022×、P90 1.024×、P99 1.022× ⇒ 单 task vsegment 已接近 plain。
+- **A→D（双 task + q1 vs plain）**：Avg 1.019×、P50 1.015×、P90 1.018×、P99 1.030× ⇒ **四项全部 ≤1.05**。
+- **A→C（双 task + q4 vs plain）**：P50 1.055×、P99 2.301× ⇒ 不达。
+- **B→D**：P50 0.993×、P99 1.008× ⇒ 4M/q4 与 2M/q1 在 P50/P99 上等价。
+- child 数 probe [未获取]（debug 无输出）；按代码/配置 B=1 child、C/D=2 child，仅作语义说明，不当实测。
+- A 组双峰：p1/p2≈246µs、p3/p4≈265µs，spread 8.1%；跨组比较注意时间漂移。
+
+### 2. 判读
+
+1. **单 task vsegment（B）≈ plain**（P50 +2.2%）；**双 task + q1（D）也 ≈ plain**（P50 +1.5%，P99 +3.0%）；**双 task + q4（C）尾部爆炸**（P99 2.3×）。
+2. 所以当前正式 2-member 的剩余 3.4% 不是“跨 target”本身，也不是“拆成两个 task”必然带来的 P50 成本；**q4 下两 child 的并发/队列形态**是尾部恶化的关键，q1 可以消掉。
+3. C 的 P99 636µs vs 2-member 正式配置 NOF-129 的 383µs：C 是两个 child 落**同一个 target**，正式是各落一个 target；[推算] 同 target 队列放大，本单未验证。
+4. 正式 2-member + qpairs=1 是**唯一还没试、且合法的旋钮**（不改码、不改 member/stripe/拓扑）；需要同会话验证它是否把正式配置的 P50/P99 拉进 1.05。
+
+### 3. 决策
+
+- **下发 NOF-134**：正式 2-member（stripe=2M、extent=256G）下 **qpairs=4 vs qpairs=1**，加 plain 同会话基线；各 4 轮。若 q1 使 P50/P90/P99 都 ≤ plain×1.05 且优于 q4 ⇒ 正式配置改用 q1；否则 3.4% 属结构性，收口。
+- 停 `vseg_nof133d` master 2491062/2491065；target A/B、etcd 不动。
+- 不单独立项查 child 计数（[未获取]，代码/配置语义足够）；不单独立项查 C 的 636µs（NOF-134 的 q4/q1 同会话数据可回答方向）。
+
+### 4. 环境末态
+
+- `vseg_nof133d` master 2491062/2491065：Keys=60000、enabled=1、vsegments=1、logical_capacity=274877906944。
+- etcd 2455814：dbSize 1531.26MiB、raftIndex 1,783,020；target B 2458315 online 11/11、ERROR=0；target A 3329243 未动；node2 无 bench。
+- 未改码/未重编/未装包/未重启 target/etcd；NOF-132 旧产物已归档 `run/nof132_partial/`。
+
+---
+
+# NOF-134（待执行 · 正式 2-member：qpairs=4 vs qpairs=1 + plain 同会话 · 60k · 4+4+4 轮 · 2026-11-26）
+
+## 目标
+
+- 在**正式 2-member 配置**（member_count=2、stripe=2MiB、extent=256GiB、一整块 vsegment）下，验证 **qpairs=1** 是否能把 P50/P90/P99 拉进 plain×1.05，且优于 qpairs=4。
+- 三组同会话：P plain/q4；V4 vseg 2-member/q4；V1 vseg 2-member/q1；各 60k、4 轮。
+- 不改码/不改 member/stripe/拓扑；只改 qpairs。
+
+## A. 清理
+
+1. 停 `vseg_nof133d` master 2491062/2491065；检查无 `nof133` 残留；释放 50056/9006/8086。
+2. target A/B、etcd 2455814 不动；node2 无残留。
+
+## B. 三组（顺序 P→V4→V1）
+
+- **P**：`plain_nof134p`，qpairs=4；注册 B 512GiB；写 60k（16t/batch16）；读 4 轮（60k、T1、warmup128、qpairs4、verify=false、diag 关）。
+- **V4**：`vseg_nof134v4`，member_count=2 / stripe=2MiB / extent=256GiB / qpairs=4；注册 B→A 各 512GiB；先注册后等 enabled=1；写 60k（T1/batch1、`--num_keys=30000`/segment）；读 4 轮（qpairs4、60k queries）。
+- **V1**：`vseg_nof134v1`，同 V4 但 **qpairs=1**；注册 B→A；等 enabled=1；写 60k；读 4 轮（qpairs1）。
+- 每组新 cluster；写失败立即中止整组；每轮记录 Avg/P50/P90/P99、failed、墙钟、target A/B W9/n；qpairs 用客户端日志自证。
+
+## C. 交付
+
+1. 三组聚合表（2026-11-12 方法：Avg=各轮均值、分位=各轮同分位中位）+ spread；逐轮 CSV 落盘，正文不逐轮罗列。
+2. 对比：V1 vs V4（q1 效果）；V4/V1 vs P（parity）；P50/P90/P99 全部给出。
+3. 判读：若 V1 的 P50/P90/P99 均 ≤P×1.05 且优于 V4 ⇒ 正式配置采用 q1；否则 q1 无效，3.4% 结构性，收口。
+4. 配置自证、target W9、环境末态。
+
+## D. 边界
+
+- 不改码/不重编/不装包/不重启 target/etcd；只 stop/start master 与 bench。
+- 正式 2-member 配置不变（member=2、stripe=2M、extent=256G）；只改 qpairs。
+- 每组 4 轮；每轮一遍 60k≈20s，禁止 duration；不补写；失败停手。
+- 预计 **25–35 分钟**。
