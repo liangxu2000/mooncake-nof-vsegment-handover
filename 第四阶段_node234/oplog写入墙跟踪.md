@@ -140,14 +140,14 @@
 - etcd 启动失败/数据异常：恢复原参数重启，停手回报；
 - 64MiB 仍被拒：停手，附 etcd flag/错误原文；下一步才考虑改码（拆分/省略 full-state）或退回 20k。
 
-### 5.3 下一单候选（未下发，等 NOF-123 回执）
+### 5.3 下一单候选（2026-11-26 已下发为 NOF-125）
 
-**一整块 vsegment**：`member_extent_size=128GiB`（逻辑 256GiB），60k/240GiB 全部装进 1 个 vsegment。
+**一整块 vsegment**：`member_extent_size=256GiB`（逻辑 512GiB），60k/234.375GiB 全部装进 1 个 vsegment。
 
 - 依据（L2 假说）：当前 50GiB×2=100GiB/vsegment，25,600 keys 填满，第 25,601 个 key 触发第 2 个 vsegment 创建；full-state checkpoint 恰在此时出现（25,632 keys/13.3MB）。
 - 一整块 = 不再创建第 2 个 vsegment ⇒ 写入过程中不触发这次 full-state；初始 checkpoint（0 keys）很小，后续都是 delta。
-- **只解决写入过程**：master 重启/恢复仍会做一次 full-state（60k≈31MB），etcd 默认 2MiB 仍不够 ⇒ 恢复/HA 仍需 etcd 64MiB 或改码。
-- 变量隔离：如果先在一整块上测试，可保持 etcd 默认 2MiB，避免“extent + etcd”两个变量混在一起；NOF-123 先验证 etcd 64MiB + 50G。
+- 为什么是 256GiB 而不是 128GiB：128GiB/member（逻辑 256GiB）也够装 234.375GiB，但只剩 9% 余量；当前每 target 已注册 512GiB，256GiB/member 留一半余量且无需扩大注册（再大才要扩 segment 注册，对 60k 无收益）。
+- **只解决写入过程**：master 重启/恢复仍会做一次 full-state（60k≈31MB），etcd 默认 2MiB 仍不够 ⇒ 恢复/HA 仍需 etcd 64MiB 或改码；NOF-125 保持 etcd 64MiB 不动（本次不隔离该变量）。
 
 ---
 
@@ -201,7 +201,7 @@
 - vseg 69 个缺失 key（type unknown、1× `-704 OBJECT_NOT_FOUND`）可能污染尾部（Max 57.8ms 很可能是一次失败查找）；**在补齐或剔除失败样本前，不能把尾部差距归因 vseg 路径**。
 - `logical_capacity` 刷新后 300GiB，`logical_used=251,368,833,024=59,931×4MiB` 精确相等 ⇒ NOF-123 的 100GiB 是 gauge 刷新延迟。
 - etcd 64MiB 两阶段 ResourceExhausted 0 ⇒ **写入墙解决**。
-- 当前配置 `extent=50GiB`、3 个 vsegment；未验证“一整块 128GiB”。
+- 当前配置 `extent=50GiB`、3 个 vsegment；一整块 `extent=256GiB` 由 NOF-125 验证中（目标：vsegments 保持 1、无第 2 次 full-state、读 parity 保持）。
 
 ---
 
@@ -237,4 +237,5 @@
 
 - 2026-11-26：建立本文档；记录 NOF-119 A / 120 / 121 / 122；确定根因为 full-state 单条 oplog entry；下发 NOF-123（etcd 64MiB）。
 - 2026-11-26：NOF-123 E1 成功，写入墙解除；NOF-124 P50/Avg/P90 parity 达成，P99/Max 待清洁数据。
-- **遗留**：vseg 69 个缺失 key（0.115%）未回填；P99/Max 未平，暂不归因 vseg 路径；一整块 128GiB 未验证，仅作未来候选。
+- 2026-11-26：NOF-125 下发——一整块 vsegment（extent=256GiB/member、逻辑 512GiB），验证写入期不再出现第 2 个 vsegment 的 full-state，并复核读 parity。
+- **遗留**：vseg 69 个缺失 key（0.115%）未回填；P99/Max 未平，暂不归因 vseg 路径；一整块 256GiB 结果待 NOF-125 回执。

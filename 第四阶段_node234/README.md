@@ -61,15 +61,15 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 
 ---
 
-## 3. 当前环境状态（2026-11-26 NOF-115 后）
+## 3. 当前环境状态（2026-11-26 NOF-125 起）
 
 | 对象 | 状态 |
 |---|---|
 | target A（node3） | PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR、零 IO |
 | target B（node4） | **已重建**：PID 2391418；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `c19b91e1…`；11/11、strip 256KiB、nsid1、4457；0 ERROR |
-| master | NOF-119 A 后 probe master 已停；旧 `vseg_nof116` 因 target B UUID 变已失效；当前无业务 master |
+| master | NOF-124 后 plain `plain_nof124` 2413231/2413234 运行（Keys=60000）；NOF-125 将停 plain、起 `vseg_nof125`（extent=256GiB/member） |
 | node2 | 无 bench/register 残留 |
-| 当前任务 | **无在途任务（NOF-124 完成，P50/Avg/P90 parity 达成；P99/Max 待清洁数据）** |
+| 当前任务 | **NOF-125（一整块 vsegment：extent=256GiB/member、逻辑 512GiB，60k 全装 1 个 vsegment；对比 NOF-124 parity 基线）** |
 
 ---
 
@@ -88,7 +88,7 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 3. **`vsegments=1` 是 quota 发布时预建**，正常；写数据不会新增。
 4. **`logical_used` gauge 1000s 才刷新**；验收以 master `Keys` + writer 日志为准。
 5. child→target 的 endpoint 不在 `nof_slow_task` 里；落点均分用**两个 target 的 IO 计数相等**判断。
-6. `extent` 是**每个 member 在 NoF segment 上的物理 extent**，不是节点 DRAM；当前 50GiB/member → 每个 vsegment 逻辑 100GiB。
+6. `extent` 是**每个 member 在 NoF segment 上的物理 extent**，不是节点 DRAM；NOF-124 基线为 50GiB/member → 每 vsegment 逻辑 100GiB；NOF-125 改为 **256GiB/member → 逻辑 512GiB**（每 target 注册 512GiB，无需扩大）。
 
 ### 4.3 单 target 下的结论（第三阶段，仍有效）
 

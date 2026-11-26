@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**无在途任务（NOF-124 完成，parity 达成 P50/Avg/P90；待用户裁决是否追尾/P99 或推进一整块）**。NOF-124：vseg 59,931 keys 单遍读 vs plain 60k 单遍读；**P50 246.32 vs 255.06µs（0.966×，vseg 快 3.4%）**，Avg 0.983×、P90 0.969×，均 ≤1.05× ⇒ **parity 达成**；target W9avg vseg 40.4 vs plain 44.45µs（0.909×）。**未打平项**：P99 361.82 vs 274.62（1.317×）、Max 57,788 vs 2,444µs（23.6×）；vseg 有 69 个缺失 key（0.115%，type unknown，1× ret=-704 OBJECT_NOT_FOUND），尾部可能被污染，尚不能归因 vseg 路径。**NOF-123 疑点澄清**：`logical_capacity` 现为 300GiB、`logical_used=251,368,833,024` 与 59,931×4MiB 精确相等；此前 100GiB 是 1000s gauge 刷新延迟，不是缺陷。etcd 64MiB 两阶段 ResourceExhausted 均 0，写入墙彻底解决。第四阶段文档：`第四阶段_node234/README.md`；oplog 墙跟踪：`第四阶段_node234/oplog写入墙跟踪.md`。
+- 当前任务：**NOF-125（一整块 vsegment：extent=256GiB/member、逻辑 512GiB，60k×4MiB=251,658,240,000B=234.375GiB 全装 1 个 vsegment；停 plain master、新 cluster `vseg_nof125`、写 60k+读 1 遍；对比 NOF-124 parity 基线；2026-11-26）**。NOF-124 基线：vseg 59,931 keys **P50 246.32µs**、W9avg 40.4µs；plain 60k **255.06µs**、W9 44.45µs；P50/Avg/P90/W9 parity 达成，P99/Max 未平（尾部可能被 69 个缺失 key 污染）。**NOF-123 疑点澄清**：`logical_capacity` 刷新后 300GiB、`logical_used=251,368,833,024=59,931×4MiB`；100GiB 是 gauge 延迟。etcd 64MiB 两阶段 ResourceExhausted 0。**NOF-125 目的**：验证“一整块装下全部数据”是否影响读 parity、能否避免写入期第 2 个 vsegment 的 full-state；只改 extent（50→256GiB），其余不变；不改码/不重启 target/不重启 etcd。**注意：256GiB 是 SSD 上的 NoF extent，不是节点 DRAM；当前每 target 注册 segment 512GiB，256G/member 留一半余量；再大需扩注册，对 60k 无收益。** 第四阶段文档：`第四阶段_node234/README.md`；oplog 墙跟踪：`第四阶段_node234/oplog写入墙跟踪.md`。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -8963,3 +8963,58 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 
 - plain `plain_nof124` 2413231/2413234 运行中（Keys=60000）；etcd 2408033/2408036（64MiB，dbSize 293MiB）；target B 2391418、target A 3329243 未重启；node2/node4 无残留。
 - 未改码/未重编/未装包。
+
+---
+
+# NOF-125（待执行 · 一整块 vsegment：extent=256GiB/member、逻辑 512GiB · 2026-11-26）
+
+## 目标
+
+- 验证“**一整块 vsegment 装下全部 60k 数据**”：`member_extent_size=256GiB`/member（`274877906944`），逻辑容量 512GiB；60k×4MiB=251,658,240,000B（234.375GiB）全部落进 1 个 vsegment。
+- 目的：① 看读 parity 是否保持（对比 NOF-124 50G/3vseg 基线）；② 看写入过程是否不再创建第 2 个 vsegment、不再出现 13–31MB full-state 事务。
+- **256GiB 是每个 member 在 NoF segment 上的物理 extent，不是节点 DRAM**；现有每 target 注册 512GiB，256G/member 留一半余量，无需扩大注册。
+- 只改 extent 这一个变量；不改码、不重编、不重启 target、不重启 etcd。
+
+## A. 停 plain master，起 vseg_nof125
+
+1. 记录并停 plain `plain_nof124` master 2413231/2413234（TERM，必要时 KILL）；备份日志到 run/；确认 50056/9006/8086 释放；target A/B 不动。
+2. etcd 2408033/2408036 **保持原样**（`--max-request-bytes=67108864`，不重启、不改 data-dir）。
+3. 起新 cluster `vseg_nof125`（node4，50056/9006/8086、slot=1、`MC_STORE_PARTITION_SLOT_COUNT=1`、etcd、URMA、HA+oplog on、`--oplog_batch_max_entries=64`，其余参数与 NOF-123 完全相同：`--vsegment_auto_plan=true`、`--cvm_segments_vsegment_exclusive=true`、`member_count=2 / stripe=2MiB / required_medium=nof / reserved_ratio=0 / io_alignment=4096 / submaster_count=1`），**仅把 `--vsegment_member_extent_size` 改为 `274877906944`（256GiB；NOF-123 为 53687091200）**。
+4. 若 etcd 中已存在 `/cvm/vseg_nof125/` 或 `/oplog/vseg_nof125/` 键：两处都删；否则不动。**不删其它 cluster 的键。**
+5. 注册 B→A 各 **512GiB**；等 quota ≥20s；验收：`member_count=2`、**`member_extent_size=274877906944`**、`stripe_size=2097152`、partitions=1、reconcile_fail=0、**`logical_capacity=549755813888`（512GiB）**、vsegments=1；记录配额发布耗时。
+
+## B. 写 60k（T1，同 NOF-123 口径）
+
+1. Writer：`--num_keys=30000`（每 segment，总 60,000）、4MiB、T1/threads=1/batch=1。
+2. 验收：**Keys=60000**、`logical_used=251,658,240,000`（若仍有失败：Keys×4MiB 精确对齐，记录 failed 数与错误码）。
+3. **一整块判据**：写入全程 `vsegments` 保持 **1**；master 日志无 13–31MB 级 full-state 事务（搜 `full_state`/`value_max`）；etcd 无 `ResourceExhausted`；target A/B 写 n 各≈960,000。
+4. 若超过 5 分钟卡在同一 key（wedged）：停手回报，附日志/etcd 证据，不擅自改参数。
+5. **不做补写**（与 NOF-124 同边界）；失败 key 如实记录。
+6. 记录写入总时长、写 P50/Avg/P99、target A/B 写 W9/n。
+
+## C. 读 1 遍（同 NOF-124 vseg 口径）
+
+1. Reader：`--num_keys=30000`（每 segment，共 60,000 queries）、T1/threads=1/batch=1、warmup=128、qpairs=4、verify=false、diag 关；**1 遍**。
+2. 记录：failed、实际读时长、P50/Avg/P90/P99/Max、target A/B 读 W9/n（各≈960,000）。
+
+## D. 判定
+
+1. **parity**：本单 vseg P50 ≤ NOF-124 plain P50 **255.06µs × 1.05 = 267.81µs**；W9avg ≤ plain **44,450ns × 1.05**。与 NOF-124 vseg 基线（P50 246.32 / W9 40.4）并列报比值。
+2. **一整块**：vsegments=1、logical_capacity=512GiB、无第 2 个 vsegment 创建、无大 full-state ⇒ 通过。
+3. 尾部（P99/Max）如实报数，**本单不据此调参、不追长尾**；若本单 60k 无缺失 key，附尾部与 NOF-124 的对照供后续。
+
+## E. 交付
+
+1. master cmdline 关键项（extent 实测值）、注册 B→A 的 segment 数与大小、quota 细节（member_count/extent/stripe/logical_capacity）、发布耗时。
+2. 写入：Keys/logical_used/failed+错误码、vsegments 变化、full-state/ResourceExhausted 计数、写时长、写 P50/Avg/P99、target A/B 写 W9/n。
+3. 读取：failed、时长、P50/Avg/P90/P99/Max、target A/B 读 W9/n。
+4. 比值：vs NOF-124 vseg（P50/W9）、vs plain（parity 判决）。
+5. etcd dbSize；环境末态（master/target/etcd PID）。
+
+## F. 边界
+
+- **不改码/不重编/不装包/不重启 target/不重启 etcd**；只停 plain master、起 vseg master。
+- 不改 member_count/stripe/required_medium/reserved_ratio/io_alignment；只把 extent 50→256GiB。
+- 不删其它 cluster 的 etcd 键；不清 target 数据（新 cluster 从 offset 0 覆盖写）。
+- 单遍读，不跑 T4/T16、不跑 20k；不做补写。
+- 预计 **40–60 分钟**（写 60k 为主）。
