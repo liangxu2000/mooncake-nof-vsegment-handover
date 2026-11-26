@@ -69,7 +69,7 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 | target B（node4） | **已重建**：PID 2391418；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `c19b91e1…`；11/11、strip 256KiB、nsid1、4457；0 ERROR |
 | master | NOF-119 A 后 probe master 已停；旧 `vseg_nof116` 因 target B UUID 变已失效；当前无业务 master |
 | node2 | 无 bench/register 残留 |
-| 当前任务 | **NOF-120：oplog-on 5k vseg 试水，实测当前环境 oplog 增长，决定 60k 是否可行** |
+| 当前任务 | **NOF-121：vseg 补写到 60k 读 1 遍；plain 60k 读 1 遍；验收 parity** |
 
 ---
 
@@ -181,6 +181,29 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - 写 **5,000 keys**（20GiB），实测当前环境 etcd dbSize / data-dir / `/oplog/vseg_nof120/` 增长。
 - 判决：外推 60k oplog + 当前 dbSize <4GiB 且 etcd 盘剩余 >50% ⇒ “oplog on 可支撑 60k”；否则停手，建议编译 quota planner 走 oplog off 或缩小规模。
 - 只写 5k；不写 60k；不重启 target。
+
+### NOF-120 结果（2026-11-26，通过）
+
+| 项 | 实测 |
+|---|---|
+| Keys | 5,000 |
+| etcd dbSize | 13,619,200 B（12.988 MiB） |
+| dbSize 增量 | +8,257,536 B（≈1,651.5 B/key） |
+| `/oplog/vseg_nof120/` | 9,870 keys / 4.68 MiB |
+| 外推 60k 增量 | **≈0.105 GiB** |
+| 文件系统 | 2.7T / used 1.5T / **avail 1.1T**（59%） |
+| vsegments | 1 / 100GiB；create_success=1、failure=0 |
+
+- 判据②“剩余>50%”字面不满足（41%），但 59% 是历史占用，与本测试无关；绝对 1.1TiB，60k 仅 ~0.1GiB ⇒ **按绝对空间判通过**。
+- oplog on 可支撑 60k；不切 oplog off。
+
+### 当前 NOF-121（60k 单遍）
+
+- 复用 `vseg_nof120`（Keys=5000）补写到 **60,000 keys**；`--num_keys=30000`/segment；`VSEGMENT_CREATING` 最多 5 轮；验收 Keys=60000、logical_used=251,658,240,000。
+- vseg 读 **1 遍**（60k queries，T1/warmup128/qpairs4/diag off），约 20–24s；target A/B n≈962,048。
+- 再停 vseg、起 plain `plain_nof121`（512GiB 注册 B），写 60k、读 1 遍，约 20s；target B n≈1,924,096。
+- parity：vseg P50 ≤ plain×1.05；记录实际读时长、W9、etcd 增长。
+- 不重启 target、不改码；master 重启需重注册 512GiB。
 
 ---
 

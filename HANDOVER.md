@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-120（oplog-on 5k vseg 试水：当前环境实测 oplog 增长，不写 60k；2026-11-26）**。NOF-119 A 段完成：**512GiB 注册通过**（两 segment 各 549,755,813,888B，总 1TiB，无需重启 target）；**oplog off 时 vseg quota 不发布**（2 分钟内 enabled=0；同机 oplog on 对照 40s 发布成功）⇒ 按 A 段判据停手，未写 60k。手工 quota 回退不可用（planner 工具未构建、HTTP 404；构建工具另议）。**开发侧决策 (a)：先用正常配置（HA+oplog on）写 5k keys 试水，实测当前环境的 oplog 增长，再决定是否写 60k；不再用 node1/3 旧数据外推。** 环境：target B 已重建（PID 2391418、新 UUID `c19b91e1…`、11/11、0 ERROR）；node4 etcd 2389250；node3 target A 3329243 未动；旧 vseg/plain 数据因 UUID 变已失效，需新 cluster。NOF-118（400-key 剩余 25µs 诊断）**暂缓**。**第四阶段文档：`第四阶段_node234/README.md`。**
+- 当前任务：**NOF-121（60k keys 单遍 ~20s：vseg 先复用 `vseg_nof120` 的 5k 数据补写到 60k 并读 1 遍；再 plain 60k 读 1 遍；oplog on；2026-11-26）**。NOF-120 完成：oplog-on 写 5k keys 后，etcd dbSize **12.99MiB**、`/oplog/vseg_nof120/` **9870 keys/4.68MiB**；dbSize 增量 **+8,257,536B ≈ 1651.5B/key**，线性外推 60k **≈0.105GiB**；文件系统 **可用 1.1TiB**（used 59% 是历史占用）。**判据②的“剩余>50%”按绝对空间判通过**（0.105GiB vs 1.1TiB，约 1 万倍余量）；59% 与本测试无关。环境：master `vseg_nof120` 2396324/2396327 运行中、Keys=5000、2 segments 各 512GiB、vsegments=1；target B 2391418、target A 3329243；数据 target A/B 各 10GiB。NOF-121 不需要重启 master，直接补写；`--num_keys=30000`（每 segment）→ 总 60k；会首次触发 `VSEGMENT_CREATING`（重试路径未验证，最多 5 轮）。**第四阶段文档：`第四阶段_node234/README.md`。**
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -8626,3 +8626,75 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 数据会覆盖旧目标区域；目标 B UUID 已变，旧数据本来已失效。
 - 若 quota/写入失败或 etcd 明显异常，立即停止并记录。
 - 预计 **10–15 分钟**。
+
+---
+
+## NOF-120 裁决（2026-11-26 · 回执已收，通过）
+
+### 1. 结果（[事实]，当前环境）
+
+| 项 | 实测（13:45 / 13:50 复核一致） |
+|---|---|
+| Keys | 5,000 |
+| etcd dbSize | 13,619,200 B（12.988 MiB） |
+| dbSize 相对写前增量 | +8,257,536 B（≈1,651.5 B/key） |
+| `/oplog/vseg_nof120/` | 9,870 keys / 4,910,154 B（4.68 MiB） |
+| 外推 60k dbSize 增量 | **≈0.105 GiB** |
+| 文件系统 | size 2.7T / used 1.5T / **avail 1.1T**（use 59%） |
+| vsegments / logical_capacity | 1 / 100GiB；create_success=1、failure=0 |
+| 驱逐 | 0/0，keys=0 |
+
+- 5k 写入成功，环境稳定；`logical_used` gauge 仍 0（1000s 刷新），以 Keys 为准。
+- target A/B 各 10GiB 数据；target B/A、etcd、master 均未重启。
+
+### 2. 判据裁定
+
+- 判据①“外推 60k dbSize <4GiB”：**通过**（0.105GiB，38× 余量）。
+- 判据②“etcd 文件系统剩余 >50%”：字面不满足（剩 41%）。但 **59% used 是长期历史占用，与本测试无关**；绝对可用 **1.1TiB**，60k 仅需 ~0.1GiB（约万分之一）。**按绝对空间判通过**，不再用 50% 这个任意阈值。
+- 结论：**oplog on 可以支撑 60k**；继续 NOF-121。
+
+### 3. 下一步
+
+**NOF-121**：vseg 先复用当前 5k 数据补写到 60k 并读 1 遍；再 plain 60k 读 1 遍；各约 20s；验收 parity。
+
+---
+
+# NOF-121（待执行 · 60k keys 单遍 ~20s：vseg + plain · oplog on · 2026-11-26）
+
+## 目标
+
+- 在 NOF-120 的 `vseg_nof120`（Keys=5000、2×512GiB segment、vsegments=1）基础上，把 vseg 补写到 **60,000 keys（240GiB）**，读 **1 遍**（约 20–24s）。
+- 再切 plain master，写 **60,000 keys**（240GiB，node4 单 target），读 **1 遍**（约 20s）。
+- 对比 P50/W9，验收 parity（vseg ≤ plain×1.05）。
+
+## A. Vseg 60k（当前 master 直接复用）
+
+1. 预检：`vseg_nof120` 运行、Keys=5000、2 segments 各 512GiB、vsegments=1、quota 100GiB、reconcile_fail=0；target A/B 运行。
+2. Writer：`--num_keys=30000`（每 segment 30000，总 60,000）、T1/batch1、4MiB；已有 keys 0–4999 会被拒（计入 succeeded），实际新增 55,000；`VSEGMENT_CREATING` 最多重试 **5 轮**（60k 会跨约 3 个 vsegment）。
+3. 验收：**Keys=60000**、`logical_used=251,658,240,000`；target A/B 写窗口各≈960,000（5k 已有 80k + 新 55k×16=880k）。若 Keys≠60000 或 vsegment 创建失败 5 轮，停手回报。
+4. Reader：**1 遍**，`--num_keys=30000`（每 segment，共 60,000 queries）、T1、warmup=128、qpairs=4、verify=false、diag 关；记录实际读时长、P50/Avg/P90/P99、failed、target A/B W9/n（各≈962,048）。
+5. 记录 etcd dbSize / `/oplog/vseg_nof120/` 增长（供后续参考）。
+
+## B. Plain 60k（node4 单 target）
+
+1. 停 `vseg_nof120` master（记录 PID/退出码）；target B 不动；起 plain master `plain_nof121`（50056/9006/8086、slot=1、etcd、URMA、HA+oplog on）；注册 target B，容量 **512GiB**。
+2. Writer：60,000 keys×4MiB、16t/batch16；验收 `Keys=60000`、`logical_used=251,658,240,000`；target B 写窗口 n≈1,920,000。
+3. Reader：**1 遍**，60,000 keys、T1、warmup=128、qpairs=4、verify=false、diag 关；记录实际读时长、P50/Avg/P90/P99、failed、target B W9/n（n≈1,924,096）。
+4. 记录 etcd dbSize/oplug 增长（两阶段合计仍在安全区）。
+
+## C. 交付（必答）
+
+1. Vseg：Keys/logical_used、写窗口 A/B n、单遍读实际时长、P50/Avg/P90/P99、W9/n、VSEGMENT_CREATING 次数。
+2. Plain：Keys/logical_used、写窗口 n、单遍读实际时长、P50/Avg/P90/P99、W9/n。
+3. 比值与 parity 判决（vseg P50 / plain P50；W9 同报）。
+4. etcd dbSize/oplog 增长；环境末态。
+5. 若 vseg 读时长明显偏离 20s（<15s 或 >30s），记录实际值，不调 key 数重跑。
+
+## D. 边界
+
+- oplog on（已实测 60k 约 0.1GiB，安全）；不切 oplog off。
+- 不重启 target；不改码/不重编/不装包；master 重启需重注册 512GiB。
+- 先 vseg 后 plain；plain 会覆盖 node4 上 vseg 数据，vseg 已测完。
+- 每臂只读 1 遍；不跑 T4/T16；不跑 1000/20k。
+- 若 60k 写入/读取失败、Keys≠60000、target 掉线，停手回报。
+- 预计 **30–40 分钟**（vseg 补写约 2–3 分钟、读 20–24s；plain 写 ~30s、读 ~20s；master 切换/注册约 10 分钟）。
