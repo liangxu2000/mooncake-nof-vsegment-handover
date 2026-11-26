@@ -1,7 +1,7 @@
 # 大数据写入的 oplog 墙：跟踪记录
 
 - 开始日期：2026-11-26
-- 状态：**NOF-123 E1 成功；写入墙已解除**（etcd 64MiB + extent=50GiB；vseg 59,931/60,000；读臂/plain 由 NOF-124 执行）
+- 状态：**写入墙已解除；NOF-124 parity 达成（P50/Avg/P90）**（etcd 64MiB + extent=50GiB；vseg 59,931/60,000；P50 0.966×、W9 0.909×；P99/Max 未平，尾部待清洁数据）
 - 一句话：目标 **60,000 keys（240GiB）**，在 **25.6k keys（约 100GiB）** 撞上 etcd 单事务上限；不是总空间，不是批条数，而是 **vsegment full-state 快照作为一条 oplog entry** 太大。
 - 关联任务：NOF-119 A / NOF-120 / NOF-121 / NOF-122 / **NOF-123（当前）**
 
@@ -184,12 +184,24 @@
 - `logical_capacity` gauge 仍 100GiB 而 vsegments=3：展示/quota 统计问题；Keys、target 落盘、create_success 均正常，不阻塞。
 - **结论：2MiB 单事务墙已解除；100GiB 处 vsegment 扩容恢复；写入过程解决。**
 
-### 7.2 待填（NOF-124）
+### 7.2 NOF-124（读臂 + plain parity）
 
-- vseg 读（59,931 keys）P50/Avg/P90/P99、W9、失败数、实际时长：
-- plain 60k 读 P50/W9：
-- parity 比值：
-- 最终配置与遗留风险：
+| 指标 | vseg（59,931 keys） | plain（60,000 keys） | 比值 |
+|---|---|---|---|
+| **P50** | **246.32µs** | **255.06µs** | **0.966×（vseg 快 3.4%）** |
+| Avg | 252.35 | 256.74 | 0.983× |
+| P90 | 255.10 | 263.26 | 0.969× |
+| P99 | 361.82 | 274.62 | 1.317× |
+| Max | 57,788.40 | 2,443.73 | 23.6× |
+| target W9avg | 40,410 / 40,330ns | 44,450ns | 0.909 / 0.907 |
+| 读耗时 | 19s | 20s | — |
+| failed | 69（0.115%） | 0 | — |
+
+- **P50/Avg/P90/W9 达到 parity；P99/Max 未达到。**
+- vseg 69 个缺失 key（type unknown、1× `-704 OBJECT_NOT_FOUND`）可能污染尾部（Max 57.8ms 很可能是一次失败查找）；**在补齐或剔除失败样本前，不能把尾部差距归因 vseg 路径**。
+- `logical_capacity` 刷新后 300GiB，`logical_used=251,368,833,024=59,931×4MiB` 精确相等 ⇒ NOF-123 的 100GiB 是 gauge 刷新延迟。
+- etcd 64MiB 两阶段 ResourceExhausted 0 ⇒ **写入墙解决**。
+- 当前配置 `extent=50GiB`、3 个 vsegment；未验证“一整块 128GiB”。
 
 ---
 
@@ -224,4 +236,5 @@
 ## 10. 变更记录
 
 - 2026-11-26：建立本文档；记录 NOF-119 A / 120 / 121 / 122；确定根因为 full-state 单条 oplog entry；下发 NOF-123（etcd 64MiB）。
-- 待更新：NOF-123 回执、最终解决结论。
+- 2026-11-26：NOF-123 E1 成功，写入墙解除；NOF-124 P50/Avg/P90 parity 达成，P99/Max 待清洁数据。
+- **遗留**：vseg 69 个缺失 key（0.115%）未回填；P99/Max 未平，暂不归因 vseg 路径；一整块 128GiB 未验证，仅作未来候选。

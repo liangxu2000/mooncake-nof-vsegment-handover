@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-124（接受 vseg 59,931 keys 直接读 1 遍 + plain 60k 写/读 1 遍 + parity；2026-11-26）**。NOF-123 E1 **成功**：etcd `--max-request-bytes=67108864` 生效；13.3MB full-state 落盘（etcd `value_max=13,284,282B`），**ResourceExhausted 12,588→0**；vsegments **1→3**、create_success **1→3**；写 59,931/60,000（69 failed：`-1401 TASK_PENDING_LIMIT_EXCEEDED`×67、-105×2、CREATING×4，均为客户端 pending 上限/瞬态，非数据问题）。`logical_capacity` 仍显示 100GiB，但 Keys=59,931、target 实际落盘，判定为 quota/gauge 展示问题，不阻塞。**决策**：69/60,000=0.115%，不影响 P50/W9；**不重跑全量覆盖写**（10–12 分钟），直接用 59,931 读；plain 60k 照常写读。**下一单候选（未下发）**：extent=128GiB 一整块（逻辑 256GiB），60k 全装 1 个 vsegment，避免写入期 full-state；重启/恢复仍需 etcd 64MiB。第四阶段文档：`第四阶段_node234/README.md`；oplog 墙跟踪：`第四阶段_node234/oplog写入墙跟踪.md`。
+- 当前任务：**无在途任务（NOF-124 完成，parity 达成 P50/Avg/P90；待用户裁决是否追尾/P99 或推进一整块）**。NOF-124：vseg 59,931 keys 单遍读 vs plain 60k 单遍读；**P50 246.32 vs 255.06µs（0.966×，vseg 快 3.4%）**，Avg 0.983×、P90 0.969×，均 ≤1.05× ⇒ **parity 达成**；target W9avg vseg 40.4 vs plain 44.45µs（0.909×）。**未打平项**：P99 361.82 vs 274.62（1.317×）、Max 57,788 vs 2,444µs（23.6×）；vseg 有 69 个缺失 key（0.115%，type unknown，1× ret=-704 OBJECT_NOT_FOUND），尾部可能被污染，尚不能归因 vseg 路径。**NOF-123 疑点澄清**：`logical_capacity` 现为 300GiB、`logical_used=251,368,833,024` 与 59,931×4MiB 精确相等；此前 100GiB 是 1000s gauge 刷新延迟，不是缺陷。etcd 64MiB 两阶段 ResourceExhausted 均 0，写入墙彻底解决。第四阶段文档：`第四阶段_node234/README.md`；oplog 墙跟踪：`第四阶段_node234/oplog写入墙跟踪.md`。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -8922,3 +8922,44 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 只读 vseg；plain 写 60k；不跑 T4/T16、不跑 20k；不改码/不重启 target。
 - 若 vseg read 无统计/中止，停手；不要在本单改数据。
 - 预计 **20–30 分钟**。
+
+---
+
+## NOF-124 裁决（2026-11-26 · parity 达成）
+
+### 1. 结果（[事实]）
+
+| 指标 | vseg（59,931 keys） | plain（60,000 keys） | 比值 vseg/plain | 判据 ≤1.05 |
+|---|---|---|---|---|
+| **P50** | **246.32µs** | **255.06µs** | **0.966×** | ✅ |
+| Avg | 252.35 | 256.74 | 0.983× | ✅ |
+| P90 | 255.10 | 263.26 | 0.969× | ✅ |
+| P99 | 361.82 | 274.62 | 1.317× | ✗ |
+| Max | 57,788.40 | 2,443.73 | 23.6× | ✗ |
+| Min | 81.45 | 242.03 | 0.336× | — |
+| target W9avg | 40,410 / 40,330ns | 44,450ns | 0.909 / 0.907 | ✅ |
+| 读耗时 | 19s | 20s | — | ✅ |
+| failed | 69（0.115%） | 0 | — | — |
+
+- 演进：NOF-116（400 keys）1.215× → NOF-124（60k keys）**0.966×**，跨过 parity。
+- `logical_capacity` 刷新后 **300GiB**，`logical_used=251,368,833,024 = 59,931×4MiB` 精确相等 ⇒ NOF-123 的 100GiB 只是 gauge 刷新延迟，不是功能缺陷。
+- etcd 64MiB 全程保持；两阶段 ResourceExhausted 均为 0 ⇒ 写入墙彻底解决。
+- vseg 的 69 个缺失 key：type unknown、1× `ret=-704`（OBJECT_NOT_FOUND）；按边界未回填。
+
+### 2. 判读边界
+
+- **P50/Avg/P90/W9 达到 parity，P99/Max 未达到。**
+- vseg 的尾部（P99/Max）**可能被 69 个缺失 key / OBJECT_NOT_FOUND 污染**：Max 57.8ms 很可能是一次失败查找/重试；P99 的 600 个样本里也包含这 69 个失败。**在补齐 60k 或剔除失败样本前，不能把尾部差距归因 vseg 路径。**
+- target n 不可直接比：vseg 60000 queries ×16 分两 target（含 69 失败/重试），plain 60000×32 单 target；W9avg 可比。
+- 本结果是在 `extent=50GiB`、3 个 vsegment、etcd 64MiB 下取得；未验证一整块配置。
+
+### 3. 决策
+
+1. **不追长尾/P99**：当前验收是 P50/W9 parity，已达成；尾部若以后要求，先补/剔除 69 个失败 key 再立单，不在污染数据上调 qpairs/submaster/stripe。
+2. **不推进“一整块 128GiB”**：当前 50GiB×2/3 vsegment + etcd 64MiB 已达成 parity；换 extent 会改变布局、需要重写+重测，且可能失去当前结果。它只作为“想移除 etcd 64MiB 写入依赖”时的未来候选，不在本阶段做。
+3. **本阶段收口**：无在途任务。后续如需 P99 parity 或部署优化，另立单并明确验收。
+
+### 4. 环境末态
+
+- plain `plain_nof124` 2413231/2413234 运行中（Keys=60000）；etcd 2408033/2408036（64MiB，dbSize 293MiB）；target B 2391418、target A 3329243 未重启；node2/node4 无残留。
+- 未改码/未重编/未装包。

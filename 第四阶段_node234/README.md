@@ -69,7 +69,7 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 | target B（node4） | **已重建**：PID 2391418；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `c19b91e1…`；11/11、strip 256KiB、nsid1、4457；0 ERROR |
 | master | NOF-119 A 后 probe master 已停；旧 `vseg_nof116` 因 target B UUID 变已失效；当前无业务 master |
 | node2 | 无 bench/register 残留 |
-| 当前任务 | **NOF-124：vseg 59,931 keys 直接读 1 遍；plain 60k 写/读 1 遍；parity** |
+| 当前任务 | **无在途任务（NOF-124 完成，P50/Avg/P90 parity 达成；P99/Max 待清洁数据）** |
 
 ---
 
@@ -259,6 +259,25 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - 复用 `vseg_nof123`，vseg 读 1 遍（60k queries，预期 failed≈69，接受）；记录 P50/Avg/P90/P99、target W9/n、实际时长。
 - 停 vseg，起 `plain_nof124`（etcd 64MiB、batch=64、注册 B 512GiB），写 60k、读 1 遍；记录同指标。
 - parity：vseg P50 ≤ plain×1.05；不补写、不重跑、不改码、不重启 target。
+
+### NOF-124 结果（2026-11-26，parity 达成）
+
+| 指标 | vseg（59,931） | plain（60,000） | 比值 |
+|---|---|---|---|
+| **P50** | **246.32µs** | **255.06µs** | **0.966×（vseg 快 3.4%）** |
+| Avg | 252.35 | 256.74 | 0.983× |
+| P90 | 255.10 | 263.26 | 0.969× |
+| P99 | 361.82 | 274.62 | 1.317× |
+| Max | 57,788.40 | 2,443.73 | 23.6× |
+| target W9avg | 40.4 / 40.3µs | 44.45µs | 0.909 / 0.907 |
+| 读耗时 | 19s | 20s | — |
+| failed | 69（0.115%） | 0 | — |
+
+- **P50/Avg/P90/W9 达到 parity；P99/Max 未达到。**
+- vseg 69 个缺失 key（type unknown、1× -704 OBJECT_NOT_FOUND）可能污染尾部；未补齐/未剔除前不能把尾部差距归因 vseg 路径。
+- `logical_capacity` 刷新后 300GiB、`logical_used=251,368,833,024=59,931×4MiB` ⇒ NOF-123 的 100GiB 是 gauge 延迟。
+- etcd 64MiB 两阶段 ResourceExhausted 0 ⇒ 写入墙解决。
+- 决策：本阶段收口；不追 P99、不推进一整块 128GiB；未来若要求尾部/部署优化另立单。
 
 ---
 
