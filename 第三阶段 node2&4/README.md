@@ -1,4 +1,4 @@
-# 第三阶段：node2/node4 重建环境与 vseg 回归定位
+# 第三阶段：node2/3/4 双 target 环境与 vseg 回归定位
 
 - 开始日期：2026-11-25
 - 目录：`D:\mooncake nof vsegment\第三阶段 node2&4`
@@ -18,36 +18,47 @@
 - node1 的 host URMA 从 2026-11-24 21:55 起整体失效（capsule `err=-5`），target 重启也无法恢复；
 - node1/node3 需交还他人。
 
-用户决定：**迁移到 node2/node4 独占环境，目标不变**（vseg 读不慢于 plain，最终更快；300µs 目标保留）。
+用户决定：**迁移到 node2/node4 独占环境，目标不变**（vseg 读不慢于 plain，最终更快；300µs 目标保留）。**2026-11-26 用户补充真实部署形态：node2/3/4 可用；reader 在 node2；元数据 master 在 node4；两个远端 target（node3+node4）构成一个 vsegment（member_count=2）；plain 只用一个 target。验收改为 parity（vseg ≤ plain×1.05），2× 绝不可接受。**
 
 第三阶段不是推倒重来：**保留第二阶段已经证实的测量事实，换一套干净、可运行的环境重新基线化**，然后继续定位 vseg 2.07×。
 
 ---
 
-## 2. 当前拓扑（用户 2026-11-25 指定）
+## 2. 当前拓扑（用户 2026-11-26 确认）
 
 ```
-node2（reader + writer）                     node4（master + etcd + target）
-┌────────────────────────┐                  ┌──────────────────────────┐
-│ stress_cluster_bench   │──元数据 RPC─────►│ mooncake_master :50056   │
-│ （supercache 构建）    │                  │ metrics :9006            │
-│                        │                  │ HTTP metadata :8086      │
-│                        │──数据 URMA──────►│ nvmf_tgt :4457           │
-│                        │                  │ URMA_RAID0（11 块 7T）   │
-│                        │                  │ nsid1 → URMA_RAID0       │
-└────────────────────────┘                  └──────────────────────────┘
+node2（reader + writer）                node4（master + etcd + target B）
+┌────────────────────────┐             ┌──────────────────────────┐
+│ stress_cluster_bench   │─元数据 RPC─►│ mooncake_master :50056   │
+│ （supercache 构建）    │             │ metrics :9006            │
+│                        │             │ HTTP metadata :8086      │
+│                        │─数据 URMA─►│ nvmf_tgt :4457           │
+│                        │             │ URMA_RAID0（11 块 7T）   │
+│                        │             │ nsid1 → URMA_RAID0       │
+│                        │             └──────────────────────────┘
+│                        │
+│                        │─数据 URMA─►  node3（target A）
+│                        │             ┌──────────────────────────┐
+│                        │             │ nvmf_tgt :4457           │
+│                        │             │ URMA_RAID0（node3 盘）   │
+│                        │             │ nsid1 → URMA_RAID0       │
+└────────────────────────┘             └──────────────────────────┘
 ```
 
 - **reader/writer = node2**
-- **master + etcd + target = node4**
-- 对 reader 来说，**元数据（master）和数据（target）都跨节点**，满足“两者都远端”的要求。
-- master 与 target 同机是本拓扑的代价：master/etcd 会占用 node4 部分 CPU/内存；解析性能时必须记录这一混叠。
+- **master + etcd = node4**
+- **两个远端 target：node3（新，target A）+ node4（现有，target B）**
+- **vsegment `member_count = 2`**：一个 4MiB key 切成 2×2MiB，两个 child 分别落到 node3/node4 两个 target，并行读。
+- **plain 基线只用一个 target（node4）**，不分片；这是“单 target plain vs 双 target vseg”的架构对比。
+- 对 reader 来说，**元数据（node4）和两个数据 target（node3/node4）都跨节点**，满足“两者都远端”。
+- 验收：**parity（vseg P50/W9 ≤ plain × 1.05）**；2× 绝不可接受。
 
 ### 端口
 
 | 组件 | 节点 | 端口 |
 |---|---|---|
-| SPDK nvmf target | node4 | **4457** |
+| SPDK nvmf target A | node3 | **4457** |
+| SPDK nvmf target B | node4 | **4457** |
 | Mooncake master RPC | node4 | **50056** |
 | metrics | node4 | **9006** |
 | HTTP metadata | node4 | **8086** |
@@ -85,7 +96,8 @@ node2（reader + writer）                     node4（master + etcd + target）
 | **NOF-111** | 单变量 qpair 数 | **无改善**：vseg W9 248.80→**248.87**、P50 555.00→558.74；plain W9 120.29。探针确认 1 条 lane/qpair、单 lane 额度仍 16384 ⇒ **qpair 扇出排除**。客户端组织方式累计全部排除；W9 比值三次独立实验均为 **2.07×** |
 | **NOF-112** | LBA 布局对照 | **布局假说被否**：两臂起始 LBA 逐值相同 400/400；非慢区 301 个 key 上 vseg **301/301 全慢**（p50 478.5 vs 179.0µs），慢区 99 个 key 两臂相等（447.5 vs 448.5）⇒ 位置不能解释 2× |
 | **NOF-113R** | 纯配置：vseg 大 IO vs plain | **配置路径到顶**：vseg@2M **551.93** vs plain@128K **270.52µs（2.04×）**、vs plain@2M 277.73（1.99×）；chunk 对 vseg 无影响，W9 反而 250→287（plain 120→143）⇒ **2× 按字节计，不是每 IO 固定开销**；target 单 IO 在 ≥256K 时被夹到 256KiB（n 16898→8450）。parity 未达成 |
-| **NOF-114（待批准）** | target 侧 BUFFER trace 拆 W9 | target 带 `URMA_STAGE_BUFFER` 重启并 dump，逐 IO 看 enter/submit/submit_return/callback、buffer/wait、lcore/qid/lba/queue；一次采两臂。高危（RAID0 UUID/vseg 元数据），需用户批准；否则转多 target/内存分层 |
+| **NOF-114（当前）** | node3 第二个 target 部署与就绪 | 用户确认 node3 独占可用。复制 node4 target 二进制/启动配置到 node3，按 node3 磁盘做 RAID0 strip256K、4457、URMA、nsid1；只部署与验证，**不 register、不写数据、不动 node4 target/master**。为 NOF-115 的双 target vseg 做准备 |
+| **NOF-115（待下发）** | 双 target vsegment 测量 | master 改为 `member_count=2`，register node3+node4 两个 NoF segment；写 400 keys（4MiB→2×2MiB 跨两个 target）；读 3 遍；plain 单 target 基线对照；验收 parity（≤ plain×1.05） |
 
 ---
 
