@@ -69,7 +69,7 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 | target B（node4） | **已重建**：PID 2391418；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `c19b91e1…`；11/11、strip 256KiB、nsid1、4457；0 ERROR |
 | master | NOF-119 A 后 probe master 已停；旧 `vseg_nof116` 因 target B UUID 变已失效；当前无业务 master |
 | node2 | 无 bench/register 残留 |
-| 当前任务 | **NOF-122：`oplog_batch_max_entries=64` 修 2MiB 事务墙；重启 master（不动 target）；重试 60k vseg/plain** |
+| 当前任务 | **NOF-123：etcd `max-request-bytes=64MiB`；重启 etcd/master（不动 target）；重试 60k vseg/plain** |
 
 ---
 
@@ -220,6 +220,22 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - 写 60k（`--num_keys=30000`/segment）；监控 etcd 是否再 ResourceExhausted；验收 Keys=60000、logical_used=251,658,240,000、vsegments/capacity 是否增长。
 - 若仍在 ~25,647 失败且非批大小，停手；下一步再裁决 20k/扩容。
 - 通过后 vseg 读 1 遍；再 plain `plain_nof122`（batch=64）写/读 1 遍；parity。
+
+### NOF-122 失败（2026-11-26）
+
+- batch 1024→64，失败点仍 **25,632 keys**，事务仍 **13,322,832B**（差 0.2%）⇒ 批条数不是杠杆。
+- 源码确认：`VSegmentOpLogRecord.full_state=true` 的 payload 是 `PartitionVSegmentSnapshot`，含每 key allocation（约 520B/key），是**一条 OpLogEntry**；batch 拆不开。
+- 25.6k keys ≈100.12GiB，刚好越过单 vsegment 100GiB；第 2 个 vsegment 的 full-state 事务卡住（[推算]）。
+- 不是总空间：etcd 92MiB、/home 1.1TiB、/cvm 0.012MiB。
+
+### 当前 NOF-123（etcd 64MiB + 重试 60k）
+
+- **E1**：重启 etcd，加 `--max-request-bytes=67108864`（64MiB）；数据复用；不改 data-dir。
+- 停 wedged `vseg_nof122` master（2404042/2404045，CPU 86%、无限重试）；只停 master，不动 target。
+- 新 `vseg_nof123`：HA+oplog on、batch=64、512GiB segments、member_count=2/extent=50G/stripe=2M；注册 B→A。
+- 写 60k；观察 full-state（25k≈13.3MB、60k≈31MB）能否落盘、vsegments/capacity 是否增长；若 64MiB 仍失败，停手。
+- 通过后 vseg 读 1 遍；plain `plain_nof123` 写/读 1 遍；parity。
+- E2（缩小 extent）暂不做（full-state 是 per partition，不是 per vsegment）；E3 并入最终 plain 臂。
 
 ---
 
