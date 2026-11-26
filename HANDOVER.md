@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-121（60k keys 单遍 ~20s：vseg 先复用 `vseg_nof120` 的 5k 数据补写到 60k 并读 1 遍；再 plain 60k 读 1 遍；oplog on；2026-11-26）**。NOF-120 完成：oplog-on 写 5k keys 后，etcd dbSize **12.99MiB**、`/oplog/vseg_nof120/` **9870 keys/4.68MiB**；dbSize 增量 **+8,257,536B ≈ 1651.5B/key**，线性外推 60k **≈0.105GiB**；文件系统 **可用 1.1TiB**（used 59% 是历史占用）。**判据②的“剩余>50%”按绝对空间判通过**（0.105GiB vs 1.1TiB，约 1 万倍余量）；59% 与本测试无关。环境：master `vseg_nof120` 2396324/2396327 运行中、Keys=5000、2 segments 各 512GiB、vsegments=1；target B 2391418、target A 3329243；数据 target A/B 各 10GiB。NOF-121 不需要重启 master，直接补写；`--num_keys=30000`（每 segment）→ 总 60k；会首次触发 `VSEGMENT_CREATING`（重试路径未验证，最多 5 轮）。**第四阶段文档：`第四阶段_node234/README.md`。**
+- 当前任务：**NOF-122（修 oplog 批大小后重试 60k：`--oplog_batch_max_entries=64`；停掉旧 master 的无限重试；新 cluster 重写 60k；再 plain 60k；2026-11-26）**。NOF-121 A 失败：vseg 补写到 **25,647 keys** 后全线失败（34,353 次，ret=-1010）；根因是 **etcd 单事务 13,295,444B > 默认 max-request-bytes 2,097,152B**，`TxnCompareAndPut` 被 ResourceExhausted 拒收，master 对同一超大批判无限重试（3784+ 次，尺寸不变）。**不是总空间问题**：etcd dbSize 仅 54.5MiB、oplog 23.89MiB、/home 余 1.1TiB。**决策**：① 走 (a) 降 `--oplog_batch_max_entries` 到 **64**（1024→64，估算批事务 13.3MB→~0.83MB <2MiB），不重启 etcd、不改码；② **授权停掉旧 master 2396324/2396327 的无限重试**（只停 master，不动 target），新 cluster `vseg_nof122` 重写；③ 100GiB 单 vsegment 静态 quota 是否是第二道墙**暂不判定**，NOF-122 写到 60k 时观察 vsegments/logical_capacity；若仍在 ~25,647 处失败再退回 20k/80GiB。**第四阶段文档：`第四阶段_node234/README.md`。**
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -8698,3 +8698,81 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 每臂只读 1 遍；不跑 T4/T16；不跑 1000/20k。
 - 若 60k 写入/读取失败、Keys≠60000、target 掉线，停手回报。
 - 预计 **30–40 分钟**（vseg 补写约 2–3 分钟、读 20–24s；plain 写 ~30s、读 ~20s；master 切换/注册约 10 分钟）。
+
+---
+
+## NOF-121 A 裁决（2026-11-26 · 回执已收，失败停手）
+
+### 1. 失败事实
+
+| 项 | 实测 |
+|---|---|
+| 写入结果 | **25,647 succeeded / 34,353 failed**（总 60,000） |
+| 失败码 | `ret=-1010` ×34,352（OpLog queue failed）、`VSEGMENT_CREATING` ×2、`ret=-105` ×1 |
+| 根因原文 | `TxnCompareAndPut failed: ResourceExhausted: received message larger than max (13295444 vs. 2097152)` |
+| 单批事务 | **13,295,444 B > etcd 默认 2,097,152 B**；同尺寸重试 3784+ 次，尺寸不变 |
+| etcd 总量 | dbSize 54.5MiB、`/oplog/vseg_nof120/` 23.89MiB、/home 余 1.1TiB ⇒ **不是空间问题** |
+| 数据落点 | 25,647×4MiB = **100.184 GiB**，刚好越过单 vsegment 静态 quota 100GiB |
+| vsegment 状态 | `vsegments=2`，但 `logical_capacity=100GiB`、`create_success_total=1`（扩容路径可疑，未分离） |
+| 环境 | target A/B 未重启；旧 master 2396324/2396327 仍在无限重试（CPU 29%、日志 25 万行） |
+
+- 这是**单事务消息尺寸墙**，不是 oplog 总空间墙；NOF-120 的“oplog on 可支撑 60k”在实践中被**部分证伪**：总空间够，但批事务超 2MiB。5k 预检没有触发 1024 条大批判，所以没暴露。
+
+### 2. 决策（无需再问）
+
+1. **走 (a)：`--oplog_batch_max_entries=64`**（1024→64，批事务约 13.3MB→0.83MB，留 2× 余量；不重启 etcd、不改码）。
+2. **授权停掉旧 master 2396324/2396327 的无限重试**（只停 master，不动 target）；新 cluster `vseg_nof122` 重写 60k。
+3. **暂不退回 20k**：先修批大小试 60k；若仍在 ~25,647 处因 vsegment 扩容/quota 失败，再单独裁决 20k/80GiB。
+4. 25,647 keys 的元数据随 master 重启丢失，数据在 target 上会被新 60k 覆盖；数据保留不是目标。
+
+---
+
+# NOF-122（待执行 · 修 oplog 批大小后重试 60k · 只停 master/不动 target · 2026-11-26）
+
+## 目标
+
+- 用 `--oplog_batch_max_entries=64` 重试 60k，验证：
+  1. etcd 单批事务 <2MiB，不再 ResourceExhausted；
+  2. 60k（240GiB）能否跨过 100GiB 单 vsegment quota，vsegments/logical_capacity 是否随写入增长；
+  3. vseg 60k 单遍读 ~20–24s，再 plain 60k 单遍读，给 parity。
+
+## A. 停旧 master
+
+1. 停 `vseg_nof120` master 2396324/2396327（TERM，必要时 KILL），确认 50056/9006/8086 释放；备份其日志（25 万行）到 run/。
+2. target A（3329243）/B（2391418）不动；node2 无残留。
+
+## B. 新 vseg master / 注册 / quota
+
+1. 起 `vseg_nof122`（node4，50056/9006/8086、slot=1、etcd、URMA、`enable_ha=true`、`enable_oplog=true`、**`--oplog_batch_max_entries=64`**、`member_count=2 / extent=50GiB / stripe=2MiB / required_medium=nof / reserved_ratio=0 / io_alignment=4096 / submaster_count=1`）。
+2. 注册 node4 B → node3 A，容量 **512GiB**；确认 segment=2、quota generation=1、partitions=1、vsegments=1、logical_capacity=100GiB、reconcile_fail=0。
+3. 记录启动命令行中的 `oplog_batch_max_entries=64`（flag 生效证据）。
+
+## C. 60k vseg 写入 + 读
+
+1. Writer：`--num_keys=30000`（每 segment，总 60,000）、T1/batch1、4MiB；`VSEGMENT_CREATING` 最多 5 轮；**监控 etcd 日志是否再出现 ResourceExhausted**。
+2. 验收：`Keys=60000`、`logical_used=251,658,240,000`；target A/B 写窗口各≈960,000；记录 `vsegments`、`logical_capacity` 是否随 25k/50k 增长（预期 3 个 vsegment / 300GiB）。
+3. 若再次失败在 ~25,647 且错误不是批大小（如 vsegment quota/创建），**停手回报**，不要继续第 2 轮；下一步再裁决 20k 或扩容。
+4. Reader：**1 遍**，`--num_keys=30000`（每 segment，60k queries）、T1、warmup=128、qpairs=4、verify=false、diag 关；记录实际时长、P50/Avg/P90/P99、failed、target A/B W9/n（各≈962,048）。
+5. 记录 etcd dbSize/oplog 增长。
+
+## D. Plain 60k + parity
+
+1. 停 `vseg_nof122` master；起 plain `plain_nof122`（50056/9006/8086、slot=1、etcd、URMA、HA+oplog、**`--oplog_batch_max_entries=64`**）；注册 B 512GiB。
+2. Writer 60k（16t/batch16），验收 Keys=60000/logical_used；reader 1 遍 60k（T1/warmup128/qpairs4/diag off），记录 P50/Avg/P90/P99、W9/n（≈1,924,096）、实际时长。
+3. 对比 vseg/plain：P50、W9、比值；判 parity（≤1.05×）。
+
+## E. 交付
+
+1. 旧 master 停止/日志备份；新 master flag 生效证据。
+2. vseg 写入 Keys/logical_used、vsegments/logical_capacity 变化、失败数/错误码、target A/B 写 n。
+3. vseg 读单遍 P50/Avg/P90/P99、W9/n、实际时长。
+4. plain 写/读同样指标；parity 比值。
+5. etcd dbSize/oplog 增长；环境末态。
+
+## F. 边界
+
+- **只停/起 master，不动 target**；不改码/不重编/不装包；oplog on，batch=64。
+- 60k 数据覆盖旧数据；master 重启后必须重注册 512GiB。
+- 若批大小修复后仍在 25,647 处失败，停手；**不要自行退回 20k 或改 quota**。
+- 单遍读，不加第 2 遍；不跑 T4/T16。
+- 预计 **30–40 分钟**。

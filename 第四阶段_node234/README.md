@@ -69,7 +69,7 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 | target B（node4） | **已重建**：PID 2391418；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `c19b91e1…`；11/11、strip 256KiB、nsid1、4457；0 ERROR |
 | master | NOF-119 A 后 probe master 已停；旧 `vseg_nof116` 因 target B UUID 变已失效；当前无业务 master |
 | node2 | 无 bench/register 残留 |
-| 当前任务 | **NOF-121：vseg 补写到 60k 读 1 遍；plain 60k 读 1 遍；验收 parity** |
+| 当前任务 | **NOF-122：`oplog_batch_max_entries=64` 修 2MiB 事务墙；重启 master（不动 target）；重试 60k vseg/plain** |
 
 ---
 
@@ -204,6 +204,22 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - 再停 vseg、起 plain `plain_nof121`（512GiB 注册 B），写 60k、读 1 遍，约 20s；target B n≈1,924,096。
 - parity：vseg P50 ≤ plain×1.05；记录实际读时长、W9、etcd 增长。
 - 不重启 target、不改码；master 重启需重注册 512GiB。
+
+### NOF-121 A 失败（2026-11-26）
+
+- vseg 补写 60k 在 **25,647 keys** 处失败：34,353 failed，`ret=-1010`。
+- 根因：**etcd 单事务 13,295,444B > 默认 max-request-bytes 2,097,152B**，`TxnCompareAndPut` ResourceExhausted；master 对同一超大批判无限重试 3784+ 次。
+- **不是总空间**：etcd dbSize 54.5MiB、oplog 23.89MiB、/home 余 1.1TiB。
+- 25,647×4MiB=100.184GiB，刚好越过单 vsegment 100GiB quota；vsegments=2 但 capacity 仍 100GiB、create_success=1，扩容路径可疑但未分离。
+- 决策：`--oplog_batch_max_entries=64`（不重启 etcd/不改码）；停旧 master 无限重试，新 cluster 重试 60k；暂不退 20k。
+
+### 当前 NOF-122（修批大小后重试 60k）
+
+- 停 `vseg_nof120` master（授权，仅 master，不动 target）。
+- 起 `vseg_nof122`：normal HA+oplog on、**batch=64**、512GiB segments、member_count=2/extent=50G/stripe=2M。
+- 写 60k（`--num_keys=30000`/segment）；监控 etcd 是否再 ResourceExhausted；验收 Keys=60000、logical_used=251,658,240,000、vsegments/capacity 是否增长。
+- 若仍在 ~25,647 失败且非批大小，停手；下一步再裁决 20k/扩容。
+- 通过后 vseg 读 1 遍；再 plain `plain_nof122`（batch=64）写/读 1 遍；parity。
 
 ---
 
