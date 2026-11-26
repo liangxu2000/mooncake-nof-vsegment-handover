@@ -61,16 +61,16 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 
 ---
 
-## 3. 当前环境状态（2026-11-26 NOF-127 完成后）
+## 3. 当前环境状态（2026-11-26 NOF-128 起）
 
 | 对象 | 状态 |
 |---|---|
 | target A（node3） | PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR |
 | target B（node4） | **已重建**：PID 2391418；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `c19b91e1…`；11/11、strip 256KiB、nsid1、4457；0 ERROR |
-| master | **`plain_nof127b` 2438798/2438801 运行中**：Keys=60000、E=1、FATAL=0 |
+| master | `plain_nof127b` 2438798/2438801 运行中（Keys=60000）；NOF-128 将停它、起 `vseg_nof128` |
 | etcd | 2408033/2408036；`--max-request-bytes=67108864`；dbSize 873.65MiB |
 | node2 | 无 bench/register 残留；客户端 md5 bb4a07a3…（未重编） |
-| 当前任务 | **无在途任务（NOF-127 完成；第四阶段第一正式结果已出）** |
+| 当前任务 | **NOF-128（只测 vsegment：60k、一整块、10 轮；逐轮取 target A/B W9，查轮间波动来源）** |
 
 ---
 

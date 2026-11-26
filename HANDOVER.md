@@ -103,7 +103,7 @@
 
 - **正式测试口径（2026-11-26 用户定，后续默认）**：① key=4MiB，**60,000 keys**，不再用 400 keys；② vsegment 用**一整块**：`extent=256GiB/member`（274877906944），逻辑 512GiB，`member_count=2 / stripe=2MiB / required_medium=nof / reserved_ratio=0 / io_alignment=4096 / slot=1`；50G/3vseg 仅作历史对照，不再默认；③ plain 单 target B；④ 读 = T1（threads=1/batch=1）、warmup=128、qpairs=4、verify=false、diag 关、sequential；vsegment `--num_keys=30000`/segment；**每轮只读一遍 60k keys（约 20s），禁止用 `--duration` 连续循环读**；⑤ **稳定性**：每臂 ≥6 轮，至少 2 个交替周期（V3→P3→V3→P3）；**回执正文不逐轮罗列，按 `测试结果聚合方法_20261112.md` 给聚合值（Avg 均值、分位中位）+ spread**；⑥ 第四阶段第一个正式结果 = NOF-127。
 
-- 当前任务：**无在途任务（NOF-127 完成；第四阶段第一正式结果已出）**。**正式结果（6+6 轮，每轮一遍 60k keys ≈20s；按 `D:\gds性能\测试结果聚合方法_20261112.md`：Avg=各轮均值、分位=各轮同分位中位）**：vsegment/plain **P50 257.01/248.51 = 1.034×**、**Avg 264.39/254.14 = 1.040×**、**P90 268.55/256.80 = 1.046×**、**P99 376.69/274.85 = 1.371×**；**P50/Avg/P90 ≤1.05 ⇒ parity 达成；P99 未达**。Avg spread 6.2%/6.4%（>3%，共同时间漂移导致；<10% 仍进表）；时间就近配对 0.977–1.076（5/6 vsegment 慢、4/6 ≤1.05）作为辅助检查。target W9 vsegment 39.19/39.22µs vs plain 44.17–44.22µs（每 IO 更快），剩余在客户端/两跳。12/12 读 failed=0；四阶段写入均 60,000/0；etcd +≈630MiB、ResourceExhausted 0。**结论**：聚合口径 P50/Avg/P90 达到 parity，P99 仍落后，无 2×；按既定边界不追 P99/Max。环境停在 `plain_nof127b`（Keys=60000）。
+- 当前任务：**NOF-128（只测 vsegment：60k、一整块、10 轮；逐轮取 target A/B 的 W9；查轮间波动在 target 还是客户端；2026-11-26）**。背景：NOF-127 正式结果（按 `D:\gds性能\测试结果聚合方法_20261112.md`：Avg=各轮均值、分位=各轮同分位中位）vsegment/plain **P50 257.01/248.51 = 1.034×**、Avg 1.040×、P90 1.046×、P99 1.371×；**P50/Avg/P90 达 parity，P99 未达**；但两臂 Avg spread **6.2% / 6.4%**（>3%，高值轮集中在 p4/p5 同时间段）。本单只测 vsegment 10 轮，每轮一遍 60k≈20s，逐轮取 W9 判断波动来源；不改码/不重启 target/etcd/不补写。环境当前 `plain_nof127b`（Keys=60000）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -9324,3 +9324,49 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - target A 3329243 / target B 2391418 未重启；客户端 md5 bb4a07a3319faae7f74214f4d0ee0a4b（未重编）。
 - 未改码/未重编/未装包/未重启 target/etcd。
 - 偏差：target A 的 W9 由 node3 末块补取（n=962,055、39,220ns）；墙钟为脚本计时 18–20s，非 bench 自报。
+
+---
+
+# NOF-128（待执行 · 只测 vsegment · 60k · 一整块 · 10 轮 · 查轮间波动 · 2026-11-26）
+
+## 目标
+
+- 只测 **vsegment**（不测 plain）：60,000 keys、一整块 vsegment（extent=274877906944、logical=549755813888）、T1、每轮只读一遍 60k（≈20s）、连续 **10 轮**。
+- 每轮同时记录：客户端端到端 Avg/P50/P90/P99、failed、墙钟；**target A/B 的读 W9avg 与 n（每轮都取）**。
+- 目的：① 给 vsegment 一个更稳的聚合值（按 `D:\gds性能\测试结果聚合方法_20261112.md`）；② 用每轮 W9 判断轮间波动在 target 还是客户端/系统。
+- 不改码、不重启 target/etcd、不补写、不测 plain。
+
+## A. 预检
+
+1. 当前 `plain_nof127b`（2438798/2438801，Keys=60000）运行；记录 PID 后停止，释放 50056/9006/8086。
+2. target A（3329243）/ target B（2391418）、etcd 2408033/2408036 运行，**均不重启**。
+3. node2 无 bench/register 残留；客户端 md5 bb4a07a3…（不重编）；记录磁盘/日志空间。
+
+## B. 起 vsegment / 写 60k
+
+1. 起 `vseg_nof128`（node4，50056/9006/8086、slot=1、etcd、URMA、HA+oplog on、`--oplog_batch_max_entries=64`）：`member_count=2 / extent=274877906944 / stripe=2MiB / required_medium=nof / reserved_ratio=0 / io_alignment=4096 / submaster_count=1`；若 etcd 存在同名 `/cvm/`、`/oplog/` 键，两处都删；不删其它 cluster 键。
+2. 注册 B→A 各 512GiB；等 quota ≥20s；验收 `member_extent_size=274877906944`、`logical_capacity=549755813888`、partitions=1、reconcile_fail=0、vsegments=1。
+3. 写 60k：`--num_keys=30000`/segment、T1/batch1、4MiB；验收 **Keys=60000**（记录 failed；不补写；不记录写入性能）。
+
+## C. 读 10 轮（每轮一遍 60k ≈20s）
+
+- 每轮：`--num_keys=30000`/segment、T1/threads=1/batch=1、warmup=128、qpairs=4、verify=false、diag 关；记录 **Avg/P50/P90/P99、failed、墙钟**。
+- **每轮结束后立即取 target A/B 的 W9avg 与 n**（必须对应当前轮窗口；取本轮末块，禁止用跨轮累计/下一轮块代替）。
+- 10 轮连续跑，轮间不重启 master/client；若 W9 取不到或 failed>0，停手回报，不要用末块近似。
+
+## D. 交付
+
+1. 逐轮原始行落盘 `run/nof128_rounds.csv`：轮号、Avg/P50/P90/P99、failed、墙钟、target A/B W9avg/n。
+2. 按 `测试结果聚合方法_20261112.md` 聚合：Avg=各轮等权算术平均；P50/P90/P99=各轮同分位中位数；**正文只给聚合表 + spread**，不逐轮罗列。
+3. 波动判读：
+   - 端到端 P50 的 spread、最高/最低轮；
+   - 每轮 target A/B W9 的范围与波动；
+   - **端到端波动与 W9 波动是否同向**：W9 平稳而端到端波动 ⇒ 客户端/系统；W9 同向波动 ⇒ target；无法分离就写“未分离”。
+4. 配置/数据完整性、环境末态。
+
+## E. 边界
+
+- **只测 vsegment，不测 plain**；每轮只读一遍 60k（≈20s），**禁止 `--duration`**；不补写；不跑 T4/T16；不调 chunk/qpairs。
+- 不改码/不重编/不装包/不重启 target/etcd；master 可停/起，注册每次 B→A。
+- 10 轮连续；每轮必须取到 W9；失败停手。
+- 预计 **20–30 分钟**。
