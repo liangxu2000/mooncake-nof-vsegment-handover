@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-132（任务拆分/lane 矩阵：A plain/q4；B vseg member=1 stripe=4M/q4；C member=1 stripe=2M/q4；D member=1 stripe=2M/q1；60k、每组 4 轮；2026-11-26）**。目的：用 **member=1（只 target B）** 拿掉“跨 target”，只比“4MiB 是否拆成两个 child task”（B vs C）和“两个 task 是否共用 lane”（C vs D），验证剩余 3–4% 是否来自客户端 task/lane。**替代 NOF-131**（若已启动停掉，其数据作废）。背景：NOF-130 同环境 vseg/plain P50 1.034×；target W9 vsegment 39.6µs vs plain 47.6µs（vseg 每 IO 更快）⇒ 差距在客户端；正式结果仍为 NOF-127。不改码/不重启 target/etcd；member=1/stripe=4M 仅本诊断。环境 `plain_nof130` 运行（Keys=60000）。
+- 当前任务：**NOF-133（NOF-132 修正重跑：A plain/q4；B vseg member=1 stripe=4M/q4；C member=1 stripe=2M/q4；D member=1 stripe=2M/q1；60k、每组 4 轮；2026-11-26）**。背景：NOF-132 因脚本把“等 quota”放在“注册 target B”之前，B 组写 0 keys、读全失败；A 有效、C 无读、D 未跑。本单修正为**先注册 → 等 enabled=1 → 写 → 读**，写失败立即中止整组；**A/B/C/D 全部重跑**（A 旧数据归档、不作矩阵），停残留 `vseg_nof132d` master 2484180/2484183。目的不变：member=1 拿掉跨 target，只比拆 task（B vs C）与同 lane（C vs D）。不改码/不重启 target/etcd；预计 30–40 分钟。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -9647,3 +9647,68 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 只 target B；target A 不动；member=1 与 stripe=4MiB 仅本诊断。
 - 每组 4 轮；每轮一遍 60k≈20s，禁止 duration；不补写；失败停手。
 - 预计 **25–35 分钟**（4 组写 + 16 轮读 + 切换）。
+
+---
+
+## NOF-132 中断（2026-11-26 · 脚本顺序错误；B 无效、C 无读、D 未跑）
+
+### 事实
+
+- **A 组有效**：plain/q4，写 60k、4 轮全 failed=0；Avg 253.70 / P50 248.91 / P90 257.56 / P99 275.99；target B W9 均 46,955ns。
+- **B 组无效**：脚本把“等 quota enabled=1”放在“注册 target B”之前；master 日志 `VSegment auto-plan deferred: no eligible psegment pool yet`，120s 全 enabled=0；写 20s 零增长退出 Keys=0；4 轮读 failed=60000（脚本未在写失败时中止）。
+- **C 组**：已写 60k，但被停手时未读；数据作废。
+- **D 组**：未开始；残留 master `vseg_nof132d` 2484180/2484183（enabled=0、未注册、无数据）。
+- 偏差：写失败后脚本继续读（违反失败停手）；CSV 表头漏 child 两列；B 写日志被同名覆盖（master 侧证据足够）。
+- 环境：etcd 2455814、target B 2458315 未动；node2 无残留；未改码/未重编。
+
+### 决策
+
+- **修脚本并重跑 A/B/C/D 四组**；A 旧 4 轮归档、不作矩阵数据，保证四组同一会话。
+- 修正：**先注册 target B → 等 enabled=1 → 写 → 读**；写失败立即中止整组和 driver，不进入读；CSV 补齐 child 列。
+- 停残留 `vseg_nof132d` master；旧 `nof132*` 产物归档到 `run/nof132_partial/`。
+
+---
+
+# NOF-133（待执行 · NOF-132 修正重跑 · A/B/C/D 四组 · 2026-11-26）
+
+## 目标
+
+- 修正脚本顺序与失败处理，四组（A plain/q4；B vseg m=1 stripe=4M/q4；C m=1 stripe=2M/q4；D m=1 stripe=2M/q1）全部重跑；每组 60k 写入 + 4 轮读。
+- 矩阵判读同 NOF-132：B vs C（拆 task 成本）、C vs D（同 lane 成本）、A vs B（单 task vsegment 是否接近 plain）。
+
+## A. 清理与归档
+
+1. 停残留 `vseg_nof132d` master 2484180/2484183（先 TERM，必要时 KILL）；检查所有 `vseg_nof132*`/`plain_nof132*` master 无残留；确认 50056/9006/8086 释放。
+2. 将 `run/nof132*`、`run/master_vseg_nof132*`、`run/nof132_rounds.csv` 等移到 `run/nof132_partial/`（**归档不删**）；A 旧 4 轮仅参考，不进矩阵。
+3. target A/B、etcd 2455814 均不动；node2 无残留。
+
+## B. 脚本修正（必须）
+
+1. 每组顺序固定：起 master → **注册 target B 512GiB** → 等 `VSegment Status enabled=1`/quota（最多 180s）→ 写 60k → 读 4 轮。
+2. 写后 `Keys<60000` 或零增长 ⇒ **立即中止整组和 driver**，不进入读轮；记录 master 日志。
+3. CSV 表头补齐 child 两列（如 `child_count`、`child_gap_us`），行与表头对齐；每轮记录 A/B/C/D 组号、轮号、Avg/P50/P90/P99、failed、墙钟、target B W9/n。
+4. qpairs 按组设置并用日志自证（`NoF qpairs/segment`）；vseg member=1 时注册/写只用 target B、`--num_keys=60000`。
+
+## C. 四组（A→B→C→D）
+
+- **A**：`plain_nof133a`，qpairs=4；写 60k（16t/batch16）；读 4 轮。
+- **B**：`vseg_nof133b`，member_count=1 / stripe=4MiB / extent=256GiB / qpairs=4；注册 B；写 60k（T1/batch1）；读 4 轮；确认 4MiB key 生成 **1 个 child task**。
+- **C**：`vseg_nof133c`，member_count=1 / stripe=2MiB / extent=256GiB / qpairs=4；写 60k；读 4 轮；确认 **2 个 child task**、均落 B。
+- **D**：`vseg_nof133d`，member_count=1 / stripe=2MiB / extent=256GiB / qpairs=1；写 60k；读 4 轮；确认 qpairs=1 生效、两 task 共用 lane。
+- 每组新 cluster、重写 60k；组间停上一 master；target A 不动；etcd 不动。
+
+## D. 交付
+
+1. 四组聚合表（2026-11-12 方法：Avg=各轮均值、分位=各轮同分位中位；正文不逐轮罗列）：
+   `组 | 配置 | 轮数 | Avg | P50 | P90 | P99 | spread`。
+2. 逐轮原始值 `run/nof133_rounds.csv`（含 child 列）。
+3. 对比：B vs C、C vs D、A vs B；给出各组差值与判读。
+4. 配置自证（vsegments=1、extent、stripe、qpairs、child 数）、target W9、环境末态。
+5. 不报吞吐；不追 P99/Max；不改正式配置。
+
+## E. 边界
+
+- 不改码/不重编/不装包/不重启 target/etcd；只停/起 master 与 bench。
+- 只 target B；target A 不动；member=1/stripe=4M 仅本诊断。
+- 每组 4 轮；每轮一遍 60k≈20s，禁止 duration；写失败立即停手；不补写。
+- 预计 **30–40 分钟**。

@@ -67,10 +67,10 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 |---|---|
 | target A（node3） | **正常**：PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR |
 | target B（node4） | **已重建**：PID 2458315；NQN `...urma-gpu-test`、SN `URMAGPU0001`；**新 UUID 50d6259e-51a6-4599-adf3-68defc0c5a53**；RAID0 strip 256K、online 11/11、4457、ERROR=0 |
-| master | **`plain_nof130` 2464822/2464825 运行中**：Keys=60000、E=1、FATAL=0；NOF-132 将停它、起 `plain_nof132a` |
-| etcd | 2455814；`--max-request-bytes=67108864`；dbSize 1026.18MiB、raftIndex 1,173,750 |
+| master | **残留 `vseg_nof132d` 2484180/2484183**（enabled=0、未注册、无数据）；NOF-133 将停它并重跑 A/B/C/D |
+| etcd | 2455814；`--max-request-bytes=67108864`；NOF-132 期间未重启 |
 | node2 | 无 bench/register 残留；客户端 md5 bb4a07a3…（未重编） |
-| 当前任务 | **NOF-132（task/lane 矩阵：A plain/q4；B vseg member=1 stripe=4M/q4；C member=1 stripe=2M/q4；D member=1 stripe=2M/q1；60k、每组 4 轮）** |
+| 当前任务 | **NOF-133（NOF-132 修正重跑：先注册→等 enabled=1→写→读；A/B/C/D 四组各 4 轮）** |
 | 风险 | node4 非独占：外部用户 `computin` 16:20–16:50 多次登录；本次重建后未被清；若再次清场/资源争用，停手回报 |
 
 ---
