@@ -148,7 +148,15 @@
 - 一整块 = 不再创建第 2 个 vsegment ⇒ 写入过程中不触发这次 full-state；初始 checkpoint（0 keys）很小，后续都是 delta。
 - 为什么是 256GiB 而不是 128GiB：128GiB/member（逻辑 256GiB）也够装 234.375GiB，但只剩 9% 余量；当前每 target 已注册 512GiB，256GiB/member 留一半余量且无需扩大注册（再大才要扩 segment 注册，对 60k 无收益）。
 - **只解决写入过程**：master 重启/恢复仍会做一次 full-state（60k≈31MB），etcd 默认 2MiB 仍不够 ⇒ 恢复/HA 仍需 etcd 64MiB 或改码；NOF-125 保持 etcd 64MiB 不动（本次不隔离该变量）。
-- **NOF-125 实测（2026-11-26）**：60,000/0 failed；vsegments 全程 1；`VSegment created`=1；value_max 9,087B、full_state 日志 0、ResourceExhausted 0 ⇒ **写侧目标完全达成**，H2 验证。读侧 P50 272.37µs（跨会话 plain 1.068×）未达 parity；**NOF-126 同会话三臂已判：extent 50↔256 对读无显著影响（P50 均值 +1.1%、中位 +3.5%，小于臂内极差），272.37 为会话偏高；50G 定为读默认**。
+- **NOF-125 实测（2026-11-26）**：60,000/0 failed；vsegments 全程 1；`VSegment created`=1；value_max 9,087B、full_state 日志 0、ResourceExhausted 0 ⇒ **写侧目标完全达成**，H2 验证。读侧 P50 272.37µs（跨会话 plain 1.068×）未达 parity；**NOF-126 同会话三臂已判：extent 50↔256 对读无显著影响（P50 均值 +1.1%、中位 +3.5%，小于臂内极差），272.37 为会话偏高；随后用户定正式条件=一整块 vsegment，50G 仅历史对照**。
+
+### 5.4 最终解决（2026-11-26 定稿）
+
+- **稳态写入**：etcd `--max-request-bytes=67108864`（64MiB）+ **一整块 vsegment**（extent=256GiB/member、逻辑 512GiB）⇒ NOF-125/127/129/133 均 **60,000/0 failed**、vsegments 恒 1、`value_max` <10KB、ResourceExhausted 0；写入期不再触发第 2 个 vsegment 的 full-state。
+- **恢复/HA**：master 重启仍会生成一次 60k≈31MB full-state，> 默认 2MiB ⇒ **etcd 64MiB 必须保留**，不能回退默认。
+- **不是 batch 问题**：NOF-122 batch 1024→64 无效；full-state 是单条 OpLogEntry，批条数拆不开。
+- **不是空间问题**：etcd dbSize 1.5GiB、`/home` 余 1.1TiB。
+- NOF-123 的 69 failed 是 `-1401 TASK_PENDING_LIMIT_EXCEEDED`（客户端 pending 上限），不是 oplog 墙。
 
 ---
 
@@ -230,17 +238,17 @@
 
 ---
 
-## 8. 环境与口径（2026-11-26）
+## 8. 环境与口径（2026-11-26 NOF-133 末态）
 
 | 对象 | 状态 |
 |---|---|
 | target A（node3） | PID 3329243；NQN `...urma-gpu-test-node3`；RAID0 UUID `2c5bf1f2…`；11/11、strip256K、nsid1、4457 |
-| target B（node4） | PID 2391418（重建后）；RAID0 UUID `c19b91e1…`；11/11、strip256K、nsid1、4457 |
-| etcd | PID 2389250；data-dir 复用；默认 max-request-bytes 2MiB |
-| wedged master | `vseg_nof122` 2404042/2404045；Keys=25,632；无限重试 13.3MB 事务 |
-| 数据 | vseg 25,632 keys ≈100.12GiB；target A/B 各 410,127 IO |
+| target B（node4） | PID **2458315**（NOF-129 重建）；RAID0 UUID **50d6259e…**；11/11、strip256K、nsid1、4457、ERROR=0 |
+| etcd | PID **2455814**；`--max-request-bytes=67108864`；dbSize **1531.26MiB**（NOF-133 末态）；data-dir 复用 |
+| master | `vseg_nof133d` 2491062/2491065（NOF-133 末态）；Keys=60000；enabled=1、vsegments=1 |
+| 数据 | 60,000 keys ≈234.375GiB；一整块 vsegment（extent=256GiB/member，逻辑 512GiB） |
 | key/并发 | 4MiB、T1（threads=1/batch=1）、warmup=128、qpairs=4、verify=false、diag 关 |
-| vseg | member_count=2、stripe=2MiB、extent=50GiB、required_medium=nof |
+| 历史 | NOF-123：59,931 keys/50G/3 vseg；NOF-125：60k/256G/1 vseg |
 | 文档原则 | 只用 node 标签，不写内网 IP |
 
 ---
@@ -267,4 +275,5 @@
 - 2026-11-26：NOF-126 同会话三臂——extent 50↔256 对读无显著影响（P50 均值 +1.1%/中位 +3.5%，小于臂内极差）；NOF-125 的 272.37 为会话偏高；“+58% IO”为计数伪影；**当时暂定 50G/3vseg**，随后用户改为正式条件=一整块 vsegment。
 - 2026-11-26：NOF-127 正式条件（60k + 一整块 vsegment）稳定性完成；四阶段写 60k/0、etcd +630MiB、rex 0；读 6+6 轮 P50 区间重叠但 4/6 ≤1.05，P99 仍 1.34–1.38×；正式结果见关键结果文档。
 - 2026-11-26：node4 被外部清空（NOF-128 阻断）；NOF-129 用同 data-dir + 64MiB 重建 etcd、回收 11 盘、重启 target B（新 UUID）；写 60k/0、value_max 3,984B；vsegment 10 轮诊断显示波动在客户端/系统（end-to-end spread 11.1% vs target W9 1.9/2.7%）。
+- 2026-11-26：**最终解决定稿**——稳态写入 = etcd 64MiB + 一整块 vsegment；NOF-125/127/129/133 均 60k/0、vsegments=1、value_max <10KB、ResourceExhausted 0；**恢复/HA 仍需 64MiB**（60k≈31MB full-state >2MiB）。
 - **遗留**：NOF-124 的 69 个缺失 key 已由 NOF-125 重写清零；NOF-126 的 50G 臂有 33 个缺失 key（0.055%，未补写）；P99/Max 未平，暂不归因 vseg 路径。
