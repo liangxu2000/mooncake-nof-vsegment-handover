@@ -10034,7 +10034,8 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 | E1/E0 | **0.996（−0.44%）** | 1.004 | 1.000 | 1.000 | 0.994 | 0.998 |
 
 - 离散度：E0 吞吐 spread 0.25%、E1 0.03%；四遍日志均含 `Selected URMA device udmac0d1e2, EID index 0/1`，EID 设置确实生效。
-- **判据（>5% 且稳定）不满足，方向为负 ⇒ `MC_EID_INDEX` 不是带宽旋钮；带宽维度不进入 vsegment 复测**；T1 时延口径见 NOF-139。
+- **判据（>5% 且稳定）不满足，方向为负 ⇒ `MC_EID_INDEX` 不是带宽旋钮；带宽维度不进入 vsegment 复测**；NOF-139 取消；NoF 的 EID 由 NOF-140 用 `SPDK_URMA_EID_INDEX` 复核。
+- **事后澄清（2026-11-26 同事）**：`MC_EID_INDEX` 设的是 **Transfer Engine（内存通道）** 的 EID，NoF 数据面不走它 ⇒ 本单 −0.44% 属**层级不对**，不代表 NoF 的 EID 无收益；NoF 的对应旋钮是 **`SPDK_URMA_EID_INDEX`**（NOF-140）。
 - 本单时延是 16×4MiB/批（≈21ms）的批时延，**与正式 T1/batch1（P50≈254µs）不可比，不并入正式时延表**；吞吐仅本单诊断。
 
 ## 偏差
@@ -10132,3 +10133,15 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 不写数据、不切 vsegment；target EID 只读不改。
 - 环境末态：`plain_nof135p` 保持运行；target/etcd 未动。
 - 预计 **3–5 分钟**。
+
+---
+
+## EID 两层（2026-11-26 同事确认 · 后续引用以此为准）
+
+| 环境变量 | 作用的层 | 代码位置 | 与 NoF 的关系 |
+|---|---|---|---|
+| `MC_EID_INDEX` | Mooncake **Transfer Engine 的 URMA endpoint（内存通道）** | `mooncake-transfer-engine/src/config.cpp:662` → `urma_endpoint.cpp:221/239/663-677` | **NoF 数据面不走它**；NOF-138 测的是这层，−0.44% 属层级不对 |
+| `SPDK_URMA_EID_INDEX` | **SPDK NVMe-oF URMA transport**（NoF 数据面） | `lib/nvme/nvme_urma_common.c:147`（initiator）；`lib/nvmf/urma.c:1209`（target transport 初始化也读） | **NoF 的对应旋钮**；NOF-140 测客户端侧 |
+
+- 因此：NOF-138 的 null 结果**符合层级预期**，不能用来关闭 NoF 的 EID；判断 NoF 的 EID 必须看 NOF-140。
+- `SPDK_URMA_EID_INDEX` 的实际语义：按 index 匹配 EID，**找不到时静默回退首个 EID**（与 `MC_EID_INDEX` 报错不回退不同）；客户端和 target 都在进程启动时读，target 的 JSON `eid_index` 可覆盖。
