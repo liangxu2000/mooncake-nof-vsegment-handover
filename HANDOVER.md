@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-125（一整块 vsegment：extent=256GiB/member、逻辑 512GiB，60k×4MiB=251,658,240,000B=234.375GiB 全装 1 个 vsegment；停 plain master、新 cluster `vseg_nof125`、写 60k+读 1 遍；对比 NOF-124 parity 基线；2026-11-26）**。NOF-124 基线：vseg 59,931 keys **P50 246.32µs**、W9avg 40.4µs；plain 60k **255.06µs**、W9 44.45µs；P50/Avg/P90/W9 parity 达成，P99/Max 未平（尾部可能被 69 个缺失 key 污染）。**NOF-123 疑点澄清**：`logical_capacity` 刷新后 300GiB、`logical_used=251,368,833,024=59,931×4MiB`；100GiB 是 gauge 延迟。etcd 64MiB 两阶段 ResourceExhausted 0。**NOF-125 目的**：验证“一整块装下全部数据”是否影响读 parity、能否避免写入期第 2 个 vsegment 的 full-state；只改 extent（50→256GiB），其余不变；不改码/不重启 target/不重启 etcd。**注意：256GiB 是 SSD 上的 NoF extent，不是节点 DRAM；当前每 target 注册 segment 512GiB，256G/member 留一半余量；再大需扩注册，对 60k 无收益。** 第四阶段文档：`第四阶段_node234/README.md`；oplog 墙跟踪：`第四阶段_node234/oplog写入墙跟踪.md`。
+- 当前任务：**NOF-126（同会话三臂：vseg256 复读 3 遍 → vseg50 重写+读 3 遍 → plain 重写+读 3 遍；判 extent 影响、同会话 parity、以及 +58% IO 数是否为计数伪影；2026-11-26）**。**NOF-125 结果**：写侧全胜——60,000/0、vsegments 全程 1、无大 full-state（value_max 9,087B）、写 P50 326.09µs；读侧 **P50 272.37µs = plain 1.068×（未达 ≤1.05）、比 NOF-124 vseg 246.32 慢 10.6%**，但为单遍+跨会话（历史漂移 ~9%），**不能归因 extent**；target W9 反而低 3%，且“读 IO +58%”与理论 960k/target 不符（841k/822k vs 535k/515k，两单窗口口径不同）⇒ 需同会话三臂复核。P99/Max 按既定边界不追。**决策**：50G/3vseg 暂为 parity 配置；NOF-126 若证明 256G≈50G 且同会话 parity 则保留 256G（写侧收益），若 256G 稳定慢 >5% 则回 50G。第四阶段文档：`第四阶段_node234/README.md`；关键结果：`第四阶段_node234/第四阶段关键结果_测试条件.md`；oplog 墙跟踪：`第四阶段_node234/oplog写入墙跟踪.md`。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -9018,3 +9018,128 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 不删其它 cluster 的 etcd 键；不清 target 数据（新 cluster 从 offset 0 覆盖写）。
 - 单遍读，不跑 T4/T16、不跑 20k；不做补写。
 - 预计 **40–60 分钟**（写 60k 为主）。
+
+---
+
+## NOF-125 裁决（2026-11-26 · 写侧全胜；读侧 1.068× 未达 parity）
+
+### 1. 结果（[事实]）
+
+**A. 配置生效 / quota**
+
+| 项 | 实测 |
+|---|---|
+| extent flag | `--vsegment_member_extent_size=274877906944`（唯一改动；NOF-123 为 53687091200） |
+| auto-plan 日志 | `member_count=2, stripe_size=2097152, member_extent_size=274877906944` |
+| VSegment created | `capacity=549755813888`；两 member 各 `offset=0, len=274877906944` |
+| quota 发布耗时 | 30s |
+| 注册 | B→A 两条 succeeded；segment=2；`master_total_nof_capacity_bytes=1099511627776`（1TiB） |
+| vsegments / logical_capacity | 1 / 549,755,813,888（512GiB） |
+
+**B. 写入（T1/batch1，60k，15:02:42→15:05:07，145s 墙钟）**
+
+| 项 | 实测 |
+|---|---|
+| Keys / failed | **60,000 / 0** |
+| vsegments 全程 | **1**（t+0/60/120/130s 均 1；`VSegment created` 条数=1） |
+| full-state 大事务 | **无**：`value_max` 1,281→3,591→7,518→**9,087 B**；`full_state` 日志=0 |
+| ResourceExhausted | 0；`VSEGMENT_CREATING`=0；`ret=[]` |
+| 写 P50 / P99 | **326.09 / 417.56** |
+| target A/B 写 n / W9avg | 960,017 / 960,016；22,890 / 22,610 ns |
+| etcd 增量 | +94.4MiB（oplog +56.56MiB）；dbSize 387.75MiB；raftIndex 452,312 |
+
+**C. 读取（1 遍，60k queries，T1/warmup128/qpairs4/verify=false/diag 关，20s 墙钟）**
+
+| 项 | 实测 |
+|---|---|
+| queries / failed | 60,000 / **0** |
+| Min / Avg / **P50** / P90 / P99 / Max | 250.54 / 278.06 / **272.37** / 285.03 / 386.92 / 60,862.44 |
+| type | 120,256 全 `vsegment`（含 warmup 256）；无 unknown |
+| target B / A 读 n | 841,329 / 822,083 |
+| target B / A 读 W9avg | 39,150 / 38,890 ns |
+
+**D. 对比（[事实]，均为单遍/跨会话）**
+
+| 对比 | 指标 | 本单 | 参照 | 比值 |
+|---|---|---|---|---|
+| vs plain（NOF-124） | P50 | 272.37 | 255.06 | **1.068×（判据 ≤1.05，未通过；阈值 267.81）** |
+| | Avg / P90 / P99 / Max | 278.06 / 285.03 / 386.92 / 60,862.44 | 256.74 / 263.26 / 274.62 / 2,443.73 | 1.083 / 1.083 / 1.409 / 24.9 |
+| | target W9avg | 39,150 / 38,890 | 44,450 | **0.881 / 0.875** |
+| vs vseg（NOF-124，同 60k） | P50 | 272.37 | 246.32 | **+10.6%（变差）** |
+| | Avg / P90 | 278.06 / 285.03 | 252.35 / 255.10 | +10.2% / +11.7% |
+| | target 读 n | 841,329 / 822,083 | 535,330 / 515,570 | **+57% / +59%** |
+| | target W9avg | 39,150 / 38,890 | 40,410 / 40,330 | −3.1% / −3.6% |
+| 写入 vs NOF-123（50G/3vseg） | 写 P50 | 326.09 | 364.43（含扩容停顿） | −10.5%（非干净对照） |
+| | Keys / failed | 60,000 / 0 | 59,931 / 69 | 本单完整 |
+| | vsegments / value_max | 1 / 9,087B | 1→3 / 13,284,282B | 无扩容、无大 full-state |
+
+### 2. 判读边界（重要）
+
+1. **写侧：一整块目标完全达成**——vsegments 恒 1、无第 2 个 vsegment、无 13–31MB full-state、60k 零失败；NOF-122 的 H2（full-state 来自跨 vsegment 扩容）得到验证。
+2. **读侧：未达 parity**（1.068× > 1.05）。但这是**单遍 + 跨会话**对比，且 NOF-124 与 NOF-125 的 10.6% 差异落在历史会话漂移（~9%）量级内 ⇒ **不能直接归因 extent**。
+3. **不是 target 单 IO 变慢**：target W9 反而低 3%，端到端却高 10.6% ⇒ 劣化在 target 执行段之外。
+4. **“+58% target IO 数”不成立为事实**：理论应为 60k×16=960,000/target；实测 NOF-125 为 841,329/822,083（86%/87%），NOF-124 为 535,330/515,570（54%/56%）⇒ 该计数本身不是完整 IO 总量，且两单窗口口径不同；**不能据此判定“读被拆成更多 IO”**，需同会话三臂复核。
+5. 吞吐类数字为 bench 内部口径，与墙钟不符（写 145s / 读 20s），**不作验收**；P99/Max 按既定边界不追（Max 60.86ms 为单点离群，未归因）。
+6. 部署仍保留 etcd 64MiB 的必要性：master 重启恢复仍会触发 60k≈31MB full-state（extent 大小不改变该恢复路径）。
+
+### 3. 决策
+
+1. **50GiB/3-vseg 暂时保留为 parity 配置**（NOF-124：P50 0.966×）；256GiB 暂不定为读路径配置。
+2. 下发 **NOF-126 同会话三臂**（vseg256 复读 → vseg50 重写+读 → plain 重写+读），一次性判决：extent 是否真的影响读、同会话 parity、以及 per-pass target n 是否随配置变化。**零改码、不重启 target/etcd、不追长尾。**
+3. 若 NOF-126 证明 256G 与 50G 读等价且同会话 parity ⇒ 保留 256G（写侧收益）；若 256G 稳定慢 >5% ⇒ 回 50G，256G 仅作写侧选项。
+
+### 4. 环境末态
+
+- `vseg_nof125` master 2416799/2416802 运行中：Keys=60000、vsegments=1、logical_capacity=549755813888；etcd 2408033/2408036（64MiB，dbSize 387.75MiB）；target A 3329243 / target B 2391418 未重启；node2/node4 无残留。
+- 未改码/未重编/未装包/未重启 target/未重启 etcd。
+
+---
+
+# NOF-126（待执行 · 同会话三臂：vseg256 复读 vs vseg50 重写 vs plain 重写 · 2026-11-26）
+
+## 目标
+
+- 用**同一会话、同一读取参数**回答三件事：
+  1. NOF-125 的 P50 272.37 是稳定值还是会话漂移（vseg256 数据已存在，零写复读 3 遍）；
+  2. extent 50GiB vs 256GiB 是否真的改变读时延（同会话重写 50G 臂，3 遍）；
+  3. 同会话 plain 阈值下的 parity（plain 60k 重写+3 遍）。
+- 同时记录每臂 per-pass target A/B 的读 n 与 W9，验证 NOF-125 的“+58% IO 数”是真实现象还是窗口计数伪影。
+- 不改码、不重启 target/etcd、不补写、不追长尾。
+
+## A. vseg256 复读（零写，3 遍）
+
+1. 复用当前 `vseg_nof125`（master 2416799/2416802，Keys=60000，vsegments=1）；target A/B 不动。
+2. Reader 3 遍：`--num_keys=30000`/segment（60k queries）、T1/threads=1/batch=1、warmup=128、qpairs=4、verify=false、diag 关。
+3. 每遍记录：P50/Avg/P90/P99/Max、failed、target A/B 读 n 与 W9avg、墙钟时长。
+4. 本段零写；若 master/数据异常，停手回报。
+
+## B. vseg50 臂（重写 60k + 3 遍读）
+
+1. 停 `vseg_nof125` master（记录 PID）；target A/B 不动；etcd 保持 64MiB 不重启。
+2. 起新 cluster `vseg_nof126_50g`（node4，50056/9006/8086、slot=1、etcd、URMA、HA+oplog on、`--oplog_batch_max_entries=64`），除 extent 外与 NOF-125 完全相同：`member_count=2 / stripe=2MiB / required_medium=nof / reserved_ratio=0 / io_alignment=4096 / submaster_count=1`；**`--vsegment_member_extent_size=53687091200`（50GiB）**。若 etcd 已存在 `/cvm/vseg_nof126_50g/` 或 `/oplog/vseg_nof126_50g/` 键，两处都删；不删其它 cluster 键。
+3. 注册 B→A 各 512GiB；等 quota ≥20s；验收 `member_extent_size=53687091200`、`logical_capacity=107374182400`、partitions=1、reconcile_fail=0。
+4. 写 60k：`--num_keys=30000`/segment、T1/batch1、4MiB；记录 Keys/failed/失败码、vsegments/create_success、`value_max`（预期 13.3MB full-state 出现）、写 P50/P99、墙钟时长、target A/B 写 n 与 W9。
+5. **不补写**；Reader 3 遍（同 A 段参数），记录同指标与 failed。
+
+## C. plain 臂（重写 60k + 3 遍读）
+
+1. 停 vseg50 master；起 `plain_nof126p`（50056/9006/8086、slot=1、etcd、URMA、HA+oplog、batch=64）；若 etcd 已存在 `/cvm/plain_nof126p/` 或 `/oplog/plain_nof126p/` 键，两处都删；注册 B 512GiB。
+2. 写 60k：16t/batch16、4MiB；验收 Keys=60000、logical_used=251,658,240,000；记录写 n、墙钟时长（写时延可报 P50）。
+3. Reader 3 遍（同 A 段参数）；记录同指标、failed、target B 读 n 与 W9。
+
+## D. 判决（必答）
+
+1. **稳定性**：A 段 3 遍彼此的离散度，以及相对 NOF-125 首遍 272.37 的位置。若 3 遍彼此差 <5% 且都在 272 附近 ⇒ 272 是该会话的稳定值；若明显低于 272（接近 246）或离散 >5% ⇒ 首遍受会话状态影响，NOF-125 的 10.6% 不能归因 extent。
+2. **extent 影响**：A（vseg256）与 B（vseg50）3 遍 P50 均值/中位对比；同会话下若 256 稳定慢 >5% ⇒ extent 真实影响读；若 ≤5% 或交叉 ⇒ 无显著影响。
+3. **parity**：A、B 分别与 C（同会话 plain）比 P50/W9，判据 ≤1.05×；给出两臂各自的比值。
+4. **IO 数**：逐臂逐遍 target A/B 读 n；若 50G 与 256G 在同会话内 n 仍差 >20% 且稳定，记录为真实线索；若 n 随遍数大幅波动或接近理论 960k，判定 NOF-125 的 +58% 为窗口计数伪影。
+5. **配置建议**：按 D2/D3 给出保留 256G 还是回 50G 的结论（测试侧只报事实与比值，不自行改配置）。
+
+## E. 边界
+
+- 不改码/不重编/不装包/不重启 target/不重启 etcd（保持 64MiB）。
+- 顺序固定：**A（256G 复读，零写）→ B（50G 重写+读）→ C（plain 重写+读）**；B/C 会覆盖前面的数据，不得调换。
+- 不补写缺失 key；不跑 T4/T16、不跑 20k；不追 P99/Max；diag 关。
+- 每遍读都是 1 遍 60k queries（约 20s）；共 3+3+3 遍。
+- 50G 臂预期会出现 3 个 vsegment 和 13.3MB full-state（etcd 64MiB 已验证可承载）；若 ResourceExhausted 复现，停手回报。
+- 预计 **25–35 分钟**。

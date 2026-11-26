@@ -140,7 +140,7 @@
 - etcd 启动失败/数据异常：恢复原参数重启，停手回报；
 - 64MiB 仍被拒：停手，附 etcd flag/错误原文；下一步才考虑改码（拆分/省略 full-state）或退回 20k。
 
-### 5.3 下一单候选（2026-11-26 已下发为 NOF-125）
+### 5.3 一整块 vsegment（NOF-125 已验证，写侧达成）
 
 **一整块 vsegment**：`member_extent_size=256GiB`（逻辑 512GiB），60k/234.375GiB 全部装进 1 个 vsegment。
 
@@ -148,6 +148,7 @@
 - 一整块 = 不再创建第 2 个 vsegment ⇒ 写入过程中不触发这次 full-state；初始 checkpoint（0 keys）很小，后续都是 delta。
 - 为什么是 256GiB 而不是 128GiB：128GiB/member（逻辑 256GiB）也够装 234.375GiB，但只剩 9% 余量；当前每 target 已注册 512GiB，256GiB/member 留一半余量且无需扩大注册（再大才要扩 segment 注册，对 60k 无收益）。
 - **只解决写入过程**：master 重启/恢复仍会做一次 full-state（60k≈31MB），etcd 默认 2MiB 仍不够 ⇒ 恢复/HA 仍需 etcd 64MiB 或改码；NOF-125 保持 etcd 64MiB 不动（本次不隔离该变量）。
+- **NOF-125 实测（2026-11-26）**：60,000/0 failed；vsegments 全程 1；`VSegment created`=1；value_max 9,087B、full_state 日志 0、ResourceExhausted 0 ⇒ **写侧目标完全达成**，H2 验证。读侧 P50 272.37µs（跨会话 plain 1.068×）未达 parity，但与 extent 的归因待 NOF-126 同会话三臂复核。
 
 ---
 
@@ -164,7 +165,7 @@
 
 ---
 
-## 7. 最终结果（NOF-123 已更新，读臂/plain 待 NOF-124）
+## 7. 最终结果（NOF-123/124/125 已更新）
 
 ### 7.1 NOF-123 E1（写入墙解除）
 
@@ -201,7 +202,29 @@
 - vseg 69 个缺失 key（type unknown、1× `-704 OBJECT_NOT_FOUND`）可能污染尾部（Max 57.8ms 很可能是一次失败查找）；**在补齐或剔除失败样本前，不能把尾部差距归因 vseg 路径**。
 - `logical_capacity` 刷新后 300GiB，`logical_used=251,368,833,024=59,931×4MiB` 精确相等 ⇒ NOF-123 的 100GiB 是 gauge 刷新延迟。
 - etcd 64MiB 两阶段 ResourceExhausted 0 ⇒ **写入墙解决**。
-- 当前配置 `extent=50GiB`、3 个 vsegment；一整块 `extent=256GiB` 由 NOF-125 验证中（目标：vsegments 保持 1、无第 2 次 full-state、读 parity 保持）。
+- 当前配置 `extent=50GiB`、3 个 vsegment；NOF-124 在此配置下达到 P50/Avg/P90/W9 parity。
+
+### 7.3 NOF-125（一整块 256GiB：写入期墙彻底消失，读侧待复核）
+
+| 项 | 实测 |
+|---|---|
+| extent / logical_capacity | 274,877,906,944（256GiB/member）/ 549,755,813,888（512GiB） |
+| Keys / failed | **60,000 / 0** |
+| vsegments | **全程 1**；`VSegment created`=1 |
+| full-state | 无大事务；value_max **9,087 B**；full_state 日志 0 |
+| ResourceExhausted / CREATING | 0 / 0 |
+| 写 P50 / P99 | 326.09 / 417.56µs（145s 墙钟） |
+| target A/B 写 n | 960,017 / 960,016；W9avg 22,890 / 22,610ns |
+| 读 P50 / Avg / P90 / P99 / Max | 272.37 / 278.06 / 285.03 / 386.92 / 60,862.44µs（20s 墙钟） |
+| 读 failed | 0 |
+| target B/A 读 n | 841,329 / 822,083；W9avg 39,150 / 38,890ns |
+| vs plain（NOF-124，跨会话） | P50 1.068×；W9 0.881/0.875 |
+| vs vseg（NOF-124，50G） | P50 +10.6%；W9 −3.1%/−3.6% |
+| etcd 增量 | +94.4MiB（oplog +56.56MiB）；dbSize 387.75MiB |
+
+- **写侧目标完全达成**：一整块不再创建第 2 个 vsegment，NOF-122 的 H2（full-state 来自跨 vsegment 扩容）得到验证；即使一整块，master 重启恢复仍会做 60k≈31MB full-state，**etcd 64MiB 仍不可撤**。
+- **读侧未达 parity**（1.068× vs 跨会话 plain），但与 NOF-124 的 10.6% 差异落在会话漂移量级内，**不能归因 extent**；target W9 反而低 3%；“读 IO +58%”因 target 计数不完整/窗口不同，不作事实采信。
+- NOF-126 同会话三臂（vseg256 复读 / vseg50 重写 / plain 重写）复核后再定配置。
 
 ---
 
@@ -238,4 +261,5 @@
 - 2026-11-26：建立本文档；记录 NOF-119 A / 120 / 121 / 122；确定根因为 full-state 单条 oplog entry；下发 NOF-123（etcd 64MiB）。
 - 2026-11-26：NOF-123 E1 成功，写入墙解除；NOF-124 P50/Avg/P90 parity 达成，P99/Max 待清洁数据。
 - 2026-11-26：NOF-125 下发——一整块 vsegment（extent=256GiB/member、逻辑 512GiB），验证写入期不再出现第 2 个 vsegment 的 full-state，并复核读 parity。
-- **遗留**：vseg 69 个缺失 key（0.115%）未回填；P99/Max 未平，暂不归因 vseg 路径；一整块 256GiB 结果待 NOF-125 回执。
+- 2026-11-26：NOF-125 回执——写侧完全达成（60,000/0、vsegments=1、value_max 9,087B、无 full-state 大事务）；读侧 272.37µs（跨会话 plain 1.068×）未达 parity，但与 extent 的归因待 NOF-126 同会话三臂。
+- **遗留**：NOF-124 的 69 个缺失 key 未回填（NOF-125 已重写为 60k/0）；P99/Max 未平，暂不归因 vseg 路径；extent 对读的影响待 NOF-126 判决。

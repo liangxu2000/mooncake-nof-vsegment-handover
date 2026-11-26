@@ -61,15 +61,16 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 
 ---
 
-## 3. 当前环境状态（2026-11-26 NOF-125 起）
+## 3. 当前环境状态（2026-11-26 NOF-126 起）
 
 | 对象 | 状态 |
 |---|---|
 | target A（node3） | PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR、零 IO |
 | target B（node4） | **已重建**：PID 2391418；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `c19b91e1…`；11/11、strip 256KiB、nsid1、4457；0 ERROR |
-| master | NOF-124 后 plain `plain_nof124` 2413231/2413234 运行（Keys=60000）；NOF-125 将停 plain、起 `vseg_nof125`（extent=256GiB/member） |
+| master | **`vseg_nof125` 2416799/2416802 运行中**：Keys=60000、vsegments=1、extent=256GiB/member、logical_capacity=512GiB；NOF-126 将先零写复读、再切 vseg50 / plain |
+| etcd | 2408033/2408036；`--max-request-bytes=67108864`；dbSize 387.75MiB |
 | node2 | 无 bench/register 残留 |
-| 当前任务 | **NOF-125（一整块 vsegment：extent=256GiB/member、逻辑 512GiB，60k 全装 1 个 vsegment；对比 NOF-124 parity 基线）** |
+| 当前任务 | **NOF-126（同会话三臂：vseg256 复读 vs vseg50 重写 vs plain 重写；判 extent 影响与同会话 parity）** |
 
 ---
 
@@ -278,6 +279,32 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - `logical_capacity` 刷新后 300GiB、`logical_used=251,368,833,024=59,931×4MiB` ⇒ NOF-123 的 100GiB 是 gauge 延迟。
 - etcd 64MiB 两阶段 ResourceExhausted 0 ⇒ 写入墙解决。
 - 决策：本阶段收口；不追 P99、不推进一整块 128GiB；未来若要求尾部/部署优化另立单。
+
+### NOF-125 结果（2026-11-26，写侧全胜、读侧未达 parity）
+
+| 项 | 实测 |
+|---|---|
+| extent | 274,877,906,944（256GiB/member）；logical_capacity=549,755,813,888（512GiB） |
+| 写入 | **60,000 / 0 failed**；vsegments 全程 **1**；`VSegment created` 条数=1；value_max 9,087B（无大 full-state）；ResourceExhausted=0；CREATING=0；145s 墙钟；写 P50/P99 326.09/417.56 |
+| 写入 target | A/B n=960,017/960,016；W9avg 22,890/22,610 ns |
+| 读取 | 60,000 / 0 failed；20s 墙钟；Min 250.54 / Avg 278.06 / **P50 272.37** / P90 285.03 / P99 386.92 / Max 60,862.44 |
+| 读 target | A/B n=822,083/841,329；W9avg 38,890/39,150 ns |
+| vs plain（NOF-124） | P50 **1.068×（>1.05，未通过）**；Avg 1.083× / P90 1.083× / P99 1.409× / Max 24.9×；W9 **0.881/0.875** |
+| vs vseg（NOF-124，50G） | P50 **+10.6%**；Avg +10.2% / P90 +11.7%；target 读 n 535,330/515,570 → 841,329/822,083（+57%/+59%）；W9 −3.1%/−3.6% |
+
+- 写侧：一整块目标完全达成，NOF-122 的 H2（full-state 来自跨 vsegment 扩容）得到验证；写 P50 326.09 vs NOF-123 364.43（−10.5%，后者含扩容停顿，非干净对照）。
+- 读侧：1.068× 未达 parity；但**单遍 + 跨会话**，10.6% 差异落在历史会话漂移（~9%）量级内，**不能归因 extent**。
+- target W9 反而低 3%、端到端却高 10.6% ⇒ 劣化不在 target 单 IO。
+- “读 IO +58%”不可采信为事实：理论 60k×16=960,000/target；两单实测分别为 841k/822k（86%/87%）与 535k/515k（54%/56%），计数本身不完整、窗口口径不同。
+- 决策：50G/3vseg 暂为 parity 配置；NOF-126 同会话三臂复核后再定。
+
+### 当前 NOF-126（同会话三臂）
+
+1. **A（零写）**：`vseg_nof125`（256G，60k）复读 **3 遍**。
+2. **B（重写）**：新 `vseg_nof126_50g`（extent=50GiB，其余同），写 60k、读 **3 遍**。
+3. **C（重写）**：`plain_nof126p`（单 target B），写 60k、读 **3 遍**。
+4. 判：A 的稳定性；A vs B 的 extent 影响（>5% 稳定慢才算）；A/B 各自 vs C 的同会话 parity（≤1.05×）；逐遍 target n 验证 +58% 真伪。
+5. 边界：零改码、不重启 target/etcd、不补写、不追长尾；顺序固定 A→B→C（后写会覆盖前数据）。
 
 ---
 
