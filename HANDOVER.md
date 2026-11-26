@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-139（MC_EID_INDEX 0 vs 1 · 正式 T1 时延 A/B · 2026-11-26）**。背景：NOF-138 在 16t/batch16 带宽口径下 EID1 **−0.44%** ⇒ 带宽无收益；用户要求回到**正式读口径**（T1/batch1、60k、每遍一遍≈20s）再看端到端时延有没有差别。做法：`plain_nof135p` 2509048/2509051 不动，只改 bench env，E0→E1→E0→E1→E0→E1（每臂 3 遍），每遍记 Avg/P50/P90/P99/P999/Max、failed、target B W9，核 `Selected URMA device ..., EID index 0/1`；按 `D:\gds性能\测试结果聚合方法_20261112.md` 聚合（Avg=各遍均值、分位=各遍同分位中位），给 E1/E0 比值与 spread；**不报吞吐、不列逐遍值**；EID1 失败即停、不重启 target；不改码/不重启 master/target/etcd/不写数据；预计 3–5 分钟。其他：NOF-138 完成（带宽口径 EID1 −0.44%，EID 线在带宽维度关闭；本单只做 T1 时延复核）；NOF-137 取消；NOF-135/136 统计定稿；正式结果仍为 NOF-127；环境 `plain_nof135p` 运行（Keys=60000）。
+- 当前任务：**NOF-140（SPDK_URMA_EID_INDEX 0 vs 1 · 正式 T1 时延 A/B · 2026-11-26）**。背景：用户更正变量名——要试的是 SPDK 的 `SPDK_URMA_EID_INDEX`，不是 Mooncake 的 `MC_EID_INDEX`；**NOF-139 取消**。源码事实：`lib/nvme/nvme_urma_common.c:147` 的 `spdk_urma_opts_init` 读该 env（默认 0），设备打开按 `eid_index` 匹配、**找不到静默回退首个 EID**；`lib/nvmf/urma.c:1209` 的 target transport 初始化也调用同一函数（所以该 env 客户端和 target 都读，target 在启动时读）。做法：`plain_nof135p` 不动，**只改 bench 客户端 env**（零重启），E0→E1→E0→E1→E0→E1 各 3 遍，正式 T1/batch1、60k、每遍一遍≈20s；记 Avg/P50/P90/P99/P999/Max、failed、target B W9、进程 environ；按 2026-11-12 方法聚合，给 E1/E0 比值与 spread；不报吞吐、不列逐遍；EID1 失败即停、不重启 target；不改码/不重启 master/target/etcd/不写数据；预计 3–5 分钟。其他：NOF-138 带宽口径 EID1 −0.44%；NOF-137 取消；正式结果仍为 NOF-127；环境 `plain_nof135p` 运行（Keys=60000）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -10078,5 +10078,57 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 
 - 不改码/不重编/不装包/不重启 master/target/etcd；**只改 bench env**。
 - 不写数据、不切 vsegment、不重启 target。
+- 环境末态：`plain_nof135p` 保持运行；target/etcd 未动。
+- 预计 **3–5 分钟**。
+
+---
+
+## NOF-139 取消（2026-11-26 · 变量名更正）
+
+- 用户撤回：要试的是 SPDK 的 **`SPDK_URMA_EID_INDEX`**，不是 Mooncake 的 `MC_EID_INDEX`；NOF-139 不再执行。
+- 如已启动，停掉；其数据作废、不并入任何表；环境保持不动。
+- 后续以 **NOF-140** 为当前任务。
+
+---
+
+# NOF-140（待执行 · SPDK_URMA_EID_INDEX 0 vs 1 · 正式 T1 时延 A/B · 2026-11-26）
+
+## 背景与源码事实
+
+- 用户更正：yin 说的旋钮是 **`SPDK_URMA_EID_INDEX`**（SPDK URMA transport），不是 Mooncake 的 `MC_EID_INDEX`。
+- 本地 SPDK 参考树（`_ref/spdk`，**实际运行树须在预检中核对**）：
+  - `lib/nvme/nvme_urma_common.c:147` `spdk_urma_opts_init` 读取 `SPDK_URMA_EID_INDEX`，**默认 0**；
+  - 设备打开时按 `eids[i].eid_index == opts->eid_index` 选 EID，**找不到则静默回退首个 EID**（与 Mooncake `MC_EID_INDEX` 的报错不回退不同）；
+  - `lib/nvmf/urma.c:1209` target 的 `nvmf_urma_opts_init` 也调用同一 `spdk_urma_opts_init` ⇒ 该 env **客户端和 target 都读**，target 在启动时读入（JSON 可覆盖）。
+- **本单只改 bench 客户端 env（零重启）**；target 当前 EID 只读记录，不重启。若客户端无差别而同事指的是 target 侧，另单再议（需重启 target）。
+
+## A. 预检（只读）
+
+1. 环境快照：`plain_nof135p` 2509048/2509051（Keys=60000）、target B 2458315、target A 3329243、etcd 2455814。
+2. **确认实际 bench 链接的 SPDK 树里有该 env**：`grep -rn "SPDK_URMA_EID_INDEX" $D/spdk-e12b7cb-src/lib/nvme/nvme_urma_common.c`；并 `strings <bench 二进制> | grep SPDK_URMA_EID_INDEX`。**若没有该字符串 ⇒ 停手回报，不重编、不换库**。
+3. `urma_admin show -d udmac0d1e2`：确认 EID index 0 与 1 都存在且 ACTIVE。
+4. 只读记录 target B 当前 transport 的 `eid_index`（`nvmf_get_transport` / 启动日志 / `/proc/<pid>/environ`，能取到什么记什么）；**不改**。
+5. 确认所有遍 `MC_EID_INDEX` 未设或为 0（与 NOF-138 变量隔离）；只变 `SPDK_URMA_EID_INDEX`。
+
+## B. A/B
+
+1. 每遍 env：既有 `SPDK_URMA_DEV_NAME=udmac0d1e2` + `SPDK_URMA_EID_INDEX=0` 或 `1`；其余不变。
+2. 每遍：`segment_read --num_keys=60000 --num_threads=1 --batch_size=1`、`--warmup_keys=128`、`--nof_qpairs_per_segment=4`、verify=false、diag 关、sequential（`--shuffle_seed=0`）；**每遍只读一遍 60k（约 20s），禁止 `--duration`**。
+3. 顺序：**E0→E1→E0→E1→E0→E1**（每臂 3 遍，交替抵消漂移）。
+4. 每遍记录：**Avg/P50/P90/P99/P999/Max、failed、墙钟、target B W9avg/n**；另存该遍 bench 进程的 `/proc/<pid>/environ` 中 `SPDK_URMA_EID_INDEX` 值（证明 env 到达进程）；SPDK 日志如有 EID 行一并摘录。
+5. EID1 初始化/读失败/rc≠0 ⇒ **停手**，恢复到 E0，**不重启 target**，回报错误原文。
+
+## C. 聚合与判读
+
+- 按 `D:\gds性能\测试结果聚合方法_20261112.md`：**Avg=各遍等权均值；P50/P90/P99=各遍同分位中位**；`spread=(max−min)/mean`。
+- 表：E0、E1 两行（Avg/P50/P90/P99 + spread + failed），再给 **E1/E0 比值**。
+- 判据：① 偏差小于两臂 spread ⇒ **无差别**，该维度关闭；② E1 稳定低 **>5%** ⇒ 记“SPDK EID 在 T1 时延有收益”，再议 vsegment 复测；③ E1 更慢 ⇒ 关闭。
+- **正文不报吞吐、不列逐遍值**；逐遍原始值落 `run/nof140_rounds.csv`。
+- E0 三遍应接近正式 plain 基线（P50≈252–254µs）；明显偏离先报环境异常，不作 EID 归因。
+
+## D. 边界
+
+- 不改码/不重编/不装包/不重启 master/target/etcd；**只改 bench env**。
+- 不写数据、不切 vsegment；target EID 只读不改。
 - 环境末态：`plain_nof135p` 保持运行；target/etcd 未动。
 - 预计 **3–5 分钟**。
