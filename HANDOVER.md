@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-116（双 target 400-key 性能：plain 单 target vs vseg member_count=2，T1×3 遍，parity 验收）**。NOF-115 完成：**双 target vseg 已打通**——node3 A + node4 B 注册为 2 个不同 segment（traddr/NQN 均不同）；quota generation=1、member_count=2、extent=50GiB、stripe=2MiB、partitions=1、logical_capacity=100GiB、reconcile_fail=0；写读通过，每 key 2 child（blocks=4096、sub_ios=16），两个 target 各约 66 IO（4 keys）均分。**关键口径**：① segment 注册**不持久**，注册进程退出即失效 ⇒ 每次 bench/每次 master 重启后必须按 node4 B → node3 A 重注册，并在整臂期间保持注册进程存活；② `segment_write` 下 `--num_keys=N` 是**每 segment N keys** ⇒ vseg 两 segment 要写 400 keys 用 `--num_keys=200`（预期 Keys=400）；③ `vsegments=1` 是 quota 发布时预建，正常；④ `logical_used` gauge 1000s 才刷新，验收以 Keys/写日志为准。NOF-116：plain 400 keys 单 target 先测，再 vseg 400 keys 双 target；400/50G、不改码、不重启 target。**第四阶段文档：`第四阶段_node234/README.md`；2026-11-26 起后续结果统一放 `第四阶段_node234/`。**
+- 当前任务：**NOF-117（vseg 64KiB chunk 只读对照：让每个 target 每 key 看到 32 个 IO，对齐 plain 的队列深度；零写/零重启/零改码）**。NOF-116 完成：双 target 把差距从单 target 的 **2.03×** 压到 **P50 均值 1.215× / 中位 1.109× / 最好 1.058×**（plain 266.36µs；vseg 均值 323.59、中位 295.47、最好 280.17）；W9 plain 120.33 vs vseg 各 target 157.3（1.31×）；**未达 parity（≤1.05×）**。vseg 6 遍方差大（280–461µs，一遍 461 为离群），按中位更稳。**口径更正**：① `segment_write` 与 `segment_read` 的 `--num_keys=N` 都是**每 segment N** ⇒ vseg 读 400 queries 要用 `--num_keys=200`（用 400 会得到 800 queries/400 rpc_fail，那 3 遍已作废）；② segment 注册**不依赖常驻进程**——master 通过 `nof_heartbeat_*` 主动探测 target 维持，`nof_register` 退出 40+ 分钟段数仍为 2；**只有 master 重启才需要重注册**；③ `vsegments=1` 预建、`logical_used` gauge 1000s 滞后，验收以 Keys/写日志为准。**第四阶段文档：`第四阶段_node234/README.md`；后续结果统一放该目录。**
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -8296,3 +8296,84 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 注册进程必须整臂存活；若中途失效（segment 数掉到 0/1），停手回报。
 - 不要混用 plain/vseg 的 Keys 语义：plain 单 segment 400；vseg 每 segment 200（总 400）。
 - 预计 **30–40 分钟**。
+
+---
+
+## NOF-116 裁决（2026-11-26 · 回执已收）
+
+### 1. 结果（[事实]）
+
+| 臂 | P50（6 遍/3 遍） | 均值 | 中位 | W9（每 target） |
+|---|---|---|---|---|
+| plain（node4 单 target） | 267.74 / 264.86 / 266.49 | **266.36** | 266.49 | **120.33** |
+| vseg（node3+node4） | 300.09 / 461.35 / 284.93 / 290.85 / 324.15 / 280.17 | **323.59** | **295.47** | **157.3**（A/B 各 ~157） |
+
+- 比值：**均值 1.215×、中位 1.109×、最好一遍 1.058×**（280.17 vs 264.86）；W9 1.31×。
+- vseg 6 遍方差大，461.35µs 是离群；去掉它后均值 ~296µs（1.11×）。
+- 相对单 target 的 2.03×，双 target 把差距压到约 **1.1×**，但**未达 parity（≤1.05×）**。
+- 两 target 写窗口 n=6400/6402，读窗口各 ~8450，**均分**；`type` 全 vsegment。
+
+### 2. 口径更正（重要，后续必须遵守）
+
+1. **vseg reader 的 `--num_keys` 也是每 segment**：`--num_keys=400` 会读 800 queries（400 rpc_fail）；要读 400 个 key 用 **`--num_keys=200`**。NOF-116 前 3 遍 vseg P50（185.91/217.84/216.33）因 400 个失败样本污染，**已作废**。
+2. **segment 注册不依赖常驻进程**：master 通过 `nof_heartbeat_*` 主动探测 target 维持；`nof_register` 退出 40+ 分钟后 segment 数仍为 2、心跳计数增长。**只有 master 重启才需要重注册**；此前“注册进程必须整臂存活”的说法作废。
+3. `vsegments=1` 是 quota 发布预建；`logical_used` gauge 1000s 滞后，验收以 Keys/写日志为准。
+4. plain 数据已被 vseg 写入覆盖；后续 plain 基线需要重新写。
+
+### 3. 判读
+
+- 差距已从“每个 target 单 IO 2×”降到“每 target 157 vs plain 120（1.31×）”，同时 vseg 每 target 只承担一半 IO。
+- 剩余差距的两个方向：
+  1. **vseg 每 target 每 key 16 个 IO，plain 是 32 个** ⇒ 队列深度/批处理形状不同；若把 chunk 从 128KiB 减到 64KiB，vseg 每 target 会变成 32 个 IO，与 plain 对齐。
+  2. vseg 每 IO 的 target 执行段仍比 plain 慢（157 vs 120），属于 target 服务路径。
+- **不改码前提下，先试方向 1**：NOF-117。
+
+### 4. 下一步
+
+**NOF-117**：vseg 只读，chunk 128KiB（对照）vs 64KiB（每 child 32 个子 IO，每 target 32 IO/key），3 遍交替，零写/零重启/零改码。若 vseg@64K 达到 parity（≤266.36×1.05≈279.7µs），收口；若不变，说明队列深度不是剩余差距的主因，再考虑第三 target 或 target 侧 W9 trace。
+
+---
+
+# NOF-117（待执行 · vseg 64KiB chunk 只读对照 · 零写/零重启/零改码 · 2026-11-26）
+
+## 目标
+
+- 现有 `vseg_nof116` 数据（400 keys，两个 target，master 运行中）**只读**，不改数据、不重启 master/target。
+- 只改客户端 env `MC_NOF_SUBMIT_CHUNK_BYTES`：
+  - 对照：128KiB（现状，每 child 16 个 128KiB，每 target 16 IO/key）
+  - 实验：**64KiB**（每 child 32 个 64KiB，每 target 32 IO/key，与 plain 的每 target 32 IO 对齐）
+- 回答：把 vseg 每 target 的 IO 数从 16 提到 32，能否把 P50 从 ~323µs 压到 parity（≤ plain 266.36×1.05 ≈ **279.7µs**）。
+
+## A. 预检
+
+1. `vseg_nof116` master 运行中（Keys=400、2 segments、quota 100GiB）；**不要重启 master/target**。
+2. 两个 target A/B 运行；node2 无残留。
+3. 用 2-key 探针 + `MC_NOF_DEBUG=1` 确认 `MC_NOF_SUBMIT_CHUNK_BYTES=65536` 生效：`blocks_per_chunk=128`；128KiB 对照为 256。探针不算性能。
+4. 注册不需要常驻进程；若发现 master 被重启，按 B→A 重注册后再跑。
+
+## B. 只读 A/B（同一 master、同一数据）
+
+- reader：vseg，**`--num_keys=200`（每 segment 200，共 400 queries）**、T1（threads=1/batch=1）、warmup=128、qpairs=4、verify=false、diag 关。
+- 6 遍交替：128K、64K、128K、64K、128K、64K（降低漂移）；每遍记录 Min/Avg/P50/P90/P99/Max、failed、target A/B W9 与 n。
+- 不写数据；不换 master；不改代码。
+
+## C. 交付（必答）
+
+1. 探针证据：两档 `blocks_per_chunk`（128/256）。
+2. 6 遍表：chunk、P50、failed、target A/B W9/n。
+3. 对比：
+   - vseg@64K vs vseg@128K（同会话）；
+   - vseg@64K vs plain@128K 基线 266.36µs / W9 120.33；
+   - 是否达到 parity（≤279.7µs）。
+4. 判决：
+   - 达到 ⇒ 记录 64KiB 为候选配置，收口；
+   - 未达到但明显改善 ⇒ 可再试 32KiB（仅当 64K 相比 128K 有 ≥5% 改善）；
+   - 无改善 ⇒ 队列深度/IO 数不是剩余差距主因，停止调 chunk；下一步第三 target 或 target 侧 W9 trace。
+5. 环境末态；未写/未重启/未改码。
+
+## D. 边界
+
+- **零写入**；不改 master/target；不改代码/不重编；不跑 plain（plain 数据已被覆盖，用 NOF-116 基线）。
+- reader 的 `--num_keys=200` 是每 segment，不要用 400。
+- 若 64K chunk 导致 I/O 失败或 target 错误，停手回报。
+- 预计 **10–15 分钟**。

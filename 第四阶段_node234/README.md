@@ -67,9 +67,9 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 |---|---|
 | target A（node3） | PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR、零 IO |
 | target B（node4） | PID 2142228（11-25 15:20:22 起）；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `0470fe3a…`；11/11、strip 256KiB、nsid1、4457；ERROR 6 条（历史 pci_event socket read error 105） |
-| master | `vseg_nof115` 运行中（2355509/2355512）；Keys=4；2 个 segment；quota generation=1、member_count=2、extent=50GiB、logical_capacity=100GiB |
+| master | `vseg_nof116` 运行中（2360608/2360611）；Keys=400；2 个 segment；quota generation=1、member_count=2、extent=50GiB、logical_capacity=100GiB |
 | node2 | 无 bench/register 残留 |
-| 当前任务 | **NOF-116：plain 400 keys vs vseg 400 keys，T1×3，parity** |
+| 当前任务 | **NOF-117：vseg 只读，chunk 128K vs 64K，3 遍交替，看能否到 parity** |
 
 ---
 
@@ -83,8 +83,8 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 
 ### 4.2 工程口径（容易踩坑）
 
-1. **segment 注册不持久**：由注册进程心跳续期，进程退出即失效；**每次 bench / 每次 master 重启后**都必须按 **node4 B → node3 A** 顺序重注册，并让注册进程在整臂期间存活。
-2. **`segment_write --num_keys=N` 是每 segment N keys**：vseg 两个 segment 要写 400 keys，用 `--num_keys=200`（总 Keys=400）；plain 单 segment 用 `--num_keys=400`。
+1. **segment 注册不依赖常驻进程**：master 通过 `nof_heartbeat_*` 主动探测 target 维持；`nof_register` 退出 40+ 分钟后 segment 数仍为 2、心跳计数继续增长。**只有 master 重启才需要按 node4 B → node3 A 重注册**；此前“注册进程必须整臂存活”的说法作废。
+2. **`segment_write` 与 `segment_read` 的 `--num_keys=N` 都是每 segment N**：vseg 两个 segment 要写/读 400 keys，用 `--num_keys=200`（总 400 queries）；用 400 会得到 800 queries/400 rpc_fail。plain 单 segment 用 400。
 3. **`vsegments=1` 是 quota 发布时预建**，正常；写数据不会新增。
 4. **`logical_used` gauge 1000s 才刷新**；验收以 master `Keys` + writer 日志为准。
 5. child→target 的 endpoint 不在 `nof_slow_task` 里；落点均分用**两个 target 的 IO 计数相等**判断。
@@ -114,13 +114,30 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 
 ---
 
-## 6. 当前任务 NOF-116
+## 6. NOF-116 结果与当前 NOF-117
 
-- **plain**：node4 单 target，400 keys、16t 写、T1 读 3 遍、diag 关。
-- **vseg**：新 master `vseg_nof116`，注册 B→A，写 `--num_keys=200`（总 400 keys）、T1 读 3 遍、diag 关。
-- 记录：Keys/logical_used、P50/Avg/P90/P99、failed、target A/B W9 与 n。
-- 验收：**vseg P50 ≤ plain P50 × 1.05**；W9 同时报。
-- 边界：只写 400 keys；不跑 1000/20k；不改码；不重启 target；master 重启后必须重注册。
+### NOF-116（已完成，未达 parity）
+
+| 臂 | P50 均值 | P50 中位 | 最好一遍 | W9（每 target） |
+|---|---|---|---|---|
+| plain（node4 单 target） | **266.36µs** | 266.49 | 264.86 | **120.33µs** |
+| vseg（node3+node4） | 323.59µs | 295.47 | 280.17 | **157.3µs** |
+
+- 比值：均值 **1.215×**、中位 **1.109×**、最好 **1.058×**；W9 1.31×。
+- vseg 6 遍方差大（280–461µs，461 为离群）；去掉离群后均值约 296µs（1.11×）。
+- 双 target 把单 target 的 **2.03×** 压到约 **1.1×**，但**未达 parity（≤1.05×）**。
+- 两个 target 写 n=6400/6402、读 n≈8450，均分；`type` 全 vsegment。
+
+### 当前 NOF-117（只读，零写/零重启）
+
+- 现有 `vseg_nof116` 数据只读；不重启 master/target。
+- reader：`--num_keys=200`（每 segment，共 400 queries）、T1、warmup=128、qpairs=4、verify=false、diag 关。
+- 6 遍交替：chunk 128KiB / 64KiB / 128K / 64K / 128K / 64K。
+  - 128KiB：每 child 16 个子 IO，每 target 16 IO/key；
+  - 64KiB：每 child 32 个子 IO，每 target 32 IO/key（与 plain 的每 target 32 IO 对齐）。
+- 验收：vseg@64K 是否 ≤ plain×1.05 ≈ **279.7µs**。
+- 若 64K 明显改善但未到 parity，可再试 32K；若不变，停止调 chunk，转第三 target 或 target 侧 W9 trace。
+- 边界：零写、不改码、不重启 target。
 
 ---
 
