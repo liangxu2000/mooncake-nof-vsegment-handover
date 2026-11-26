@@ -61,16 +61,16 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 
 ---
 
-## 3. 当前环境状态（2026-11-26 NOF-127 起）
+## 3. 当前环境状态（2026-11-26 NOF-127 完成后）
 
 | 对象 | 状态 |
 |---|---|
 | target A（node3） | PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR |
 | target B（node4） | **已重建**：PID 2391418；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `c19b91e1…`；11/11、strip 256KiB、nsid1、4457；0 ERROR |
-| master | `plain_nof126p` 2427483/2427487 运行中（Keys=60000）；NOF-127 将停它，起 `vseg_nof127a` |
-| etcd | 2408033/2408036；`--max-request-bytes=67108864`；dbSize 568.55MiB |
-| node2 | 无 bench/register 残留 |
-| 当前任务 | **NOF-127（正式条件稳定性测量：60k、一整块 vsegment vs plain；V3→P3→V3→P3 共 12 轮，交逐轮 Avg/P50/P90/P99）** |
+| master | **`plain_nof127b` 2438798/2438801 运行中**：Keys=60000、E=1、FATAL=0 |
+| etcd | 2408033/2408036；`--max-request-bytes=67108864`；dbSize 873.65MiB |
+| node2 | 无 bench/register 残留；客户端 md5 bb4a07a3…（未重编） |
+| 当前任务 | **无在途任务（NOF-127 完成；第四阶段第一正式结果已出）** |
 
 ---
 
@@ -320,6 +320,21 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - “+58% IO”查实为 target dump 的**块内计数伪影**（非累计）：plain 第 3 遍同一负载只有 1,034,594（前两遍 1,923,395/1,924,099）；同会话 vsegment 的 n 反而低于 50G 历史。
 - **注**：本单在用户定“一整块 vsegment”正式条件之前；当时 50G 逐轮全过、整块两遍超；**后续正式条件 = 一整块 vsegment，50G 仅历史对照（见 NOF-127）**。
 - 偏差：B 臂第 2 轮补写被人工中止（bench 从 key 0 重写，Keys 恒 59,967）；最终 59,967/60,000，33 失败（0.055%）未补写。A 臂 target B 的 n 未取到（脚本缺口）。
+
+### NOF-127 结果（2026-11-26，第四阶段第一正式结果）
+
+**条件**：60k keys；vsegment 一整块（extent 256GiB/member、logical 512GiB、vsegments=1）；plain 单 target B；四阶段 V3→P3→V3→P3，每臂 6 轮；每轮一遍 60k（约 20s，不循环）；T1/warmup128/qpairs4/verify=false/diag 关。
+
+| 臂 | 轮数 | Avg 范围 | P50 范围 | P90 范围 | P99 范围 | failed |
+|---|---|---|---|---|---|---|
+| vsegment | 6 | 257.04–273.45 | **251.77–267.55** | 260.32–285.49 | 365.65–391.76 | 0 |
+| plain | 6 | 248.33–264.63 | **245.30–261.37** | 253.09–270.17 | 265.34–292.94 | 0 |
+
+- **P50**：区间重叠（[251.77, 261.37]）；端点比 1.026× / 1.024×；时间就近配对 6 对 **0.977–1.076**（5/6 vsegment 慢，**4/6 ≤1.05**）。
+- **P99**：完全不重叠，**1.338–1.378×**；12 轮 0 缺失 key，尾部差距真实。
+- target W9：vsegment 39,190/39,220ns；plain 44,170–44,220ns（vsegment 每 IO 低约 11–12%）。
+- 结论：**P50 基本打平但未稳定 ≤1.05；P99 落后；无 2×。** 不追 P99/Max；不再用单遍/单轮代表阶段结果。
+- 四阶段写入均 60,000/0；etcd +≈630MiB、ResourceExhausted 0；逐轮原始值在 `run/nof127_summary.txt`。
 
 ---
 
