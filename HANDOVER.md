@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-114（node3 第二个 target 部署与就绪 · 不 register/不写数据/不动 node4 target/master）**。**用户 2026-11-26 确认真实部署形态**：node2/3/4 可用；reader/writer 在 node2；master+etcd 在 node4；**两个远端 target：node3（新）+ node4（现有）构成一个 vsegment（member_count=2）**；4MiB key → 2×2MiB child 跨两个 target 并行；**plain 只用一个 target（node4）**；reader 的元数据和数据都跨节点；验收 **parity（vseg P50/W9 ≤ plain×1.05）**，2× 绝不可接受。NOF-113R 完成：单 target 配置路径到顶——vseg@2M 551.93µs vs plain@128K 270.52µs（2.04×）；chunk 对 vseg 无影响，W9 反而 250→287（plain 120→143）⇒ **2× 按字节计，不是每 IO 固定开销**；target 单 IO 在 ≥256K 时被夹到 256KiB。**单 target 的 W9 trace 暂缓；先按真实双 target 形态搭建并基线化。** 用户不接受改 vseg 逻辑代码。
+- 当前任务：**NOF-114（node3 第二个 target 部署与就绪 · 不 register/不写数据/不动 node4 target/master）**。**用户 2026-11-26 确认真实部署形态**：node2/3/4 可用；reader/writer 在 node2；master+etcd 在 node4；**两个远端 target：node3（新）+ node4（现有）构成一个 vsegment（member_count=2）**；4MiB key → 2×2MiB child 跨两个 target 并行；**plain 只用一个 target（node4）**；reader 的元数据和数据都跨节点；验收 **parity（vseg P50/W9 ≤ plain×1.05）**，2× 绝不可接受。NOF-113R 完成：单 target 配置路径到顶——vseg@2M 551.93µs vs plain@128K 270.52µs（2.04×）；chunk 对 vseg 无影响，W9 反而 250→287（plain 120→143）⇒ **2× 按字节计，不是每 IO 固定开销**；target 单 IO 在 ≥256K 时被夹到 256KiB。**单 target 的 W9 trace 暂缓；先按真实双 target 形态搭建并基线化。** 用户不接受改 vseg 逻辑代码。**NOF-115 预定参数（用户已拍板，先跑通）：keys=400、extent=50GiB、member_count=2、oplog/HA 保持现状；1000/20k 等跑通后再试。**
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -8048,3 +8048,14 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - node3 target 的 endpoint（node 标签）、nsid、UUID、BDF 顺序。
 - `nof_register` 是否支持对两个 target 分别注册（本单只查 `--help`/源码，不执行注册）。
 - master 启动参数中 `member_count=2` 的可行性（只查源码/配置，不改 master）。
+
+### NOF-115 预定参数（用户 2026-11-26 拍板，先跑通）
+
+- **keys = 400**（先跑通；1000/20k 后面再试）
+- **extent = 50GiB**（`--vsegment_member_extent_size=53687091200`）
+- `member_count=2`、`stripe_size=2MiB`、`required_medium=nof`、`reserved_ratio=0`
+- **oplog/HA 保持现状**（400 keys 已知安全，旧实现约 22MB oplog；不为这轮增加额外变量）
+- plain：400 keys，只打 node4 一个 target
+- vseg：400 keys，跨 node3+node4；先写 plain 测量，再写 vseg（会覆盖 node4 同 LBA 区域）
+- 验收：parity（vseg P50/W9 ≤ plain×1.05）
+- 说明：400 keys 在 50GiB extent 下只用 1 个 vsegment（逻辑 100GiB，每 target 预留 50GiB、实际用 ~0.8GiB）；跑通后可继续往同一 vsegment 加 keys，不用改 extent。
