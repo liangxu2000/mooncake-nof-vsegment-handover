@@ -148,6 +148,7 @@ node2（reader + writer）                node4（master + etcd + target B）
 
 - `../HANDOVER.md`：NOF-104 起的所有任务书与回执。
 - `400keys-首次端到端测试结果.md`：第三阶段第一份 400-key 端到端结果（NOF-107/108）；含 plain/vseg 对照、客户端分段结构图、逐 key 快慢档分析、结论等级与边界。
+- `条带与分块三层参数说明.md`：vsegment `stripe_size=2MiB`、NoF `chunk=128KiB`、target RAID0 `strip=256KiB` 三层的区别、公式、LBA 例子和常见误解。
 - `../接手以来重要结果.md`：接手至 NOF-106 的有效/撤回结论汇总。
 - `../第二阶段/README.md`：第二阶段历史（node1/node3），仅作参考，不再作为当前状态。
 - node4：`/home/l00955908/mooncake-nof-vsegment-2/`（target 树、启动脚本、日志）。
