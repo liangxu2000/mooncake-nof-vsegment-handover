@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- **回执指标硬规则（2026-11-26 用户定规，后续所有 NOF 任务生效）**：每次测试**逐遍**报 **Avg / P50 / P90 / P99** 的绝对值（µs）；**不报吞吐**；**禁止计算或书写“P50 均值”“P50 中位”**（百分位不可跨遍平均）；多遍就逐遍列；同一会话的 vseg/plain 放**同一张表**；验收按**逐遍 P50 对逐遍 P50 的比值**，每一遍写明是否 ≤1.05。
+- **回执指标硬规则（2026-11-26 用户定规，后续所有 NOF 任务生效）**：每次测试按轮记录 **Avg / P50 / P90 / P99** 的绝对值（µs）；**不报吞吐**；**禁止计算或书写“P50 均值”“P50 中位”**。**回执正文不逐轮罗列**：每臂只给 **轮数 + 各指标 min–max 区间 + 超阈值轮数**；逐轮原始值落盘（`run/*.csv`）备查；有离群轮单独点名。同一会话的 vseg/plain 放同一张表；验收按逐轮 P50 对逐轮 P50 的比值，汇总为“N 轮中 M 轮 ≤1.05”并给比值区间。
 
 - **正式测试口径（2026-11-26 用户定，后续默认）**：① key=4MiB，**60,000 keys**，不再用 400 keys；② vseg 用**一整块**：`extent=256GiB/member`（274877906944），逻辑 512GiB，`member_count=2 / stripe=2MiB / required_medium=nof / reserved_ratio=0 / io_alignment=4096 / slot=1`；50G/3vseg 仅作历史对照，不再默认；③ plain 单 target B；④ 读 = T1（threads=1/batch=1）、warmup=128、qpairs=4、verify=false、diag 关、sequential；vseg `--num_keys=30000`/segment；⑤ **稳定性**：每臂 ≥6 轮读，至少 2 个交替周期（V3→P3→V3→P3）以抵消时间漂移；逐轮报 Avg/P50/P90/P99，不报吞吐、不写 P50 均值/中位；⑥ 第四阶段第一个正式结果 = NOF-127。
 
