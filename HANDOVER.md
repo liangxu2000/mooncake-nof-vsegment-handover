@@ -103,7 +103,7 @@
 
 - **正式测试口径（2026-11-26 用户定，后续默认）**：① key=4MiB，**60,000 keys**，不再用 400 keys；② vsegment 用**一整块**：`extent=256GiB/member`（274877906944），逻辑 512GiB，`member_count=2 / stripe=2MiB / required_medium=nof / reserved_ratio=0 / io_alignment=4096 / slot=1`；50G/3vseg 仅作历史对照，不再默认；③ plain 单 target B；④ 读 = T1（threads=1/batch=1）、warmup=128、qpairs=4、verify=false、diag 关、sequential；vsegment `--num_keys=30000`/segment；**每轮只读一遍 60k keys（约 20s），禁止用 `--duration` 连续循环读**；⑤ **稳定性**：每臂 ≥6 轮，至少 2 个交替周期（V3→P3→V3→P3）；**回执正文不逐轮罗列，按 `测试结果聚合方法_20261112.md` 给聚合值（Avg 均值、分位中位）+ spread**；⑥ 第四阶段第一个正式结果 = NOF-127。
 
-- 当前任务：**NOF-129（重建 node4：etcd 64MiB + 回收 11 盘 + target B；随后重跑 NOF-128 的 vsegment 10 轮，逐轮取 W9；用户已授权；2026-11-26）**。背景：NOF-127 正式结果（按 2026-11-12 聚合）vsegment/plain **P50 257.01/248.51 = 1.034×**、Avg 1.040×、P90 1.046×、P99 1.371×；**P50/Avg/P90 达 parity，P99 未达**。NOF-128 开测前 **node4 被外部清空**（etcd/master/target B 全无；target B 日志 16:25:50 后无退出记录；11 盘仍 vfio-pci），零数据停手；外部用户 `computin` 多次登录、因果未证。本单只重建 node4 的 etcd/target B 并重跑 vsegment 10 轮；**不杀外部用户会话/进程**；target A 不动；target B 旧测试数据不保留。详见 NOF-129。
+- 当前任务：**无在途任务（NOF-129 完成；环境已重建；NOF-127 仍为第一正式结果）**。NOF-129：node4 etcd/target B 重建成功（etcd 64MiB、dbSize 873.65→968.22MiB；target B 新 UUID 50d6259e…、11/11、ERROR=0）；vsegment 60k/0 十轮：**P50 260.59µs（spread 11.1%）、Avg 266.93（12.7%）、P90 269.12（10.2%）、P99 383.08（30.8%）**；target W9 B/A spread **1.9%/2.7%** ⇒ 端到端/target=4.1×，**波动在客户端/系统，不在 target**。**按 2026-11-12 方法 Avg spread 12.7% >10% ⇒ NOF-129 不进正式表，仅诊断**；正式结果仍为 NOF-127（P50 257.01/248.51=1.034×、Avg 1.040×、P90 1.046×、P99 1.371×；Avg spread 6.2/6.4）。vsegment 跨会话可复现（NOF-129 vs 127 P50 +1.4%）。客户端侧具体成因未测。环境 `vseg_nof128` 运行（Keys=60000）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -9433,3 +9433,43 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 外部用户会话/进程一律不动；若外部作业导致再次清场或资源争用，停手回报。
 - target B 旧数据不保留；NOF-127 结果已落盘。
 - 预计 **30–45 分钟**（重建 + 写 60k + 10 轮）。
+
+---
+
+## NOF-129 裁决（2026-11-26 · 重建成功；vsegment 10 轮；波动在客户端/系统）
+
+### 1. 重建结果（[事实]）
+
+- etcd：新 PID 2455814；同 data-dir + `--max-request-bytes=67108864`；2379/2380 LISTEN、healthy；dbSize 916,090,880B（873.65MiB，与 NOF-127 末值一致）、raftIndex 994,095、FATAL=0。
+- 11 盘：`takeover -r -y` 11/11 `[ OK ]`，仍 vfio 的盘数=0；根分区 rw。
+- target B：新 PID 2458315、4457 LISTEN、NQN `...urma-gpu-test` / SN `URMAGPU0001`、**新 UUID 50d6259e-51a6-4599-adf3-68defc0c5a53**、RAID0 block 512 / 165,032,248,832 blocks / strip 256K / online 11/11、max_io_size 8,388,608、ERROR=0。
+- target A（node3 3329243）未动。
+- `vseg_nof128` 2458697/2458700：extent=274877906944、logical_capacity=549755813888、vsegments=1、reconcile_fail=0；注册 B→A 各 512GiB；写入 **60,000/0 failed**、vsegments 全程 1、rex=0。
+
+### 2. vsegment 10 轮聚合（按 `测试结果聚合方法_20261112.md`：Avg=各轮均值、分位=各轮同分位中位）
+
+| 指标 | 聚合值 | 各轮 min | 各轮 max | spread | 最低/最高轮 |
+|---|---|---|---|---|---|
+| Avg | 266.93 | 247.18 | 281.09 | **12.7%** | p9 / p4 |
+| P50 | **260.59** | 246.03 | 274.99 | **11.1%** | p9 / p4 |
+| P90 | 269.12 | 257.52 | 285.26 | 10.2% | p9 / p4 |
+| P99 | 383.08 | 310.27 | 428.38 | 30.8% | p9 / p5 |
+
+- target B W9avg：39,622ns（39,240–40,010，spread **1.9%**）；target A：39,264ns（38,990–40,040，spread **2.7%**）。
+- 端到端 P50 spread 11.1% / target W9 spread 1.9–2.7% = **4.1×**。
+- 高值集中在连续三轮 p3/p4/p5（269.49/274.99/273.33，约 17:02:50–17:04:10），同期两 target W9 仍为 39.24–39.51µs，无抬升。
+
+### 3. 判读
+
+1. **波动不在 target**：端到端波动是 target W9 的 4.1 倍，且高值轮 target 无变化 ⇒ 在**客户端/系统侧**（node2 及其路径）。具体成因（node2 load/CPU 竞争/队列）本单未测。
+2. **按 2026-11-12 方法，Avg spread 12.7% >10% ⇒ NOF-129 不进正式表**，只作诊断；**正式结果仍为 NOF-127**（Avg spread 6.2/6.4%，P50 1.034×）。
+3. **vsegment 跨会话可复现**：NOF-129 vs NOF-127（同配置）P50 260.59 vs 257.01（+1.4%）、Avg +1.0%、P90 +0.2%、P99 +1.7% ⇒ 1–2% 内；11% 是**同一次里的客户端/系统噪声**，不是配置漂移。
+4. vs NOF-127 plain（跨会话）：P50 260.59/248.51=1.049、Avg 1.050、P90 1.048、P99 1.394；P50/Avg/P90 贴线，但 NOF-129 spread >10% 且 plain 为跨会话 ⇒ **不作正式对比**，正式 parity 仍按 NOF-127 的 1.034×。
+5. 环境重建未改码/未装包；target A 未重启；未杀任何外部进程/未重启整机。
+
+### 4. 环境末态
+
+- etcd 2455814：64MiB、dbSize 968.22MiB、raftIndex 1,113,386；`/oplog/vseg_nof128/` 118,998 条、value_max 3,984B（整块无大 full-state）。
+- target B 2458315（新 UUID 50d6259e…）、target A 3329243；master `vseg_nof128` 2458697/2458700、Keys=60,000、E=1 FATAL=0。
+- node2 无残留；客户端 md5 bb4a07a3…（未重编）。
+- 偏差：W9 主口径用每轮窗口末块；窗口内全块口径（B 23 块 spread 13.1%、A 28 块 8.2%）含 10s 分段边界块，仅参考；plain 基线沿用 NOF-127（跨会话）；客户端侧成因未测。

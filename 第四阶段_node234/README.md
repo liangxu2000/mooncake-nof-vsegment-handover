@@ -61,17 +61,17 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 
 ---
 
-## 3. 当前环境状态（2026-11-26 NOF-129 重建中）
+## 3. 当前环境状态（2026-11-26 NOF-129 完成后）
 
 | 对象 | 状态 |
 |---|---|
 | target A（node3） | **正常**：PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR |
-| target B（node4） | **不存在**（原 2391418；日志 16:25:50 后无退出记录）；11 块数据盘仍绑定 vfio-pci；NOF-129 重建后新 UUID |
-| master | **不存在**；NOF-129 将起 `vseg_nof128` |
-| etcd | **不存在**（原 2408033/2408036；data-dir 1.3G 完好，末行 16:06:00）；NOF-129 用同 data-dir + 64MiB 重建 |
+| target B（node4） | **已重建**：PID 2458315；NQN `...urma-gpu-test`、SN `URMAGPU0001`；**新 UUID 50d6259e-51a6-4599-adf3-68defc0c5a53**；RAID0 strip 256K、online 11/11、4457、ERROR=0 |
+| master | **`vseg_nof128` 2458697/2458700 运行中**：Keys=60000、vsegments=1、E=1 FATAL=0 |
+| etcd | 2455814；`--max-request-bytes=67108864`；dbSize 968.22MiB、raftIndex 1,113,386 |
 | node2 | 无 bench/register 残留；客户端 md5 bb4a07a3…（未重编） |
-| 当前任务 | **NOF-129（重建 node4 的 etcd/target B + 回收 11 盘；再跑 NOF-128 的 vsegment 10 轮；不杀外部用户）** |
-| 风险 | node4 非独占：外部用户 `computin` 16:20–16:50 多次登录，load 9.3、15 users；与清场因果未证；如再次清场，停手回报 |
+| 当前任务 | **无在途任务（NOF-129 完成；NOF-127 仍为第一正式结果）** |
+| 风险 | node4 非独占：外部用户 `computin` 16:20–16:50 多次登录；本次重建后未被清；若再次清场/资源争用，停手回报 |
 
 ---
 
@@ -338,6 +338,22 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - target W9：vsegment 39,190/39,220ns；plain 44,170–44,220ns（vsegment 每 IO 低约 11–12%）。
 - 结论：**P50/Avg/P90 达到 parity；P99 仍落后；无 2×。** 不追 P99/Max；不再用单遍/单轮代表阶段结果。
 - 四阶段写入均 60,000/0；etcd +≈630MiB、ResourceExhausted 0；逐轮原始值在 `run/nof127_summary.txt`。
+
+### NOF-129 结果（2026-11-26，vsegment-only 10 轮诊断；不进正式表）
+
+**条件**：node4 重建后（etcd 64MiB、target B 新 UUID）；60k、一整块 vsegment；10 轮，每轮一遍 60k≈20s；T1/warmup128/qpairs4/verify=false/diag 关；每轮取 target A/B W9。
+
+| 指标 | 聚合值 | min | max | spread |
+|---|---|---|---|---|
+| Avg | 266.93 | 247.18 | 281.09 | **12.7%** |
+| P50 | **260.59** | 246.03 | 274.99 | **11.1%** |
+| P90 | 269.12 | 257.52 | 285.26 | 10.2% |
+| P99 | 383.08 | 310.27 | 428.38 | 30.8% |
+
+- target B W9avg 39,622ns（39,240–40,010，1.9%）；target A 39,264ns（38,990–40,040，2.7%）；端到端/target = **4.1×** ⇒ **波动在客户端/系统，不在 target**。
+- **Avg spread 12.7% >10% ⇒ 按方法不进正式表**；仅诊断。正式结果仍为 NOF-127。
+- 跨会话复现：vs NOF-127 vsegment P50 260.59 vs 257.01（+1.4%）⇒ 1–2% 内；11% 是同次内客户端/系统噪声。
+- vs NOF-127 plain（跨会话）：P50 1.049、Avg 1.050、P90 1.048、P99 1.394；贴线，但 spread >10% + 跨会话 ⇒ 不作正式对比。
 
 ---
 
