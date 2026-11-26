@@ -67,10 +67,10 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 |---|---|
 | target A（node3） | **正常**：PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR |
 | target B（node4） | **已重建**：PID 2458315；NQN `...urma-gpu-test`、SN `URMAGPU0001`；**新 UUID 50d6259e-51a6-4599-adf3-68defc0c5a53**；RAID0 strip 256K、online 11/11、4457、ERROR=0 |
-| master | **`vseg_nof128` 2458697/2458700 运行中**：Keys=60000、vsegments=1、E=1 FATAL=0；NOF-130 将停它、起 `plain_nof130` |
-| etcd | 2455814；`--max-request-bytes=67108864`；dbSize 968.22MiB、raftIndex 1,113,386 |
+| master | **`plain_nof130` 2464822/2464825 运行中**：Keys=60000、E=1、FATAL=0；NOF-131 将停它、起 `vseg_nof131` |
+| etcd | 2455814；`--max-request-bytes=67108864`；dbSize 1026.18MiB、raftIndex 1,173,750 |
 | node2 | 无 bench/register 残留；客户端 md5 bb4a07a3…（未重编） |
-| 当前任务 | **NOF-130（补测 plain：当前重建环境、60k、10 轮，按 2026-11-12 方法聚合，与 vsegment NOF-129 比）** |
+| 当前任务 | **NOF-131（vsegment vs plain 客户端分段拆解：同环境、diag on、各 3 轮；找 3–4% 差距落在哪一段）** |
 | 风险 | node4 非独占：外部用户 `computin` 16:20–16:50 多次登录；本次重建后未被清；若再次清场/资源争用，停手回报 |
 
 ---
@@ -339,21 +339,21 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - 结论：**P50/Avg/P90 达到 parity；P99 仍落后；无 2×。** 不追 P99/Max；不再用单遍/单轮代表阶段结果。
 - 四阶段写入均 60,000/0；etcd +≈630MiB、ResourceExhausted 0；逐轮原始值在 `run/nof127_summary.txt`。
 
-### NOF-129 结果（2026-11-26，vsegment-only 10 轮诊断；不进正式表）
+### NOF-129/130 结果（2026-11-26，同环境 vsegment/plain 10 轮诊断；不进正式表）
 
-**条件**：node4 重建后（etcd 64MiB、target B 新 UUID）；60k、一整块 vsegment；10 轮，每轮一遍 60k≈20s；T1/warmup128/qpairs4/verify=false/diag 关；每轮取 target A/B W9。
+**条件**：node4 重建后（etcd 64MiB、target B 新 UUID）；vsegment 一整块、plain 单 target B；各写 60k、各读 10 轮；每轮一遍 60k≈20s；T1/warmup128/qpairs4/verify=false/diag 关；每轮取 target W9。
 
-| 指标 | 聚合值 | min | max | spread |
-|---|---|---|---|---|
-| Avg | 266.93 | 247.18 | 281.09 | **12.7%** |
-| P50 | **260.59** | 246.03 | 274.99 | **11.1%** |
-| P90 | 269.12 | 257.52 | 285.26 | 10.2% |
-| P99 | 383.08 | 310.27 | 428.38 | 30.8% |
+| 指标 | vsegment（N-129） | plain（N-130） | vseg/plain |
+|---|---|---|---|
+| Avg | 266.93（12.7%） | 255.71（8.1%） | **1.044×** |
+| P50 | **260.59**（11.1%） | **252.08**（8.2%） | **1.034×** |
+| P90 | 269.12（10.2%） | 261.21（6.2%） | **1.030×** |
+| P99 | 383.08（30.8%） | 274.91（7.5%） | **1.393×** |
 
-- target B W9avg 39,622ns（39,240–40,010，1.9%）；target A 39,264ns（38,990–40,040，2.7%）；端到端/target = **4.1×** ⇒ **波动在客户端/系统，不在 target**。
-- **Avg spread 12.7% >10% ⇒ 按方法不进正式表**；仅诊断。正式结果仍为 NOF-127。
-- 跨会话复现：vs NOF-127 vsegment P50 260.59 vs 257.01（+1.4%）⇒ 1–2% 内；11% 是同次内客户端/系统噪声。
-- vs NOF-127 plain（跨会话）：P50 1.049、Avg 1.050、P90 1.048、P99 1.394；贴线，但 spread >10% + 跨会话 ⇒ 不作正式对比。
+- target W9：vsegment 39,622ns（1.9%）vs plain 47,629ns（3.7%）⇒ vsegment 每 IO 快约 20%，端到端慢 3.3% ⇒ 差距在客户端聚合/路径。
+- 两臂 spread >3%；**vsegment >10% ⇒ 按方法不进正式表**；同环境比值 1.034/1.044/1.030 **与 NOF-127 一致**，作为佐证，不替换正式表。
+- 不盲目补测到 spread ≤10%；若要正式同环境格，先做 node2 稳定化再重跑。
+- 不单独立项查“plain target W9 更慢”：vsegment 每 IO 已更快，target 不能解释 vsegment 端到端更慢。
 
 ---
 

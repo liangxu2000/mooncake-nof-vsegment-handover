@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-130（补测 plain：当前重建环境、60k、10 轮，按 2026-11-12 方法聚合；2026-11-26）**。背景：当前环境 vsegment 10 轮（NOF-129）Avg 266.93 / P50 260.59，但 spread 12.7%/11.1% >10% 仅诊断；plain 旧值 NOF-127 Avg 254.14 / P50 248.51 是 **node4 重建前、旧 target B**，不能直接比。本单补同一重建环境的 plain 10 轮，得到可比比值；不改码/不重启 target/etcd/不补写。环境 `vseg_nof128` 运行（Keys=60000）。
+- 当前任务：**NOF-131（vsegment vs plain 客户端分段拆解：同环境、diag on、各 3 轮；找 3–4% 差距落在哪一段；零改码/零拓扑变更；2026-11-26）**。背景：同环境 vseg/plain **P50 1.034× / Avg 1.044× / P90 1.030×**（P99 1.393×），都在 1.05 内；但 vseg spread 12.7%/11.1%/10.2% >10%，按方法同环境这对**不进正式表**，只作诊断；正式结果仍为 NOF-127（1.034×/1.040×/1.046×/1.371×）。target W9 vsegment 39.6µs vs plain 47.6µs（vseg 每 IO 更快）⇒ 差距在客户端聚合/两跳。本单拆 query/resolve/prepare/submit/completion_wait + 两 child 完成差；若落在 completion_wait/child 差，当前约束下无合法旋钮；若落在 submit/prepare，再试 node2 绑核/governor。环境 `plain_nof130` 运行（Keys=60000）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -9514,3 +9514,74 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 不重启 target/etcd；不改码/不重编/不装包；不补写；不跑 T4/T16。
 - 只读一遍 60k/轮（≈20s），禁止 `--duration`；每轮取 W9。
 - 预计 **15–20 分钟**（写 60k + 10×20s + 切换）。
+
+---
+
+## NOF-130 裁决（2026-11-26 · 同环境 plain 完成；vseg/plain P50 1.034×，仍为诊断）
+
+### 1. 结果（[事实]：vsegment 10 轮 + plain 10 轮，同一重建环境/同一 target B）
+
+| 指标 | vsegment（NOF-129） | plain（NOF-130） | vseg/plain |
+|---|---|---|---|
+| Avg | 266.93（spread 12.7%） | 255.71（spread 8.1%） | **1.044×** |
+| P50 | 260.59（spread 11.1%） | 252.08（spread 8.2%） | **1.034×** |
+| P90 | 269.12（spread 10.2%） | 261.21（spread 6.2%） | **1.030×** |
+| P99 | 383.08（spread 30.8%） | 274.91（spread 7.5%） | **1.393×** |
+
+- target W9：vsegment **39,622ns（1.9%）** vs plain **47,629ns（3.7%）** ⇒ vsegment 每 IO 快约 20%，端到端却慢 3.3% ⇒ 差距在客户端聚合/路径。
+- plain：60,000/0、10/10 轮 failed=0；target B 未重启；etcd 1026.18MiB；master `plain_nof130` 2464822/2464825。
+- 历史参考：plain 本单 255.71/252.08 vs NOF-127 254.14/248.51（跨环境）⇒ +0.6%/+1.4%；同环境比值更可信。
+
+### 2. 裁定
+
+1. **两臂 spread 均 >3%（plain 6–8%、vseg 10–31%）；vseg >10% ⇒ 按 `测试结果聚合方法_20261112.md`，NOF-129/130 同环境比值不进正式表**，只作诊断。
+2. **不盲目补测到 spread ≤10%**：spread 是客户端/系统噪声（NOF-129 W9 1.9/2.7%、NOF-130 plain W9 3.7%，端到端却 8–31%），多跑几轮不保证降低；要正式同环境格，先做 node2 稳定化（绑核/performance governor/IRQ），再重跑。
+3. **不单独立项查“plain target W9 更慢”**：vsegment 每 IO 已经更快，target 侧不能解释 vsegment 端到端更慢；差距在客户端两 child 聚合/两跳。
+4. **正式结果仍为 NOF-127**（P50 1.034×、Avg 1.040×、P90 1.046×、P99 1.371×；spread 6.2/6.4% <10%）；NOF-129/130 的同环境 1.034/1.044/1.030 **与 NOF-127 一致，作为佐证**，不替换正式表。
+
+### 3. 下一步
+
+- 下发 **NOF-131 客户端分段拆解**（diag on，vsegment/plain 各 3 轮）：query/resolve/prepare/submit/completion_wait + 两 child 完成差 + target W9；不改码、不改 stripe/member_count、不重启 target/etcd。
+- 判读：差距在 completion_wait/child 差 ⇒ 两 child 聚合，当前约束下无合法旋钮，接受或松约束；在 query/resolve ⇒ 控制面/layout，需改码；在 submit/prepare ⇒ 可试 node2 绑核/governor；无稳定差 ⇒ 3.4% 是噪声，收口。
+
+### 4. 环境末态
+
+- `plain_nof130` 2464822/2464825：Keys=60,000、E=1、FATAL=0、rex=0；etcd 1026.18MiB、raftIndex 1,173,750、64MiB；target B UUID 50d6259e…、11/11、ERROR=0；target A 3329243 未动。
+- 未改码/未重编/未装包/未补写/未重启 target/etcd。
+
+---
+
+# NOF-131（待执行 · vsegment vs plain 客户端分段拆解 · 同环境 · diag on · 零改码 · 2026-11-26）
+
+## 目标
+
+- 同环境（重建后 target B）、同 60k/一整块 vsegment/plain，各写 60k、各读 **3 轮 diag on**（`MC_STORE_TRANSFER_DIAG=1`）。
+- 抓 `get_into_breakdown` 的 **query / resolve / prepare / submit / completion_wait / unattributed**，vsegment 两 child 的完成时间差、endpoint A/B，以及每轮 target W9。
+- 回答：vsegment 端到端比 plain 慢的 3–4% 落在客户端哪一段；据此判断是否还有合法旋钮。
+- **diag 绝对值不作性能**（有开销）；只比较同 diag 下两臂的分段差。
+- 不改码、不改 stripe/member_count、不重启 target/etcd、不补写。
+
+## A. vsegment 臂
+
+1. 停 `plain_nof130` master（2464822/2464825）；target A/B、etcd 不动。
+2. 起 `vseg_nof131`（同正式配置：extent=274877906944、member_count=2、stripe=2MiB、slot=1、HA+oplog、batch=64）；清同名键；注册 B→A 512GiB；写 60k（T1/batch1）；验收 Keys=60000。
+3. 读 3 轮 diag on：60k queries（`--num_keys=30000`/segment）、T1、warmup=128、qpairs=4、verify=false、`MC_STORE_TRANSFER_DIAG=1`；每轮抓 breakdown、child 完成差、target A/B W9。
+
+## B. plain 臂
+
+1. 停 vseg；起 `plain_nof131`（单 target B）；注册 B 512GiB；写 60k（16t/batch16）；验收 Keys=60000。
+2. 读 3 轮 diag on：60k、T1、warmup=128、qpairs=4、verify=false、`MC_STORE_TRANSFER_DIAG=1`；每轮抓 breakdown、target B W9。
+
+## C. 交付
+
+1. 每臂 3 轮的 **query/resolve/prepare/submit/completion_wait/unattributed** 原始值（逐轮落盘，正文给 3 轮范围或逐轮 3 行；diag 不作正式表）。
+2. vsegment 两 child：每轮先到/后到完成时间、差、endpoint A/B。
+3. **分段差表**：vsegment−plain 各段；指出最大且稳定的差值段。
+4. 判读（按 D 段的四种去向）+ 环境末态。
+5. 不报吞吐；不做正式聚合；不追 P99/Max。
+
+## D. 边界
+
+- 不改码/不重编/不装包/不重启 target/etcd；不改 stripe/member_count/extent。
+- 每轮一遍 60k≈20s，禁止 duration；diag on 只作归因。
+- 3+3 轮；失败停手；不补写；预计 20–30 分钟。
