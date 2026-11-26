@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-123（执行中 · 按已下发版本：etcd `--max-request-bytes=64MiB` + extent=50GiB；60k 会创建 3 个 vsegment）**。NOF-122 失败：batch=64 与 1024 **无效**，仍在 **25,632 keys** 处同一 13,322,832B 事务被 `ResourceExhausted` 拒收 ⇒ 卡点不是批条数，而是单个 full-state 事务。源码确认：`VSegmentOpLogRecord.full_state=true` payload 是 `PartitionVSegmentSnapshot`（约 520B/key）；25.6k keys≈13.3MB。**下一单候选（未下发，等 NOF-123 回执后再决定）**：`extent=128GiB`（逻辑 256GiB），60k/240GiB 全装进 1 个 vsegment，避开第 2 个 vsegment 创建触发的 13MB full-state；这只解决写入过程，master 重启/恢复的 full-state（60k≈31MB）仍需 etcd 64MiB 或改码。**不改正在跑的 NOF-123。** 第四阶段文档：`第四阶段_node234/README.md`；oplog 墙跟踪：`第四阶段_node234/oplog写入墙跟踪.md`。
+- 当前任务：**NOF-124（接受 vseg 59,931 keys 直接读 1 遍 + plain 60k 写/读 1 遍 + parity；2026-11-26）**。NOF-123 E1 **成功**：etcd `--max-request-bytes=67108864` 生效；13.3MB full-state 落盘（etcd `value_max=13,284,282B`），**ResourceExhausted 12,588→0**；vsegments **1→3**、create_success **1→3**；写 59,931/60,000（69 failed：`-1401 TASK_PENDING_LIMIT_EXCEEDED`×67、-105×2、CREATING×4，均为客户端 pending 上限/瞬态，非数据问题）。`logical_capacity` 仍显示 100GiB，但 Keys=59,931、target 实际落盘，判定为 quota/gauge 展示问题，不阻塞。**决策**：69/60,000=0.115%，不影响 P50/W9；**不重跑全量覆盖写**（10–12 分钟），直接用 59,931 读；plain 60k 照常写读。**下一单候选（未下发）**：extent=128GiB 一整块（逻辑 256GiB），60k 全装 1 个 vsegment，避免写入期 full-state；重启/恢复仍需 etcd 64MiB。第四阶段文档：`第四阶段_node234/README.md`；oplog 墙跟踪：`第四阶段_node234/oplog写入墙跟踪.md`。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -8857,3 +8857,68 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 若 64MiB 仍失败，停手，不擅自继续加 etcd 上限或缩 keys。
 - 单遍读，不跑 T4/T16；不跑 20k。
 - 预计 **40–50 分钟**。
+
+---
+
+## NOF-123 裁决（2026-11-26 · E1 成功）
+
+### 1. 结果
+
+| 项 | 实测 |
+|---|---|
+| etcd flag | `--max-request-bytes=67108864` 生效（cmdline 确认）；data-dir 复用，dbSize 不变 96,854,016B |
+| ResourceExhausted | **0**（NOF-122 为 12,588） |
+| full-state 写入 | `value_max=13,284,282 B`（13.3MB）成功落盘 |
+| vsegments / create_success | **3 / 3**（1→3，扩容恢复） |
+| Keys | **59,931 / 60,000**（69 failed） |
+| 失败码 | `-1401 TASK_PENDING_LIMIT_EXCEEDED` ×67、`-105` ×2、`VSEGMENT_CREATING` ×4 |
+| target A/B 写 n | 958,911 / 958,912（均分，≈59,931×16） |
+| 写吞吐 | 10,450 MiB/s；写 P50 364µs（含扩容停顿） |
+| etcd dbSize | 246,902,784 B（235MiB）；/home 余 1.1TiB |
+
+- `-1401` 源码定义：`TASK_PENDING_LIMIT_EXCEEDED`（`mooncake-store/include/types.h:417`）——客户端 pending 任务超过上限，属瞬态/背压，不是数据错误。
+- `logical_capacity` 仍显示 100GiB 而 vsegments=3：quota/gauge 展示问题；Keys、target 落盘、create_success 均正常，不阻塞。
+- 结论：**2MiB 单事务墙已解除；100GiB 处 vsegment 扩容恢复**。
+
+### 2. 决策
+
+- 69/60,000 = **0.115%**，不影响 P50/W9；**接受 59,931 keys 直接读**，不重跑全量覆盖写（10–12 分钟）。
+- plain 60k 照常写/读；etcd 保持 64MiB。
+- 下一单候选（未下发）：extent=128GiB 一整块，60k 全装 1 个 vsegment，避免写入期 full-state；重启/恢复仍需 etcd 64MiB。
+
+---
+
+# NOF-124（待执行 · 接受 vseg 59,931 keys 直接读 + plain 60k + parity · 2026-11-26）
+
+## 目标
+
+- 复用当前 `vseg_nof123`（Keys=59,931、vsegments=3、etcd 64MiB），**读 1 遍 60k queries**；接受 69 个缺失 key 的失败（0.115%），只看 P50/W9。
+- 再切 plain master，写 60k、读 1 遍；对比 parity。
+- 不补写、不重跑全量覆盖写、不改码、不重启 target。
+
+## A. Vseg 读（直接复用）
+
+1. 预检：`vseg_nof123` 运行（Keys=59,931、vsegments=3、2 segments、etcd 64MiB）；target A/B 运行。
+2. Reader：`--num_keys=30000`（每 segment，共 60,000 queries）、T1/threads=1/batch=1、warmup=128、qpairs=4、verify=false、diag 关；**1 遍**。
+3. 预期 failed≈69（缺失 key）；记录实际 failed、实际读时长、P50/Avg/P90/P99、target A/B W9/n。
+4. 若 read 因缺失 key 中止/无统计，停手回报；**本单不做补写**。
+
+## B. Plain 60k
+
+1. 停 `vseg_nof123` master（记录 PID）；target B 不动；起 plain `plain_nof124`（50056/9006/8086、slot=1、etcd、URMA、HA+oplog、batch=64、etcd 64MiB 保持）；注册 B **512GiB**。
+2. Writer：60,000 keys×4MiB、16t/batch16；验收 Keys=60000、logical_used=251,658,240,000；target B 写 n≈1,920,000。
+3. Reader：**1 遍**，60k keys、T1、warmup=128、qpairs=4、verify=false、diag 关；记录实际时长、P50/Avg/P90/P99、failed、target B W9/n（n≈1,924,096）。
+
+## C. 交付
+
+1. Vseg 读：failed/缺失数、实际时长、P50/Avg/P90/P99、target A/B W9/n。
+2. Plain 写/读：Keys/logical_used、写 n、读 P50/Avg/P90/P99、W9/n、实际时长。
+3. 比值与 parity 判决（vseg P50 / plain P50；W9 同报）。
+4. etcd dbSize；环境末态。
+
+## D. 边界
+
+- 接受 59,931 keys；**不补写 69 个**、不重跑全量覆盖写。
+- 只读 vseg；plain 写 60k；不跑 T4/T16、不跑 20k；不改码/不重启 target。
+- 若 vseg read 无统计/中止，停手；不要在本单改数据。
+- 预计 **20–30 分钟**。

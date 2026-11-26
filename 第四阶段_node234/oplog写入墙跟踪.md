@@ -1,7 +1,7 @@
 # 大数据写入的 oplog 墙：跟踪记录
 
 - 开始日期：2026-11-26
-- 状态：**NOF-123 执行中**（按已下发版本：etcd 64MiB + extent=50GiB；最终解决段留空，后续更新）
+- 状态：**NOF-123 E1 成功；写入墙已解除**（etcd 64MiB + extent=50GiB；vseg 59,931/60,000；读臂/plain 由 NOF-124 执行）
 - 一句话：目标 **60,000 keys（240GiB）**，在 **25.6k keys（约 100GiB）** 撞上 etcd 单事务上限；不是总空间，不是批条数，而是 **vsegment full-state 快照作为一条 oplog entry** 太大。
 - 关联任务：NOF-119 A / NOF-120 / NOF-121 / NOF-122 / **NOF-123（当前）**
 
@@ -66,6 +66,21 @@
 | 结果 | `-1010` 无限重试 | 同样 `-1010`，同一尺寸 |
 
 结论：**`oplog_batch_max_entries` 不是这条事务的尺寸杠杆**。
+
+### 2.5 NOF-123：etcd 64MiB 解除写入墙
+
+| 项 | 实测 |
+|---|---|
+| etcd `--max-request-bytes` | 67,108,864（64MiB） |
+| ResourceExhausted | **0**（NOF-122 12,588） |
+| full-state 写入 | 成功，`value_max=13,284,282 B` |
+| vsegments / create_success | **3 / 3**（1→3） |
+| Keys | **59,931 / 60,000** |
+| 失败码 | **-1401 `TASK_PENDING_LIMIT_EXCEEDED` ×67**、-105×2、CREATING×4 |
+| target A/B 写 n | 958,911 / 958,912 |
+| 写吞吐 / P50 | 10,450 MiB/s / 364µs |
+
+结论：**2MiB 单事务墙解除；100GiB 处 vsegment 扩容恢复**。69 个失败是客户端 pending 上限，不是数据/空间问题。
 
 ---
 
@@ -149,15 +164,32 @@
 
 ---
 
-## 7. 最终结果（待填）
+## 7. 最终结果（NOF-123 已更新，读臂/plain 待 NOF-124）
 
-> **NOF-123 回执后更新此节**：
-> - etcd 新 flag/PID/dbSize：
-> - vseg 写入 Keys / logical_used / vsegments / logical_capacity：
-> - vseg 读 P50/Avg/P90/P99、W9、实际时长：
-> - plain 读 P50/W9：
-> - parity 比值：
-> - 最终采用的配置与遗留风险：
+### 7.1 NOF-123 E1（写入墙解除）
+
+| 项 | 实测 |
+|---|---|
+| etcd `--max-request-bytes` | **67,108,864（64MiB）**；data-dir 复用，dbSize 96,854,016B 不变 |
+| ResourceExhausted | **0**（NOF-122 12,588） |
+| full-state 快照 | **写入成功**，etcd `value_max=13,284,282 B`（13.3MB） |
+| vsegments / create_success | **3 / 3**（1→3，扩容恢复） |
+| Keys | **59,931 / 60,000**（99.885%） |
+| 失败码 | **-1401 `TASK_PENDING_LIMIT_EXCEEDED` ×67**、-105×2、CREATING×4 |
+| target A/B 写 n | 958,911 / 958,912（均分，≈59,931×16） |
+| 写吞吐 / P50 | 10,450 MiB/s / 364µs（含扩容停顿） |
+| etcd dbSize | 246,902,784B（235MiB）；/home 余 1.1TiB |
+
+- `-1401` 是客户端 pending 任务上限（`types.h:417`），瞬态/背压，不是数据错误。
+- `logical_capacity` gauge 仍 100GiB 而 vsegments=3：展示/quota 统计问题；Keys、target 落盘、create_success 均正常，不阻塞。
+- **结论：2MiB 单事务墙已解除；100GiB 处 vsegment 扩容恢复；写入过程解决。**
+
+### 7.2 待填（NOF-124）
+
+- vseg 读（59,931 keys）P50/Avg/P90/P99、W9、失败数、实际时长：
+- plain 60k 读 P50/W9：
+- parity 比值：
+- 最终配置与遗留风险：
 
 ---
 

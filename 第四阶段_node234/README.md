@@ -69,7 +69,7 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 | target B（node4） | **已重建**：PID 2391418；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `c19b91e1…`；11/11、strip 256KiB、nsid1、4457；0 ERROR |
 | master | NOF-119 A 后 probe master 已停；旧 `vseg_nof116` 因 target B UUID 变已失效；当前无业务 master |
 | node2 | 无 bench/register 残留 |
-| 当前任务 | **NOF-123：etcd `max-request-bytes=64MiB`；重启 etcd/master（不动 target）；重试 60k vseg/plain** |
+| 当前任务 | **NOF-124：vseg 59,931 keys 直接读 1 遍；plain 60k 写/读 1 遍；parity** |
 
 ---
 
@@ -236,6 +236,29 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - 写 60k；观察 full-state（25k≈13.3MB、60k≈31MB）能否落盘、vsegments/capacity 是否增长；若 64MiB 仍失败，停手。
 - 通过后 vseg 读 1 遍；plain `plain_nof123` 写/读 1 遍；parity。
 - E2（缩小 extent）暂不做（full-state 是 per partition，不是 per vsegment）；E3 并入最终 plain 臂。
+
+### NOF-123 成功（2026-11-26，写入墙解除）
+
+| 项 | 实测 |
+|---|---|
+| etcd `--max-request-bytes` | 67,108,864（64MiB） |
+| ResourceExhausted | **0**（NOF-122 12,588） |
+| full-state 写入 | 成功，`value_max=13,284,282 B` |
+| vsegments / create_success | **3 / 3** |
+| Keys | **59,931 / 60,000** |
+| 失败码 | **-1401 TASK_PENDING_LIMIT_EXCEEDED ×67**、-105×2、CREATING×4 |
+| target A/B 写 n | 958,911 / 958,912 |
+| 写吞吐 / P50 | 10,450 MiB/s / 364µs |
+
+- `-1401` 是客户端 pending 任务上限（`types.h:417`），瞬态，不是数据错误。
+- `logical_capacity` gauge 仍 100GiB 而 vsegments=3：展示/quota 统计问题；Keys/落盘正常，不阻塞。
+- 决策：69/60,000=0.115%，接受 59,931 直接读，不重跑全量覆盖写。
+
+### 当前 NOF-124（读臂 + plain）
+
+- 复用 `vseg_nof123`，vseg 读 1 遍（60k queries，预期 failed≈69，接受）；记录 P50/Avg/P90/P99、target W9/n、实际时长。
+- 停 vseg，起 `plain_nof124`（etcd 64MiB、batch=64、注册 B 512GiB），写 60k、读 1 遍；记录同指标。
+- parity：vseg P50 ≤ plain×1.05；不补写、不重跑、不改码、不重启 target。
 
 ---
 
