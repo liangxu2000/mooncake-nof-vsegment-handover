@@ -1,0 +1,167 @@
+# 第四阶段：node2/3/4 双 target vsegment 性能收口
+
+- 开始日期：2026-11-26
+- 目录：`D:\mooncake nof vsegment\第四阶段_node234`
+- 任务通道：`../HANDOVER.md`
+- 历史依据：`../第三阶段 node2&4/`（单 target 定位、双 target 打通）、`../接手以来重要结果.md`
+- 拓扑与产物只使用 **node2/node3/node4** 指代，不写内网 IP。
+
+---
+
+## 1. 为什么进入第四阶段
+
+第三阶段完成了两件事：
+
+1. **单 target 下的 2× 被压缩到 target 单 IO 服务段**：vseg P50 555µs vs plain 274µs（2.03×），target W9 248 vs 120（2.07×）；客户端计划/提交、child 并行、worker、inflight、qpair、数据 LBA 全部排除；2× 是**按字节**的服务成本，不是每 IO 固定开销。
+2. **双 target vsegment 打通**（NOF-115）：node3 A + node4 B 两个 segment 注册成功，`member_count=2` quota 发布成功，每个 key 2 个 child、两 target IO 均分。
+
+第四阶段不再回答“单 target 为什么 2×”，而是回答**真实部署形态下 vseg 是否达到 parity**：
+
+```text
+plain：400 keys，只打 node4 一个 target
+vseg ：400 keys，member_count=2，跨 node3+node4 两个 target
+验收：vseg P50 ≤ plain P50 × 1.05
+```
+
+---
+
+## 2. 当前拓扑（用户 2026-11-26 确认）
+
+```text
+node2（reader + writer）
+┌────────────────────────┐
+│ stress_cluster_bench   │──元数据 RPC──► node4（master + etcd）
+│ （supercache 构建）    │
+│                        │──数据 URMA──► node3（target A）
+│                        │──数据 URMA──► node4（target B）
+└────────────────────────┘
+
+node3：target A（11 盘 RAID0，strip 256KiB，nsid1，4457）
+node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
+```
+
+- reader/writer：**node2**
+- master + etcd：**node4**
+- 两个远端 target：**node3 A + node4 B**，共同构成一个 vsegment
+- vsegment：`member_count=2`，4MiB key → 2×2MiB child，分别落 node3/node4
+- plain：只用 **node4 一个 target**
+- 对 reader 来说，元数据（node4）和数据（node3/node4）**都跨节点**
+
+### 端口
+
+| 组件 | 节点 | 端口 |
+|---|---|---|
+| SPDK nvmf target A | node3 | **4457** |
+| SPDK nvmf target B | node4 | **4457** |
+| Mooncake master RPC | node4 | **50056** |
+| metrics | node4 | **9006** |
+| HTTP metadata | node4 | **8086** |
+| etcd（本地） | node4 | **2379** |
+| client TE RPC（如需） | node2 | **50156** |
+
+---
+
+## 3. 当前环境状态（2026-11-26 NOF-115 后）
+
+| 对象 | 状态 |
+|---|---|
+| target A（node3） | PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR、零 IO |
+| target B（node4） | PID 2142228（11-25 15:20:22 起）；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `0470fe3a…`；11/11、strip 256KiB、nsid1、4457；ERROR 6 条（历史 pci_event socket read error 105） |
+| master | `vseg_nof115` 运行中（2355509/2355512）；Keys=4；2 个 segment；quota generation=1、member_count=2、extent=50GiB、logical_capacity=100GiB |
+| node2 | 无 bench/register 残留 |
+| 当前任务 | **NOF-116：plain 400 keys vs vseg 400 keys，T1×3，parity** |
+
+---
+
+## 4. 已确认、必须继承的口径
+
+### 4.1 双 target vseg
+
+1. 两个 segment 注册成功且不覆盖：node4 B 与 node3 A 的 traddr/NQN 均不同。
+2. 每个 key `child_count=2`、`blocks=4096`、`sub_ios=16`；两个 target 各收到约一半 IO（NOF-115 为 66 vs 66）。
+3. `member_count=2` 是**条带，不是副本**：每个 target 存 key 的一半（2MiB），不是各存一份 4MiB。
+
+### 4.2 工程口径（容易踩坑）
+
+1. **segment 注册不持久**：由注册进程心跳续期，进程退出即失效；**每次 bench / 每次 master 重启后**都必须按 **node4 B → node3 A** 顺序重注册，并让注册进程在整臂期间存活。
+2. **`segment_write --num_keys=N` 是每 segment N keys**：vseg 两个 segment 要写 400 keys，用 `--num_keys=200`（总 Keys=400）；plain 单 segment 用 `--num_keys=400`。
+3. **`vsegments=1` 是 quota 发布时预建**，正常；写数据不会新增。
+4. **`logical_used` gauge 1000s 才刷新**；验收以 master `Keys` + writer 日志为准。
+5. child→target 的 endpoint 不在 `nof_slow_task` 里；落点均分用**两个 target 的 IO 计数相等**判断。
+6. `extent` 是**每个 member 在 NoF segment 上的物理 extent**，不是节点 DRAM；当前 50GiB/member → 每个 vsegment 逻辑 100GiB。
+
+### 4.3 单 target 下的结论（第三阶段，仍有效）
+
+- vseg P50 555µs vs plain 274µs（2.03×）；target W9 248 vs 120（2.07×）。
+- 差值 95% 在 `completion_wait`；客户端 resolve/prepare/submit 合计 <10µs。
+- 两个 child 100% 并行，op span = 1.10× 单 child；不是串行。
+- worker、inflight、qpair、数据 LBA 均排除。
+- **2× 是按字节的服务成本，不是每 IO 固定开销**；chunk 加大不降时延，W9 反而变差；target 单 IO 在 ≥256KiB 时被夹到 256KiB。
+- 剩余解释：target 对 vseg 请求的每字节服务路径（尚未拆 W9）。
+
+---
+
+## 5. 三层参数速查
+
+| 层 | 参数 | 当前值 | 作用 |
+|---|---|---|---|
+| vsegment 逻辑条带 | `stripe_size` | **2MiB** | 4MiB key → 2 个 2MiB child，落两个 member |
+| NoF 提交切片 | `MC_NOF_SUBMIT_CHUNK_BYTES` | **128KiB** | 每个 2MiB child → 16 个 128KiB 子 IO |
+| target RAID0 条带 | `strip_size` | **256KiB** | 每个 128KiB 子 IO 按起始地址落到某块盘 |
+
+详细公式、LBA 例子和常见误解见：  
+`../第三阶段 node2&4/条带与分块三层参数说明.md`
+
+---
+
+## 6. 当前任务 NOF-116
+
+- **plain**：node4 单 target，400 keys、16t 写、T1 读 3 遍、diag 关。
+- **vseg**：新 master `vseg_nof116`，注册 B→A，写 `--num_keys=200`（总 400 keys）、T1 读 3 遍、diag 关。
+- 记录：Keys/logical_used、P50/Avg/P90/P99、failed、target A/B W9 与 n。
+- 验收：**vseg P50 ≤ plain P50 × 1.05**；W9 同时报。
+- 边界：只写 400 keys；不跑 1000/20k；不改码；不重启 target；master 重启后必须重注册。
+
+---
+
+## 7. 验收与决策规则
+
+1. **parity 即可**：vseg P50 与 W9 都 ≤ plain × 1.05；2× 绝不可接受。
+2. 若 NOF-116 达到 parity ⇒ 用双 target 配置收口，记录最佳参数。
+3. 若仍差很多 ⇒ 不再调客户端旋钮；两条路：
+   - 拆 target 侧 W9（`URMA_STAGE_BUFFER` 24 字段 trace，需 target 重启，待用户批准）；
+   - 改 vseg 读提交逻辑（例如合并相邻 child），需用户单独批准。
+4. **暂不接受修改 vsegment 逻辑代码**；任何改码必须单独拍板。
+
+---
+
+## 8. 风险与边界
+
+- **target 不重启**：node3 A / node4 B 都是当前基线；重启会改 RAID0 UUID，需重新 register/mount。
+- **master 可重启，但 segment 注册不持久**：每次都要重注册并保持心跳。
+- **数据保留不是目标**：plain 与 vseg 会覆盖同一 target 的 LBA 区域；顺序执行，先测 plain 再写 vseg。
+- **etcd/oplog**：400 keys 已知安全；1000/20k 需要先关 oplog 或预检增长（旧 2000-key 曾产生 942MB oplog）。
+- **node3 独占**：royi 进程已清理；不要杀系统守护/sshd。
+- **文档只用 node 标签**，不写内网 IP。
+
+---
+
+## 9. 产物索引
+
+- `../HANDOVER.md`：任务书与回执（NOF-104 起）。
+- `../工作汇总.md`：结论登记表与当前状态。
+- `../第三阶段 node2&4/400keys-首次端到端测试结果.md`：单 target 400-key 结果与客户端分段分析。
+- `../第三阶段 node2&4/条带与分块三层参数说明.md`：stripe/chunk/strip 三层说明。
+- `../第三阶段 node2&4/README.md`：第三阶段环境、源码政策、NOF-104~115 里程碑。
+- 本目录：第四阶段及之后的结果、回执摘要、图表、脚本摘要。
+
+---
+
+## 10. 工作原则
+
+- **事实三态**：`[事实]` / `[推算]` / `[未获取]`；不猜、不用默认值填充。
+- **一单一阶段**：测试 agent 只执行不决策；失败停手回报。
+- **改动可回退**：env 关 / 反向补丁 / 文件归档+md5。
+- **每个任务写清**：做什么、为什么、回答什么问题、边界、预计耗时。
+- **不写内网 IP**，只用 node2/node3/node4。
+- **连续两单没有决定性证据就停下复盘**，不钻进牛角尖。
