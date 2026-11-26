@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**待用户裁决 NOF-117 后续（接受 1.08–1.10 近 parity / 查剩余 ~25µs / 改码）**。NOF-117 完成：vseg chunk 128K vs 64K 同会话交替 3+3 遍。**target W9 157.58→130.50µs（−17.2%）、P90 −5.32%、Avg −5.45%，但 P50 均值 293.90→286.91（−2.38%），中位 291.37→293.91（略升）** ⇒ 队列深度/每 target IO 数不是 P50 剩余差距的主因，**停止调 chunk**。parity 门槛 279.7µs 未稳：单遍 272.27（1.022×）达线，另两遍 294.54/293.91 未达；对 plain 266.36 的均值比 **1.077×**、中位比约 **1.10×**。**判读**：W9 已接近 plain（130.5 vs 120.3），剩余 ~25µs 不在 target 单 IO 执行段，更可能在客户端两 child 的聚合/等待或两跳网络差异。**口径**：`segment_write/read --num_keys` 都是每 segment（vseg 400 queries 用 200）；segment 注册由 master 心跳维持，`nof_register` 退出不失效，只有 master 重启才需重注册。**第四阶段文档：`第四阶段_node234/README.md`；后续结果统一放该目录。**
+- 当前任务：**NOF-118（零写查剩余 ~25µs：vseg@64K/128K 开 `MC_STORE_TRANSFER_DIAG=1`，取两 child 的提交/完成时间、completion_wait、target 完成差与 endpoint；零写/零重启/零改码）**。NOF-117 完成：64K 让 target W9 **157.58→130.50µs（−17.2%）**、P90 −5.3%、Avg −5.4%，但 **P50 均值仅 293.90→286.91（−2.38%）、中位略升** ⇒ 队列深度不是 P50 剩余差距主因，停止调 chunk。对 plain 266.36：均值 **1.077×**、中位 ~1.10×；单遍 272.27 达线，另两遍 294 未达。**判读**：W9 已接近 plain（130.5 vs 120.3），剩余 ~25µs 在 target 单 IO 之外——需分辨“两 target/两跳不对称（慢 child 决定 key 时延）”还是“客户端两 child 聚合/观察/QoS 开销”。**口径**：`segment_write/read --num_keys` 均为每 segment（vseg 400 queries 用 200）；segment 注册由 master 心跳维持，只有 master 重启才需重注册。**第四阶段文档：`第四阶段_node234/README.md`。**
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -8415,3 +8415,82 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - **C. 改码 / 结构性**：合并 child（需批准改码，且会放弃双 target 并行）或第三 target（可能增加聚合开销）；均不建议在未定因前做。
 
 **建议**：先走 B（~10 分钟、零风险），因为它能区分“物理两跳/聚合”与“客户端可修”；若证明是物理代价，就按 A 收口。
+
+---
+
+# NOF-118（待执行 · 零写查剩余 ~25µs：两 child 时序 + 客户端分段 · 2026-11-26）
+
+## 目标
+
+现有 `vseg_nof116` 400 keys 只读，同一 master/数据/会话，开 `MC_STORE_TRANSFER_DIAG=1`，回答剩余 ~25µs（中位 P50 293.9 vs plain 266.4）在哪：
+
+1. **慢 child / 两跳不对称**：两个 target 的 child 完成时间是否一前一后，晚的那个决定 key 时延；
+2. **客户端聚合/观察**：两个 child 都完成后，key 的 `read_us`/`completion_wait` 是否还多出一段；
+3. **64K 客户端开销**：64K 把子 IO 数翻倍，`nof_submit`/`unprepare`/`unattributed` 是否比 128K 高，抵消 target W9 收益。
+
+不改数据、不重启 master/target、不改码。
+
+## A. 预检
+
+- `vseg_nof116` master 运行中（Keys=400、2 segments、quota 100GiB）；target A/B 运行；node2 无残留。
+- 注册由 master 心跳维持；若 master 被重启，按 B→A 重注册后再跑。
+- 确认 `MC_STORE_TRANSFER_DIAG=1` 生效：日志出现 `get_into_breakdown`、`nof_vsegment_child`、`nof_vsegment_operation`、`nof_slow_task`。
+
+## B. 采集（只读）
+
+- reader：vseg，`--num_keys=200`（每 segment，共 400 queries）、T1/threads=1/batch=1、warmup=128、qpairs=4、verify=false。
+- 6 遍交替：**64K diag、128K diag、64K、128K、64K、128K**；`MC_STORE_TRANSFER_DIAG=1`，其余同 NOF-117。
+- 每遍记录：P50（diag 抬高，仅参考）、failed、target A/B W9/n。
+- 保存 6 份日志（每份约 8–10MB）。
+
+## C. 解析（必答）
+
+### C1 每 key 两个 child 的时序
+
+从 `nof_vsegment_child` / `nof_slow_task` 按 `(trace_id, vsegment_op_id)` 归组，取：
+- child0/child1 的 `first_submit_mono_ns`、`complete_mono_ns`；
+- 每 child 的 `first_completion_from_submit_us`、`max_subio_us`、`fifo_us`；
+- `nof_slow_task` 的 `endpoint`（映射为 node3/node4 标签，不写 IP）、`lba`、`blocks`、`sub_ios`。
+
+计算每个 key：
+- `child_latency = complete - first_submit`；
+- `completion_gap = child1.complete - child0.complete`；
+- `last_child`（谁完成得晚）；
+- `submit_skew = child1.first_submit - child0.first_submit`；
+- `key_span = last_completion - first_submit`。
+
+### C2 客户端分段
+
+从 `get_into_breakdown` 取每 key：
+- `query_us`、`read_us`、`vsegment_resolve_us`、`nof_prepare_us`、`nof_submit_us`、`completion_wait_us`、`read_unattributed_us`。
+
+计算：
+- `key_read_minus_span = read_us - key_span`（客户端聚合/观察/提交等超出 child 时间跨度的部分）；
+- 64K vs 128K 各段差异。
+
+### C3 目标侧
+
+- target A/B 的 W9/n（应接近；若一边明显高，记录）；
+- 按 endpoint 分组的 child latency：node3 vs node4 谁更慢、慢多少。
+
+## D. 交付（必答）
+
+1. 6 遍 P50/W9/n 表（64K vs 128K）。
+2. **每 key 两 child**：child latency、completion_gap、last_child 比例、submit_skew 的 p50/p90；按 endpoint（node3/node4）分组。
+3. **客户端分段**：64K/128K 的 query/read/resolve/prepare/submit/wait/unattributed 均值；`read_us - key_span` 的 p50/p90。
+4. 判决三选一（给比例/数值）：
+   - **(A) 慢 child/两跳不对称**：某个 target 的 child 系统性晚到/更慢，晚 child 决定 key 时延；
+   - **(B) 客户端聚合/观察**：两 child 完成接近，但 `read_us - key_span` 有稳定 ~20–25µs；
+   - **(C) 64K 客户端开销**：64K 的 submit/prepare/unattributed 明显高于 128K，target 收益被吃掉。
+5. 若 (A)，给出两 target 的 child latency 差与占比；若 (B)，给出 `read_us - key_span` 与 `completion_wait - span` 的数值；若 (C)，给出各段差值。
+6. 5 个代表 key 的原始行（child0/child1/operation/breakdown 各一行）。
+7. 环境末态；零写/零重启/零改码。
+
+## E. 边界
+
+- **零写入**；不改 master/target；不改代码/不重编；不跑 plain。
+- `--num_keys=200` 是每 segment，共 400 queries；不要用 400。
+- diag 只用于分段，绝对 P50 不作性能结论。
+- 日志大；若单遍超过 20MB 或磁盘不足，减到 2 遍/档（64K/128K 各 2 遍），并说明。
+- 失败（日志缺字段/挂载失败）停手回报。
+- 预计 **15 分钟**。

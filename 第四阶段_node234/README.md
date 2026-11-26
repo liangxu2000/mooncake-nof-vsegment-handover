@@ -69,7 +69,7 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 | target B（node4） | PID 2142228（11-25 15:20:22 起）；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `0470fe3a…`；11/11、strip 256KiB、nsid1、4457；ERROR 6 条（历史 pci_event socket read error 105） |
 | master | `vseg_nof116` 运行中（2360608/2360611）；Keys=400；2 个 segment；quota generation=1、member_count=2、extent=50GiB、logical_capacity=100GiB |
 | node2 | 无 bench/register 残留 |
-| 当前任务 | **待裁决 NOF-117 后续：接受 1.08–1.10 近 parity / 查剩余 ~25µs / 改码** |
+| 当前任务 | **NOF-118：零写查剩余 ~25µs（vseg@64K/128K diag，两 child 时序 + 客户端分段）** |
 
 ---
 
@@ -142,6 +142,17 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - **target W9 明显改善，但 P50 不动** ⇒ 队列深度/每 target IO 数不是 P50 剩余差距的主因，停止调 chunk。
 - 剩余 ~25µs 不在 target 单 IO 执行段；更可能在客户端两 child 聚合/等待、两跳网络差异、或 64K 带来的客户端开销翻倍。
 - 当前待裁决：A 接受 1.08–1.10 近 parity；B 零写查剩余 ~25µs（diag/child timing）；C 改码或第三 target（均不轻）。
+
+### 当前 NOF-118（零写，查剩余 ~25µs）
+
+- 现有 `vseg_nof116` 400 keys 只读；`--num_keys=200`（每 segment，共 400 queries）。
+- 6 遍交替：64K diag / 128K diag / 64K / 128K / 64K / 128K；`MC_STORE_TRANSFER_DIAG=1`。
+- 解析：
+  - `nof_vsegment_child` / `nof_slow_task`：两 child 的 submit/complete、latency、completion_gap、last_child、endpoint（node3/node4）；
+  - `get_into_breakdown`：query/read/resolve/prepare/submit/completion_wait/unattributed；
+  - 计算 `read_us - key_span`、按 endpoint 分组的 child latency。
+- 判决：A 慢 child/两跳不对称；B 客户端聚合/观察；C 64K 客户端开销。
+- 零写、零重启、零改码；diag 绝对 P50 不作性能。
 
 ---
 
