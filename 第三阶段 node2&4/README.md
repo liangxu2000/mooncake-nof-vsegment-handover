@@ -84,7 +84,8 @@ node2（reader + writer）                     node4（master + etcd + target）
 | **NOF-110** | 单变量 `MC_NOF_WORKERS=1` | **无改善**：vseg P50 555.00→558.50、W9 248.80→249.36；plain 274.00→266.27、W9 120.07→120.36。4 条 lane 全绑 worker0，两配置 `lane_inflight=16384`/`segment_inflight=65536` 相同 ⇒ **worker 分布、inflight 额度排除**。但 qpair 仍 4 条，连续 task 轮转 ⇒ vseg 每 key 2 条 qpair、plain 1 条，**qpair 扇出未排除** |
 | **NOF-111** | 单变量 qpair 数 | **无改善**：vseg W9 248.80→**248.87**、P50 555.00→558.74；plain W9 120.29。探针确认 1 条 lane/qpair、单 lane 额度仍 16384 ⇒ **qpair 扇出排除**。客户端组织方式累计全部排除；W9 比值三次独立实验均为 **2.07×** |
 | **NOF-112** | LBA 布局对照 | **布局假说被否**：两臂起始 LBA 逐值相同 400/400；非慢区 301 个 key 上 vseg **301/301 全慢**（p50 478.5 vs 179.0µs），慢区 99 个 key 两臂相等（447.5 vs 448.5）⇒ 位置不能解释 2× |
-| **NOF-113R（当前）** | 纯配置：vseg 大 IO vs plain | **用户不接受修改 vsegment 逻辑代码**；merge 补丁取消并撤下。只测 vseg 的 2MiB child 作为大 IO（`MC_NOF_SUBMIT_CHUNK_BYTES`=1M/2M），plain 128K 对照 + plain 大 IO 同工作对照。**用户验收：打平即可，2× 绝不可接受**；parity = P50/W9 ≤ plain×1.05。若配置达不到，唯一已知 parity 修法是合并 child（需批准改码），否则转多 target/member 或内存分层 |
+| **NOF-113R** | 纯配置：vseg 大 IO vs plain | **配置路径到顶**：vseg@2M **551.93** vs plain@128K **270.52µs（2.04×）**、vs plain@2M 277.73（1.99×）；chunk 对 vseg 无影响，W9 反而 250→287（plain 120→143）⇒ **2× 按字节计，不是每 IO 固定开销**；target 单 IO 在 ≥256K 时被夹到 256KiB（n 16898→8450）。parity 未达成 |
+| **NOF-114（待批准）** | target 侧 BUFFER trace 拆 W9 | target 带 `URMA_STAGE_BUFFER` 重启并 dump，逐 IO 看 enter/submit/submit_return/callback、buffer/wait、lcore/qid/lba/queue；一次采两臂。高危（RAID0 UUID/vseg 元数据），需用户批准；否则转多 target/内存分层 |
 
 ---
 

@@ -394,10 +394,16 @@ MC_STORE_TRANSFER_DIAG=1
 
 **NOF-112 已完成**：两臂起始 LBA 逐值相同 400/400；在非慢区 301 个 key 上 vseg 301/301 全慢（478.5 vs 179.0µs），慢区两臂相等 ⇒ **数据落点解释力弱/被否**（见 5.5）。
 
-**NOF-113R（当前 · 纯配置）**：用户明确**不接受修改 vsegment 逻辑代码**，merge 补丁取消并撤下；只测一个 vseg 独有杠杆：
-- vseg 的 2MiB child 直接作为一个大 IO 下发（`MC_NOF_SUBMIT_CHUNK_BYTES`=1M/2M），plain 保持 128K；
-- 同时跑 plain 的大 IO 臂作同工作对照；
-- T1 400 keys、每臂 3 遍、零写、target 不重启、不重编。
-- 回答：vseg@2M 与 plain@128K 的 P50/W9 差多少？是否达到 **parity**？同 2M 下 vseg 是否有优势？
-- **用户验收（2026-11-25）：打平即可，2× 绝不可接受**；parity = P50/W9 ≤ plain×1.05。
-- 若配置达不到 parity ⇒ 唯一已知的 parity 修法是合并相邻 child（需批准改码）；否则转多 target/member 或内存分层。
+**NOF-113R 已完成（纯配置，配置路径到顶）**：用户明确**不接受修改 vsegment 逻辑代码**，merge 补丁取消并撤下。只测大 IO（`MC_NOF_SUBMIT_CHUNK_BYTES`）能否救 vseg：
+
+| 臂 | chunk | P50 | W9 |
+|---|---|---|---|
+| plain | 128K | **270.52** | 120.4–129.1 |
+| plain | 2M | 277.73 | 142.5–143.5 |
+| vseg | 128K | **546.36** | 249.9–257.4 |
+| vseg | 2M | **551.93** | 286.6–288.7 |
+
+- vseg@2M vs plain@128K = **2.04×**；vs plain@2M = **1.99×**；chunk 对 vseg 无影响。
+- **W9 反而变差**（plain 120→143、vseg 250→287），总时延不降 ⇒ **2× 是按字节的服务成本，不是每 IO 固定开销**。
+- target 单 IO 在 chunk≥256K 时被夹在 **256KiB**（n 16898→8450），大 IO 杠杆失效。
+- **parity 未达成**。下一步要拆 W9：target 带 `URMA_STAGE_BUFFER` 重启并 dump，逐 IO 看 enter/submit/submit_return/callback、buffer/wait、lcore/qid/lba/queue；高危，需用户批准。否则转多 target/member 或内存分层。

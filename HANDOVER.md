@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-113R（修订 · 纯配置：vseg 大 IO vs plain；零改码/零写/零重启）**。**用户明确：现在不接受修改 vsegment 的逻辑代码** ⇒ NOF-113 的 merge 补丁已取消并从仓库撤下，不 apply/不构建。修订后只测一个 vseg 独有配置：让 vseg 的 2MiB child 作为一个 IO 下发（`MC_NOF_SUBMIT_CHUNK_BYTES`=1M/2M），plain 保持 128K 对照；同时跑 plain 的大 IO 臂作同工作对照。回答：vseg@2M 能否快于 plain@128K？同 2M 下 vseg 是否有优势？若都不行 ⇒ 单 target 同工作无 vseg 赢面，停止配置调参，转多 target/member 或内存分层。**NOF-112 完成**：两臂 400/400 起始 LBA 完全相同，非慢区 301 key 上 vseg 301/301 全慢（478.5 vs 179.0µs），慢区相等 ⇒ 位置不能解释 2×。**用户最新验收（2026-11-25）：打平即可，2× 绝不可接受**；因此 NOF-113R 以 **parity（P50/W9 ≤ plain×1.05）** 为成功标准。若配置达不到，唯一已知的 parity 修法是合并相邻 child（改 vseg 读提交逻辑，需用户另行批准）；多 target/member 或内存分层属于另一路线。
+- 当前任务：**待用户批准 NOF-114（target 侧 BUFFER trace：拆 W9 + 逐 IO 的 lcore/qid/buffer/queue）**。NOF-113R 完成：**配置路径到顶**——vseg@2M **551.93µs** vs plain@128K **270.52µs（2.04×）**、vs plain@2M **277.73µs（1.99×）**；chunk 128K→2M 对 vseg 无影响（546–559 噪声带内），W9 反而从 250→287µs（plain 120→143）⇒ **2× 是按字节的服务成本，不是每 IO 固定开销**。实际单 IO 在 chunk≥256K 时被夹在 **256KiB**（target n 从 16898 掉到 8450），大 IO 杠杆失效。**用户验收 parity（P50/W9 ≤ plain×1.05）未达成。** 用户明确不接受改 vseg 逻辑代码；下一步要拆 W9 必须让 target 带 BUFFER 重启（高危，需批准），否则只能走多 target/member 或内存分层。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -7948,3 +7948,45 @@ vsegment 规划参数（命令行）：
 - 不改 SPDK、不动 `/usr/local`。
 - 失败（挂载/IO 错误）停手回报；不要自行改代码修复。
 - 预计：探针 3 分钟 + 7 臂 ×3 遍约 8–10 分钟；总计 **≤15 分钟**。
+
+---
+
+## NOF-113R 裁决（2026-11-26 · 回执已收）
+
+### 1. 结果（[事实]，T1，3 遍均值，µs）
+
+| 臂 | chunk | P50 | W9（target） | target n |
+|---|---|---|---|---|
+| plain | 128K | **270.52** | 120.4–129.1 | 16897–16898 |
+| plain | 1M | 264.00 | 143.4–143.5 | 8449–8451 |
+| plain | 2M | 277.73 | 142.5–143.5 | 8450 |
+| vseg | 128K | **546.36** | 249.9–257.4 | 16897–16899 |
+| vseg | 512K | 559.24 | 287.0–287.6 | 8449–8452 |
+| vseg | 1M | 549.87 | 286.7–288.3 | 8449–8451 |
+| vseg | 2M | **551.93** | 286.6–288.7 | 8449–8451 |
+
+- vseg@2M vs plain@128K = **2.04×**；vseg@2M vs plain@2M = **1.99×**。
+- vseg 四个 chunk 全在 546–559 噪声带，**chunk 对 vseg 无影响**。
+- 大 IO 不降时延：plain 270.52→264.00→277.73，vseg 546.36→549.87→551.93；**W9 反而升**（plain 120→143，vseg 250→287）。
+
+### 2. 两个关键机制事实
+
+1. **target 实际单 IO 被夹在 256KiB**：chunk≥256K 时 target n 从 16898（528×32）掉到 8450（528×16），即每 key 16 个 IO、每个 256KiB；虽然 `blocks_per_chunk` 到了 4096，实际 IO 没有继续变大。512K/1M/2M 三档表现一致就是这个原因。夹点很可能是 target MDTS/传输上限（[推算]，回执未直接给出 MDTS 值）。
+2. **2× 是按字节的成本，不是每 IO 固定开销**：IO 从 128K 变 256K，单 IO 时间与总时延都基本不变（甚至 W9 变差）。如果 vseg 多出的是“每笔请求固定 128µs”，大 IO 应该摊薄它；实测没有 ⇒ vseg 是**每字节的服务速率约为 plain 的一半**。
+
+### 3. 判决
+
+- **配置路径到顶**：单 target、同 LBA、同 IO 数下，调 chunk 不能消除 2×，也达不到 parity（≤1.05×）。
+- 仍为 **L2**：知道“按字节慢一倍”，不知道 target 内部哪一段/什么机制导致。
+- 用户验收未达成；不能把 2× 收口。
+
+### 4. 下一步（需用户批准）
+
+要回答“为什么按字节慢一倍”，必须**拆开 W9**，看 target 逐 IO 的：
+- `enter/submit/submit_return/callback`（bdev 提交前/中/盘完成）；
+- `buffer/wait/enomem`（buffer 等待）；
+- `lcore/qid/cid/lba/nlb`（哪个轮询核/队列、在飞并发、到达顺序）。
+
+target 已有 `URMA_STAGE_BUFFER` 24 字段 trace，可直接用；但必须让 target **带 BUFFER env 重启并退出时 dump**（高危：RAID0 UUID 可能变、vseg 元数据可能失效，需重新 register/mount，必要时重写 400 keys）。一次重启可同时采 vseg 与 plain，按 `exec_tick` 间隙切分。
+
+**替代方案（不重启 target）**：多 member 跨独立 target，或内存分层；都不是“定位这个 2×”，而是换路线。
