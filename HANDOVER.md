@@ -5,7 +5,7 @@
 - 之后每轮：`cd mooncake-nof-vsegment-handover && git pull`
 - 权限：**只 pull，不要 push**；本仓不接收反向提交
 - 回执：按下方《回执格式》在会话里输出，由用户转交开发侧；回执不写回仓库
-- 最后更新：2026-11-25
+- 最后更新：2026-11-26
 
 
 > ## 📌 代码来源链（2026-11-24 21:38 · 用户提供 + NOF-092 实测 · **所有源码判断的唯一依据**）
@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-138（MC_EID_INDEX A/B：0 vs 1 · plain 60k 带宽读 · 2026-11-26）**。背景：yin 称 `MC_EID_INDEX=1` 可提升“1读多”带宽；源码确认 `MC_EID_INDEX` 只选 URMA EID/context（`config.cpp:662`，默认 0；`urma_endpoint.cpp:663-673`），不是带宽开关，需实测。流程：记录环境/`udmac0d1e2` EID 列表 → **只改 bench 进程 env**，E0→E1→E0→E1 各 2 遍（`segment_read` 60k、`--num_threads=16 --batch_size=16`、warmup=128、qpairs=4、verify=false、diag 关）→ 比吞吐（本单诊断）、Avg/P50/P90/P99、failed、target B W9/n，并核日志 `Selected URMA device ..., EID index 0/1`。EID1 初始化/读失败即停，**不重启 target**；EID1 吞吐 >5% 且稳定才议 vsegment 复测。不改码/不重启 master/target/etcd/不写数据；预计 5–10 分钟。其他：**NOF-137 已取消**（用户不再追 NOF-133 C 测量问题）；NOF-135/136 修正统计已定稿（V400 3轮 340.95/261.00/566.02/674.64；P400 340.04/266.30/589.44/661.49；V400/P400 1.003/0.980/0.960/1.020）；正式结果仍为 NOF-127；环境 `plain_nof135p` 运行（Keys=60000）。
+- 当前任务：**无在途任务（NOF-138 完成，EID 线关闭；2026-11-26）**。NOF-138 实测：同一 plain 60k、只改 bench env，E0→E1→E0→E1 各 2 遍；**EID1 相对 E0 吞吐 −0.44%**（47,705.41 vs 47,917.09 MiB/s），P50 −0.03%、P90 +0.00%、P99 −0.64%、target B W9 −0.18%，四遍 failed=0、每遍 234.38GB；EID 自证四遍全命中（`Selected URMA device udmac0d1e2, EID index 0/1`），`urma_admin show -d udmac0d1e2` 显示 8 个 EID 全 ACTIVE。⇒ **`MC_EID_INDEX` 只是 URMA EID/context 选择，不是带宽旋钮；按判据不进入 vsegment 复测**。**裁定：EID 线关闭；`plain_nof135p` master 暂保持运行（无写入、零成本；如需释放 node4 再单独停 master，etcd/target 与数据不动）**。其他：NOF-137 已取消；NOF-135/136 修正统计定稿（V400 3轮 340.95/261.00/566.02/674.64；P400 340.04/266.30/589.44/661.49；V400/P400 1.003/0.980/0.960/1.020）；正式结果仍为 NOF-127；环境 `plain_nof135p` 运行（Keys=60000）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -10014,3 +10014,35 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 不写数据、不切 vsegment、不重启 target。
 - 若 EID1 不可用，停手；不要为它重启 target。
 - 预计 **5–10 分钟**。
+
+---
+
+# NOF-138 完成（2026-11-26 · MC_EID_INDEX 0 vs 1 · plain 60k · **EID 线关闭**）
+
+## 条件
+
+- 环境：`plain_nof135p` 2509048/2509051（Keys=60000）、target B 2458315、target A 3329243、etcd 2455814 全部不动；**只改 bench 进程 env**。
+- 读：`segment_read` 60k（plain 单 segment，`--num_keys=60000`）、`--num_threads=16 --batch_size=16`、warmup=128、qpairs=4、verify=false、diag 关；顺序 E0→E1→E0→E1，每臂 2 遍。
+- 预检：`urma_admin show -d udmac0d1e2` 显示 8 个 EID（index 0–7）全 ACTIVE；**必须带 `-d`**，不带只列 bonding_dev_0 的 eid0。
+
+## 结果（每遍读成功：failed=0、234.38 GB、3,760 queries）
+
+| 臂 | 吞吐 MiB/s | Avg µs | P50 µs | P90 µs | P99 µs | target B W9 ns |
+|---|---|---|---|---|---|---|
+| E0（2 遍） | **47,917.09** | 21,296.55 | 21,342.68 | 21,640.68 | 22,156.34 | 283,495 |
+| E1（2 遍） | **47,705.41** | 21,385.46 | 21,336.69 | 21,641.34 | 22,013.48 | 282,980 |
+| E1/E0 | **0.996（−0.44%）** | 1.004 | 1.000 | 1.000 | 0.994 | 0.998 |
+
+- 离散度：E0 吞吐 spread 0.25%、E1 0.03%；四遍日志均含 `Selected URMA device udmac0d1e2, EID index 0/1`，EID 设置确实生效。
+- **判据（>5% 且稳定）不满足，方向为负 ⇒ `MC_EID_INDEX` 不是带宽旋钮；不进入 vsegment 复测，EID 线关闭。**
+- 本单时延是 16×4MiB/批（≈21ms）的批时延，**与正式 T1/batch1（P50≈254µs）不可比，不并入正式时延表**；吞吐仅本单诊断。
+
+## 偏差
+
+- `run/nof138_rounds.csv` 的 Throughput 列原为空（抓取模式写成 `Throughput:`，日志实际为 `Throughput (avg):`）；已从客户端日志补算并另写 `run/nof138_rounds_fixed.csv`，原始读数未丢。
+- 客户端日志在 node2（4 份×10MB），聚合时复制到 node4 `/tmp/nof138_ev/` 供核对。
+
+## 裁定与末态
+
+- **EID 线关闭**；`plain_nof135p` master 暂保持运行（无写入、零成本）；target/etcd 未动，数据完整。
+- 如需释放 node4，仅停 master 2509048/2509051，**不要停 etcd/target、不删数据**；以后可同集群重启复用 plain 基线。
