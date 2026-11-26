@@ -61,16 +61,17 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 
 ---
 
-## 3. 当前环境状态（2026-11-26 NOF-128 起）
+## 3. 当前环境状态（2026-11-26 NOF-129 重建中）
 
 | 对象 | 状态 |
 |---|---|
-| target A（node3） | PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR |
-| target B（node4） | **已重建**：PID 2391418；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `c19b91e1…`；11/11、strip 256KiB、nsid1、4457；0 ERROR |
-| master | `plain_nof127b` 2438798/2438801 运行中（Keys=60000）；NOF-128 将停它、起 `vseg_nof128` |
-| etcd | 2408033/2408036；`--max-request-bytes=67108864`；dbSize 873.65MiB |
+| target A（node3） | **正常**：PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR |
+| target B（node4） | **不存在**（原 2391418；日志 16:25:50 后无退出记录）；11 块数据盘仍绑定 vfio-pci；NOF-129 重建后新 UUID |
+| master | **不存在**；NOF-129 将起 `vseg_nof128` |
+| etcd | **不存在**（原 2408033/2408036；data-dir 1.3G 完好，末行 16:06:00）；NOF-129 用同 data-dir + 64MiB 重建 |
 | node2 | 无 bench/register 残留；客户端 md5 bb4a07a3…（未重编） |
-| 当前任务 | **NOF-128（只测 vsegment：60k、一整块、10 轮；逐轮取 target A/B W9，查轮间波动来源）** |
+| 当前任务 | **NOF-129（重建 node4 的 etcd/target B + 回收 11 盘；再跑 NOF-128 的 vsegment 10 轮；不杀外部用户）** |
+| 风险 | node4 非独占：外部用户 `computin` 16:20–16:50 多次登录，load 9.3、15 users；与清场因果未证；如再次清场，停手回报 |
 
 ---
 

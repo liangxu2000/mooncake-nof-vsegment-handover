@@ -103,7 +103,7 @@
 
 - **正式测试口径（2026-11-26 用户定，后续默认）**：① key=4MiB，**60,000 keys**，不再用 400 keys；② vsegment 用**一整块**：`extent=256GiB/member`（274877906944），逻辑 512GiB，`member_count=2 / stripe=2MiB / required_medium=nof / reserved_ratio=0 / io_alignment=4096 / slot=1`；50G/3vseg 仅作历史对照，不再默认；③ plain 单 target B；④ 读 = T1（threads=1/batch=1）、warmup=128、qpairs=4、verify=false、diag 关、sequential；vsegment `--num_keys=30000`/segment；**每轮只读一遍 60k keys（约 20s），禁止用 `--duration` 连续循环读**；⑤ **稳定性**：每臂 ≥6 轮，至少 2 个交替周期（V3→P3→V3→P3）；**回执正文不逐轮罗列，按 `测试结果聚合方法_20261112.md` 给聚合值（Avg 均值、分位中位）+ spread**；⑥ 第四阶段第一个正式结果 = NOF-127。
 
-- 当前任务：**NOF-128（只测 vsegment：60k、一整块、10 轮；逐轮取 target A/B 的 W9；查轮间波动在 target 还是客户端；2026-11-26）**。背景：NOF-127 正式结果（按 `D:\gds性能\测试结果聚合方法_20261112.md`：Avg=各轮均值、分位=各轮同分位中位）vsegment/plain **P50 257.01/248.51 = 1.034×**、Avg 1.040×、P90 1.046×、P99 1.371×；**P50/Avg/P90 达 parity，P99 未达**；但两臂 Avg spread **6.2% / 6.4%**（>3%，高值轮集中在 p4/p5 同时间段）。本单只测 vsegment 10 轮，每轮一遍 60k≈20s，逐轮取 W9 判断波动来源；不改码/不重启 target/etcd/不补写。环境当前 `plain_nof127b`（Keys=60000）。
+- 当前任务：**NOF-129（重建 node4：etcd 64MiB + 回收 11 盘 + target B；随后重跑 NOF-128 的 vsegment 10 轮，逐轮取 W9；用户已授权；2026-11-26）**。背景：NOF-127 正式结果（按 2026-11-12 聚合）vsegment/plain **P50 257.01/248.51 = 1.034×**、Avg 1.040×、P90 1.046×、P99 1.371×；**P50/Avg/P90 达 parity，P99 未达**。NOF-128 开测前 **node4 被外部清空**（etcd/master/target B 全无；target B 日志 16:25:50 后无退出记录；11 盘仍 vfio-pci），零数据停手；外部用户 `computin` 多次登录、因果未证。本单只重建 node4 的 etcd/target B 并重跑 vsegment 10 轮；**不杀外部用户会话/进程**；target A 不动；target B 旧测试数据不保留。详见 NOF-129。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -9370,3 +9370,66 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 不改码/不重编/不装包/不重启 target/etcd；master 可停/起，注册每次 B→A。
 - 10 轮连续；每轮必须取到 W9；失败停手。
 - 预计 **20–30 分钟**。
+
+---
+
+## NOF-128 阻断（2026-11-26 · node4 环境被外部清空，零数据）
+
+### 1. 事实
+
+- 16:46:37 启动时，node4 上 **etcd / master / target B 全部不存在**；端口 2379/2380/4457/50056/9006/8086 均未监听。
+- 本次启动的 master 因 etcd 不可达，16:47:03 abort（`failed to create HA batch-record OpLog writer: ETCD_OPERATION_ERROR`）。
+- 注册 B/A 均失败（segment=0）；写 60k 空转 98s，Keys 恒 0（ret=-1）；读轮无统计；16:52:32 停手。
+- target B 旧进程 2391418 不存在；`/tmp/nvmf_tgt.log` mtime=16:25:50，最后一行正常 timing，**无 Exiting/shutdown/SIGTERM/ERROR** ⇒ 非正常退出。
+- etcd 旧进程 2408033/2408036 不存在；`/tmp/etcd_nof123.log` 末行 16:06:00（正常 WAL purge），data-dir 1.3G 完好；16:09:12 NOF-127 收尾时仍可读（dbSize 873.65MiB）。
+- 11 块数据盘仍绑定 vfio-pci；`lsblk` 仅系统盘 nvme10n1；target A（node3，3329243）正常。
+- 外部登录：`last` 显示 `computin` 在 16:20/16:23/16:32/16:41/16:42/16:50 多次登录 node4；load 9.32、15 users。**无法证明与清场的因果**，只记录事实。
+- 测试 Agent 未启动/重启任何服务；无残留。
+
+### 2. 影响与决策
+
+- NOF-128 本轮 **0 有效数据**；NOF-127 已交付结果不受影响（16:09 完成并落盘）。
+- target B 上的 8 次 60k 写入均为测试数据，**不保留**；只备份旧 target/etcd 日志用于取证。
+- **下发 NOF-129**：按 NOF-119R 已验证路径重建 node4（etcd 64MiB → 回收 11 盘 → 重启 target B），随后重跑 NOF-128 的 10 轮 vsegment。
+- node4 非独占（外部用户多次登录）；**不杀外部用户会话/进程**；若其作业再次清场或占用资源，停手回报，由用户决定是否处理该用户。
+
+---
+
+# NOF-129（待执行 · 重建 node4 + 重跑 NOF-128 · 用户已授权 · 2026-11-26）
+
+## 授权范围（仅此单有效）
+
+- **允许重启/重建** node4 的 etcd、target B，并回收 11 块 NVMe（vfio-pci→nvme）；允许停/起本方 master。
+- **不允许**杀外部用户会话/进程、重启 node4 整机、动 target A（node3）、改码/重编。
+- target B 旧数据丢弃（测试数据）；先备份旧日志。
+
+## A. 取证（只读）
+
+1. 备份到 `run/nof129_evidence/`：`/tmp/nvmf_tgt.log`（旧 target B，23,335 行）、`/tmp/etcd_nof123.log`、`last -n 30`、`who`、`ps -ef` 相关快照、`ss -ltnp`、`lsblk`、vfio 设备列表。
+2. 检查 11 块 NVMe 是否被外部进程占用（`fuser`/`lsof` 相关设备）；若有外部占用，**停手回报**，不杀。
+3. 记录 node4 当前 load/用户数；若外部作业明显在跑（持续高负载），先回报再决定。
+
+## B. 重建 etcd
+
+1. 用**同一 data-dir + 原参数 + `--max-request-bytes=67108864`** 启动 etcd；记录 PID/cmdline。
+2. 验收：2379 LISTEN、health/leader 正常、dbSize ≈873MiB、无 FATAL；若起不来，停手回报。
+
+## C. 回收 11 盘 + 重启 target B
+
+1. 运行 `target_nvme_takeover.sh -r -y`（NOF-119R 路径）；验收 11/11 `[ OK ]`，`lsblk` 出现 11 块数据盘（排除系统盘 nvme10n1）。
+2. 按 BDF 升序取 nvmeXn1，重启 target B：RAID0 strip 256KiB、端口 4457、`--wait-for-rpc`、trace 262144；记录 PID、新 UUID、NQN/SN。
+3. 验收：4457 LISTEN、11/11 online、0 ERROR；target A（node3）不动。
+
+## D. 重跑 NOF-128
+
+1. 起 `vseg_nof128`（node4，50056/9006/8086、slot=1、etcd、URMA、HA+oplog、batch=64、`extent=274877906944`、member_count=2/stripe=2MiB/…）；清同名键；注册 **新 target B → target A** 各 512GiB；quota 验收。
+2. 写 60k（T1/batch1，`--num_keys=30000`/segment）；验收 Keys=60000；不补写。
+3. 读 10 轮（每轮一遍 60k≈20s，T1/warmup128/qpairs4/verify=false/diag 关）；**每轮取 target A/B 的 W9avg 与 n**（本轮窗口，禁止跨轮累计）。
+4. 按 `测试结果聚合方法_20261112.md` 聚合（Avg 均值、分位中位）+ spread；正文不逐轮罗列。
+
+## E. 边界
+
+- 只重建 node4 的 etcd/target B；target A 不重启；不改码/不重编/不装包。
+- 外部用户会话/进程一律不动；若外部作业导致再次清场或资源争用，停手回报。
+- target B 旧数据不保留；NOF-127 结果已落盘。
+- 预计 **30–45 分钟**（重建 + 写 60k + 10 轮）。
