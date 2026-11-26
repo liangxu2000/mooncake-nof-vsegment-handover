@@ -96,7 +96,8 @@ node2（reader + writer）                node4（master + etcd + target B）
 | **NOF-111** | 单变量 qpair 数 | **无改善**：vseg W9 248.80→**248.87**、P50 555.00→558.74；plain W9 120.29。探针确认 1 条 lane/qpair、单 lane 额度仍 16384 ⇒ **qpair 扇出排除**。客户端组织方式累计全部排除；W9 比值三次独立实验均为 **2.07×** |
 | **NOF-112** | LBA 布局对照 | **布局假说被否**：两臂起始 LBA 逐值相同 400/400；非慢区 301 个 key 上 vseg **301/301 全慢**（p50 478.5 vs 179.0µs），慢区 99 个 key 两臂相等（447.5 vs 448.5）⇒ 位置不能解释 2× |
 | **NOF-113R** | 纯配置：vseg 大 IO vs plain | **配置路径到顶**：vseg@2M **551.93** vs plain@128K **270.52µs（2.04×）**、vs plain@2M 277.73（1.99×）；chunk 对 vseg 无影响，W9 反而 250→287（plain 120→143）⇒ **2× 按字节计，不是每 IO 固定开销**；target 单 IO 在 ≥256K 时被夹到 256KiB（n 16898→8450）。parity 未达成 |
-| **NOF-114** | node3 第二个 target 部署与就绪 | **已就绪、无需部署**：PID 2810360、md5 同 node4、11 盘 RAID0 strip256K、nsid1、4457、0 ERROR、空转 n=0。**待裁决**：① NQN/SN 与 node4 相同（身份冲突风险，建议重启换唯一 NQN）；② node3 有第三方 royi master/client，实际非独占 |
+| **NOF-114** | node3 第二个 target 部署与就绪 | **已就绪、无需部署**：PID 2810360、md5 同 node4、11 盘 RAID0 strip256K、nsid1、4457、0 ERROR、空转 n=0；但 NQN/SN 与 node4 相同 |
+| **NOF-114R（当前）** | node3 独占清理 + target A 换唯一 NQN | 用户授权“佛挡杀佛”：清 royi master/client；重启 target A 换 `urma-gpu-test-node3`/`URMAGPU0003`，保持 11 盘 RAID0/4457/nsid1；不 register/不写/不动 node4 |
 | **NOF-115（待下发）** | 双 target vsegment 测量 | 参数：`member_count=2`、**extent=50GiB**、**keys=400（先跑通）**、oplog/HA 保持现状。register node3+node4 两个 NoF segment；写 400 keys（4MiB→2×2MiB 跨两个 target）；plain 单 target 400 keys 对照；验收 parity（≤ plain×1.05）。1000/20k 等跑通后再试 |
 
 ---

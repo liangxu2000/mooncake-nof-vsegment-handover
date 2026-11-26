@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**待用户裁决 NOF-114 后续（NQN / royi）**。NOF-114 回执：**node3 target A 已就绪，无需部署**——PID 2810360、md5 `3129641f…` 与 node4 相同、11 盘 RAID0 strip256K online、nsid1、4457 LISTEN、0 ERROR、最新 breakdown 块 n=0（从未有 IO）。**两个待裁决点**：① NQN/SN 与 node4 **相同**（`nqn.2026-01.io.spdk:urma-gpu-test` / `URMAGPU0001`），两个独立 target 同 NQN/SN 存在 NVMe-oF 子系统身份冲突风险；master 侧 segment 名含 traddr（不同 IP 会得到不同 segment 名，重复注册只 warn），所以**注册可能不阻塞，但 initiator 侧多路径身份有风险**（[未验证]）。② node3 上有第三方 **royi master/client**（50151/18080/19005），node3 并非实际独占；未触碰。**建议**：授权重启 node3 target 换唯一 NQN/SN（空转、无数据，3–5 分钟，UUID 会变），并由用户处理 royi；然后 NOF-115。NOF-115 参数不变：keys=400、extent=50GiB、member_count=2、plain 单 target、oplog/HA 保持。
+- 当前任务：**NOF-114R（用户已授权 node2/3/4 独占“佛挡杀佛”：清理 node3 第三方 royi 进程 + 重启 node3 target A 换唯一 NQN/SN + 验证；不 register/不写数据/不动 node4）**。NOF-114 已完成：node3 target A 已就绪（PID 2810360、md5 同 node4、11 盘 RAID0 strip256K、nsid1、4457、0 ERROR、空转 n=0），但 **NQN/SN 与 node4 相同**（`nqn.2026-01.io.spdk:urma-gpu-test` / `URMAGPU0001`）且 node3 有 royi master/client。用户 2026-11-26 明确：**node2/3/4 我们独占，佛挡杀佛** ⇒ 清理 royi；重启 target A 换唯一 NQN/SN（空转无数据，3–5 分钟，UUID 变）。之后 NOF-115：keys=400、extent=50GiB、member_count=2、plain 单 target、oplog/HA 保持。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -8085,3 +8085,65 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - **(c) 先处理 royi**：用户确认是否可停；若保留，NOF-115 需记录 node3 负载/CPU 混叠。
 
 **NOF-115 参数不变**：keys=400、extent=50GiB、member_count=2、plain 单 target、oplog/HA 保持现状。
+
+---
+
+# NOF-114R（待执行 · node3 独占清理 + target A 换唯一 NQN/SN · 不 register/不写数据/不动 node4 · 2026-11-26）
+
+## 用户授权
+
+用户明确：**node2/3/4 我们独占，佛挡杀佛**。node3 上的第三方进程可以清理；node3 target A 可以重启。仍不碰 node4 target/master，不写数据。
+
+## 目标
+
+1. 清理 node3 上的第三方 Mooncake/测试进程（royi master/client 及其他非系统、非我方残留进程），释放 CPU/内存。
+2. 重启 node3 target A，使用**唯一 NQN/SN**（与 node4 不同），保持同一二进制、同一 11 盘 RAID0 strip256K、nsid1、4457。
+3. 验证 target A 就绪；为 NOF-115 双 target 注册做准备。
+4. **不 register、不 mount、不写数据、不动 node4 target/master**。
+
+## A. node3 进程清理（先取证再杀）
+
+1. 全量记录 node3 用户态进程：PID/PPID/user/cmdline/端口/CPU/内存；标出：
+   - 我们的：target A（PID 2810360）、node3 上可能残留的 bench/register；
+   - 第三方的：royi master（3463695，50151/18080/19005）、royi client（3465188）及其他 royi 子进程；
+   - 系统/他人：sshd、系统服务等**不杀**。
+2. 先停 royi client，再停 master；`TERM` 后等待，必要时 `KILL`；记录每步 PID/退出码。清理后确认 50151/18080/19005 释放、load 下降。
+3. 若发现其他非系统、非我方进程：记录后按“佛挡杀佛”处理；**不杀 PID 1、系统守护进程、sshd/网络管理**。若无法判断归属，停手回报。
+4. 检查 node3 端口占用：4457 应仅剩 target A；其他我方端口（50056/9006/8086/2379/50156）不应在 node3 运行。
+
+## B. 重启 target A（换唯一 NQN/SN）
+
+1. 取证 target A 的启动方式：PID 2810360 的 exe/cwd/cmdline/environ、启动 wrapper、日志路径；记录原 NQN/SN、RAID0 UUID、BDF 顺序、hugepages。
+2. 停止 target A（SIGTERM，等待退出；记录日志尾部）。确认 11 盘回到 vfio、4457 释放。
+3. 用同一 wrapper/同一二进制重启，仅改：
+   - **NQN = `nqn.2026-01.io.spdk:urma-gpu-test-node3`**（与 node4 的 `urma-gpu-test` 不同）
+   - **SN = `URMAGPU0003`**（与 node4 的 `URMAGPU0001` 不同）
+   - 保持 11 盘 RAID0、strip 256KiB、superblock=false、nsid1、4457、`-m [2-7]`、trace entries 262144、URMA 设备/capsule 同原配置。
+   - 若 wrapper 硬编码 NQN/SN：复制到我们自有目录再改，记录 diff/md5；不改他人脚本。
+4. 启动后验收：
+   - 4457 LISTEN；`nvmf_get_subsystems` 显示新 NQN/SN、nsid1→URMA_RAID0；
+   - RAID0 online、11 盘、strip 256K；新 RAID0 UUID 记录；
+   - 日志 0 ERROR；`breakdown` 块 n=0（无 IO）；
+   - node2→node3:4457 L3 连通（ping）。
+5. **不执行 register/mount/nof_register**；不改 node4。
+
+## C. 交付（必答）
+
+1. node3 清理前后进程表、被杀 PID/命令/退出码、端口释放、load 对比。
+2. target A 原配置 vs 新配置：NQN/SN、PID、启动时间、日志路径、RAID0 UUID、BDF、hugepages。
+3. 新 target 验收：4457、NQN/SN、nsid1、RAID0 online/11 盘/strip256K、0 ERROR、breakdown n=0。
+4. 明确写：**未 register、未 mount、未写数据、node4 未动**。
+5. 环境末态：node3 target A 运行（新 NQN）、royi 已清理；node2/node4 未变。
+
+## D. 边界与回退
+
+- 只清理 node3 用户态进程；**不杀系统守护/sshd/PID 1**；不动 node4。
+- 不 register、不 mount、不写数据、不改 vseg 逻辑代码、不装包。
+- target A 空转无数据，重启风险低；若重启失败：记录日志，恢复原 wrapper/配置并重启（旧 NQN 可回退），停手回报。
+- 新 RAID0 UUID 会变；NOF-115 重新 register 即可，不依赖旧 UUID。
+- 预计 **10–15 分钟**。
+
+## E. 为 NOF-115 准备
+
+- 记录 node3 target A 的新 endpoint（node 标签）、NQN、SN、nsid、UUID。
+- 只查 `nof_register --help` 是否支持按 endpoint+NQN 注册两个 segment（**不执行注册**）。
