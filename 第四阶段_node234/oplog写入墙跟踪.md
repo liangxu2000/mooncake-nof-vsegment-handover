@@ -1,0 +1,186 @@
+# 大数据写入的 oplog 墙：跟踪记录
+
+- 开始日期：2026-11-26
+- 状态：**NOF-123 待执行/待回执**（最终解决段留空，后续更新）
+- 一句话：目标 **60,000 keys（240GiB）**，在 **25.6k keys（约 100GiB）** 撞上 etcd 单事务上限；不是总空间，不是批条数，而是 **vsegment full-state 快照作为一条 oplog entry** 太大。
+- 关联任务：NOF-119 A / NOF-120 / NOF-121 / NOF-122 / **NOF-123（当前）**
+
+---
+
+## 1. 背景
+
+- 真实拓扑：reader node2；master+etcd node4；target A node3 + target B node4；vsegment `member_count=2`；plain 单 target。
+- 目标：60k keys ×4MiB = 240GiB，单遍读约 20s，vseg 与 plain 对比 parity。
+- 正常 HA 配置：`--enable_ha=true --enable_oplog=true`；etcd 默认 `--max-request-bytes=2MiB`。
+- 旧 node1/node3 的“2000-key 942MB oplog”**不外推**；本记录只写当前环境实测。
+
+---
+
+## 2. 时间线与实验
+
+### 2.1 NOF-119 A：容量可扩，oplog off 不发 quota
+
+| 项 | 结果 |
+|---|---|
+| 512GiB segment 注册 | **通过**：两 segment 各 549,755,813,888B，总 1TiB；无需重启 target |
+| oplog off 发布 vseg quota | **不通过**：2 分钟 `enabled=0`；日志 `no eligible psegment pool yet` |
+| 同机 oplog on 对照 | **通过**：40s 发布 generation=1、partitions=1、discovered_segments=2 |
+| 手工 quota 回退 | 不可用：planner 工具未构建、HTTP 404 |
+
+结论：oplog off 这条路在当前构建不可用；quota 发布依赖 HA/OpLog 提交路径。
+
+### 2.2 NOF-120：5k 试水，总空间安全
+
+| 项 | 实测 |
+|---|---|
+| Keys | 5,000 |
+| etcd dbSize | 13,619,200 B（12.99MiB） |
+| `/oplog/vseg_nof120/` | 9,870 keys / 4,910,154 B（4.68MiB） |
+| dbSize 增量 | +8,257,536 B（≈1,651.5 B/key） |
+| 外推 60k | **≈0.105GiB** |
+| 文件系统 | 可用 1.1TiB（used 59% 为历史占用） |
+
+结论：**总空间不是问题**；oplog on 可以支撑 60k 的空间需求。  
+注意：5k 没有触发 1024 条大批判，因此没有暴露后面的“单条 full-state”问题。
+
+### 2.3 NOF-121：第一次撞墙（batch=1024）
+
+| 项 | 实测 |
+|---|---|
+| 写入结果 | **25,647 succeeded / 34,353 failed** |
+| 失败码 | `ret=-1010` ×34,352、`VSEGMENT_CREATING` ×2、`ret=-105` ×1 |
+| 错误原文 | `TxnCompareAndPut failed: ResourceExhausted: received message larger than max (13295444 vs. 2097152)` |
+| 单事务 | **13,295,444 B > etcd 默认 2,097,152 B**；同尺寸重试 3784+ 次 |
+| 数据量 | 25,647×4MiB = **100.184 GiB** |
+| vsegment 状态 | `vsegments=2`，但 `logical_capacity=100GiB`、`create_success=1` |
+| etcd | dbSize 54.5MiB、oplog 23.89MiB、`/cvm` 0.012MiB；总空间安全 |
+
+### 2.4 NOF-122：把 batch 从 1024 降到 64，仍然无效
+
+| 项 | NOF-121（1024） | NOF-122（64） |
+|---|---|---|
+| 失败 Keys | 25,647 | **25,632** |
+| 失败事务 | 13,295,444 B | **13,322,832 B（+0.2%）** |
+| 每 key 折算 | 518 B | **520 B** |
+| etcd 上限 | 2,097,152 B | 2,097,152 B（未变） |
+| 结果 | `-1010` 无限重试 | 同样 `-1010`，同一尺寸 |
+
+结论：**`oplog_batch_max_entries` 不是这条事务的尺寸杠杆**。
+
+---
+
+## 3. 根因（源码级）
+
+- `VSegmentOpLogRecord`（`mooncake-store/include/vsegment/vsegment_ha.h:24-37`）有一个 `full_state` 标志；
+- `full_state=true` 时，payload 是整块 **`PartitionVSegmentSnapshot`**；
+- `OrderedOpLogVSegmentCommitter::CommitDeferred`（`vsegment_ha.cpp:121-148`）把它 `struct_json::to_json` 成 **一个 `OpLogEntry`**；
+- 该快照包含 `logical_allocation`（每个 key 的分配记录），约 **520B/key**；
+- 25.6k keys ⇒ **13.3MB**；60k keys ⇒ **约 31MB**；
+- 它是一条 entry，`oplog_batch_max_entries=64` 只能限制“批里几条”，**不能拆开这一条**；
+- 于是 `TxnCompareAndPut` 把整条 13.3MB 放进一个 etcd 事务，超过 `--max-request-bytes=2MiB`，被 `ResourceExhausted` 拒收；
+- 批一旦封好，master 用同一冻结事务无限重试，不会自愈。
+
+**为什么卡在 ~100GiB**：25,632 keys 刚好越过单 vsegment 100GiB；第 2 个 vsegment 创建触发了 full-state checkpoint，而这条 checkpoint 超过 etcd 上限。  
+（[推算]，NOF-123 抬 etcd 上限后应能验证；若第 2 个 vsegment 仍不创建，则 100GiB 静态 quota 是第二道墙。）
+
+---
+
+## 4. 已排除 vs 未排除
+
+### 4.1 已排除（当前环境实测）
+
+| 假说 | 结论 |
+|---|---|
+| oplog 总空间不够 | **排除**：etcd 92MiB、/home 1.1TiB、/cvm 0.012MiB |
+| oplog 批条数太大 | **排除**：1024→64，事务尺寸不变 |
+| vseg quota 空间不足 | **排除**：512GiB segment 注册成功、总 1TiB |
+| oplog off 可绕开 | **排除**：quota 不发布，手工 quota 不可用 |
+| 数据/磁盘满 | **排除**：target 写入 n 与容量均正常 |
+
+### 4.2 未排除
+
+| 假说 | 状态 |
+|---|---|
+| **etcd `max-request-bytes=2MiB` 是唯一卡点** | NOF-123 验证中（64MiB） |
+| 100GiB 单 vsegment 静态 quota 是第二道墙 | 未分离；NOF-123 观察 vsegments/capacity |
+| full-state checkpoint 的触发频率/大小是否还有更大值 | 60k 预计 31MB；需实测 |
+| plain 是否不受此墙 | 预期不受（不写 vsegment state），NOF-123 最终 plain 臂验证 |
+
+---
+
+## 5. 解决决策
+
+### 5.1 选择 E1：抬 etcd 单请求上限
+
+- 重启 etcd，增加 **`--max-request-bytes=67108864`（64MiB）**；
+- 数据复用，不改 data-dir；
+- 60k full-state 约 31MB，64MiB 留 2× 余量；
+- 只重启 etcd + master，**不动 target**；
+- 为什么不是 E2/E3：
+  - E2（缩小 extent）不解决：full-state 是 **per partition**，不是 per vsegment，缩小 extent 不会缩小 state；
+  - E3（plain 60k）不解决 vseg，只作为最终对照臂。
+
+### 5.2 回退
+
+- etcd 启动失败/数据异常：恢复原参数重启，停手回报；
+- 64MiB 仍被拒：停手，附 etcd flag/错误原文；下一步才考虑改码（拆分/省略 full-state）或退回 20k。
+
+---
+
+## 6. NOF-123 执行项（当前）
+
+1. 停 wedged `vseg_nof122` master（2404042/2404045；CPU 86%、无限重试），备份日志；target 不动。
+2. 优雅停 etcd 2389250，用同 data-dir + `--max-request-bytes=67108864` 重启；验证 health/leader/dbSize。
+3. 起 `vseg_nof123`（HA+oplog、batch=64、512GiB segments、member_count=2/extent=50G/stripe=2M），注册 B→A。
+4. 写 60k；监控 ResourceExhausted；验收 Keys=60000、logical_used=251,658,240,000；观察 vsegments/capacity 是否增长。
+5. 通过后 vseg 读 1 遍（60k queries，T1/warmup128/qpairs4/diag off），约 20–24s。
+6. plain `plain_nof123` 写/读 1 遍，约 20s；parity。
+
+**成功判据**：etcd 无 `ResourceExhausted`；Keys=60000；vsegments 按需增长；vseg 读通；plain 读通；parity 可计算。
+
+---
+
+## 7. 最终结果（待填）
+
+> **NOF-123 回执后更新此节**：
+> - etcd 新 flag/PID/dbSize：
+> - vseg 写入 Keys / logical_used / vsegments / logical_capacity：
+> - vseg 读 P50/Avg/P90/P99、W9、实际时长：
+> - plain 读 P50/W9：
+> - parity 比值：
+> - 最终采用的配置与遗留风险：
+
+---
+
+## 8. 环境与口径（2026-11-26）
+
+| 对象 | 状态 |
+|---|---|
+| target A（node3） | PID 3329243；NQN `...urma-gpu-test-node3`；RAID0 UUID `2c5bf1f2…`；11/11、strip256K、nsid1、4457 |
+| target B（node4） | PID 2391418（重建后）；RAID0 UUID `c19b91e1…`；11/11、strip256K、nsid1、4457 |
+| etcd | PID 2389250；data-dir 复用；默认 max-request-bytes 2MiB |
+| wedged master | `vseg_nof122` 2404042/2404045；Keys=25,632；无限重试 13.3MB 事务 |
+| 数据 | vseg 25,632 keys ≈100.12GiB；target A/B 各 410,127 IO |
+| key/并发 | 4MiB、T1（threads=1/batch=1）、warmup=128、qpairs=4、verify=false、diag 关 |
+| vseg | member_count=2、stripe=2MiB、extent=50GiB、required_medium=nof |
+| 文档原则 | 只用 node 标签，不写内网 IP |
+
+---
+
+## 9. 相关源码
+
+| 内容 | 位置 |
+|---|---|
+| `VSegmentOpLogRecord` / `full_state` | `mooncake-store/include/vsegment/vsegment_ha.h:24-37` |
+| `CommitDeferred` 整块序列化为一条 entry | `mooncake-store/src/vsegment/vsegment_ha.cpp:121-148` |
+| OrderedOpLog writer 批封口 | `mooncake-store/src/ha/oplog/ordered_oplog_writer.cpp` |
+| 批事务 `TxnCompareAndPut`（单 value） | `mooncake-store/src/ha/oplog/oplog_batch_storage.cpp:134-190` |
+| etcd 错误 `ResourceExhausted` | `mooncake-store/src/etcd_helper.cpp:263` |
+| `--oplog_batch_max_entries` 定义 | `mooncake-store/src/master.cpp:385` |
+
+---
+
+## 10. 变更记录
+
+- 2026-11-26：建立本文档；记录 NOF-119 A / 120 / 121 / 122；确定根因为 full-state 单条 oplog entry；下发 NOF-123（etcd 64MiB）。
+- 待更新：NOF-123 回执、最终解决结论。

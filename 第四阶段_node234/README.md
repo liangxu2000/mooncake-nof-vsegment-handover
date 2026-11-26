@@ -268,6 +268,7 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - `../第三阶段 node2&4/400keys-首次端到端测试结果.md`：单 target 400-key 结果与客户端分段分析。
 - `../第三阶段 node2&4/条带与分块三层参数说明.md`：stripe/chunk/strip 三层说明。
 - `../第三阶段 node2&4/README.md`：第三阶段环境、源码政策、NOF-104~115 里程碑。
+- `oplog写入墙跟踪.md`：大数据写入的 oplog/full-state 墙时间线、根因、实验与最终解决记录（持续更新，直到 60k 写入解决）。
 - 本目录：第四阶段及之后的结果、回执摘要、图表、脚本摘要。
 
 ---
