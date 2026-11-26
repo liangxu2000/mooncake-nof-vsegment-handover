@@ -67,10 +67,10 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 |---|---|
 | target A（node3） | **正常**：PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR |
 | target B（node4） | **已重建**：PID 2458315；NQN `...urma-gpu-test`、SN `URMAGPU0001`；**新 UUID 50d6259e-51a6-4599-adf3-68defc0c5a53**；RAID0 strip 256K、online 11/11、4457、ERROR=0 |
-| master | **`vseg_nof134v1` 运行中**：Keys=60000、enabled=1（q1 诊断环境）；NOF-135 将停它、起 `vseg_nof135v` |
-| etcd | 2455814；`--max-request-bytes=67108864`；dbSize 1778.46MiB、raftIndex 2,081,968 |
+| master | **`plain_nof135p` 2509048/2509051 运行中**：Keys=60000（当前 plain 基线，先保留） |
+| etcd | 2455814；`--max-request-bytes=67108864`；dbSize 1931.57MiB、raftIndex 2,261,561 |
 | node2 | 无 bench/register 残留；客户端 md5 bb4a07a3…（未重编） |
-| 当前任务 | **NOF-135（m=1 一整块：写 60k、只读前 400 keys + plain 400 同环境对照；看旧 400-key 2× 是否复现）** |
+| 当前任务 | **无在途任务（NOF-135 完成；旧 400-key 2× 未复现，400-key 规模不是原因）** |
 | 风险 | node4 非独占：外部用户 `computin` 16:20–16:50 多次登录；本次重建后未被清；若再次清场/资源争用，停手回报 |
 
 ---
@@ -384,6 +384,20 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - 判据要求三项全 ≤1.05，V1 的 P99 **未过** ⇒ **q1 不采用**；正式配置保持 q4，正式结果仍为 NOF-127。
 - target W9：plain 47.4µs；vseg 39–40µs（vseg 单 IO 更快 15–17%）⇒ 差额在客户端聚合/路径；剩余 2.8–4.1%（P50/P90）与 1.345（P99）判结构性，本线收口。
 - V4 P99 spread 12.4% >10% ⇒ 该格仅诊断。
+
+### NOF-135 结果（2026-11-26，m=1 只读前 400 keys；旧 2× 未复现）
+
+| 组 | 范围 | 轮数 | Avg | P50 | P90 | P99 | P50 spread |
+|---|---|---|---|---|---|---|---|
+| V400 | vseg m=1 前 400 keys | 4 | 368.23 | 263.65 | 572.80 | 673.07 | **65.6%（不进表）** |
+| P400 | plain 前 400 keys | 4 | 340.04 | 266.30 | 589.44 | 661.49 | 4.7% |
+| V60k | vseg m=1 全 60k | 1 | 295.60 | 269.30 | 322.22 | 572.78 | n/a |
+
+- **V400/P400 P50 0.990×**（剔除 V400 首轮异常后 0.980×）、P90 0.972×、P99 1.018× ⇒ **旧 400-key 2× 未复现**。
+- 旧 NOF-113R 551.93/270.52 是旧 target 2142228（W9 286.6–288.7）+ 64MiB×~25 vseg 的账，**不是 400-key 规模**。
+- V60k 269.30 vs NOF-133 C 270.01 = 0.997×；400 与 60k P50 几乎相同。
+- 400-key target W9 高值多数来自 n=1/2 空闲块，两臂都有，不作归因；V400 首轮异常/样本少仅诊断。
+- 正式结果仍为 NOF-127；不单独立项复测旧环境/首轮异常。
 
 ---
 
