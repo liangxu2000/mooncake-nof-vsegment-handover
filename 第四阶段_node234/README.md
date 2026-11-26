@@ -66,10 +66,10 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 | 对象 | 状态 |
 |---|---|
 | target A（node3） | PID 3329243；NQN `...urma-gpu-test-node3`、SN `URMAGPU0003`；RAID0 UUID `2c5bf1f2…`；11/11 online、strip 256KiB、nsid1、4457、0 ERROR、零 IO |
-| target B（node4） | PID 2142228（11-25 15:20:22 起）；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `0470fe3a…`；11/11、strip 256KiB、nsid1、4457；ERROR 6 条（历史 pci_event socket read error 105） |
-| master | `vseg_nof116` 运行中（2360608/2360611）；Keys=400；2 个 segment；quota generation=1、member_count=2、extent=50GiB、logical_capacity=100GiB |
+| target B（node4） | **已重建**：PID 2391418；NQN `...urma-gpu-test`、SN `URMAGPU0001`；RAID0 UUID `c19b91e1…`；11/11、strip 256KiB、nsid1、4457；0 ERROR |
+| master | NOF-119 A 后 probe master 已停；旧 `vseg_nof116` 因 target B UUID 变已失效；当前无业务 master |
 | node2 | 无 bench/register 残留 |
-| 当前任务 | **NOF-119：单遍 ~20s/60k keys；先验证 512GiB segment + 所选 oplog 配置，再 plain/vseg 单遍读** |
+| 当前任务 | **NOF-120：oplog-on 5k vseg 试水，实测当前环境 oplog 增长，决定 60k 是否可行** |
 
 ---
 
@@ -166,6 +166,21 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 - A 段只做容量/oplog 探针 + 2-key 高 LBA 验证；不写 60k。失败即停。
 - 通过后：plain 60k 单遍（node4，240G），vseg 60k 单遍（node3+node4，每 target 120G，`--num_keys=30000`/segment）；T1、warmup=128、qpairs=4、diag 关；各 1 遍约 20s。
 - 验收 parity（vseg P50 ≤ plain×1.05）；不达则记录，不调 key 数重跑。
+
+### NOF-119 A 段结果（2026-11-26）
+
+- **512GiB segment 注册通过**：两 segment 各 549,755,813,888B，总 1TiB；无需重启 target。
+- **oplog off 时 vseg quota 不发布**：2 分钟 enabled=0；同机 oplog on 对照 40s 发布成功 ⇒ quota 发布依赖 HA/OpLog 提交路径。
+- 手工 quota 回退不可用：planner 工具未构建、HTTP 404。
+- 按判据停手，未写 60k。
+- target B 已重建（PID 2391418、新 UUID `c19b91e1…`、11/11、0 ERROR）；旧 vseg/plain 数据失效，需新 cluster。
+
+### 当前 NOF-120（oplog-on 5k 试水）
+
+- 新 vseg master `vseg_nof120`：正常 HA + **oplog on**、512GiB segments、member_count=2/extent=50G/stripe=2M。
+- 写 **5,000 keys**（20GiB），实测当前环境 etcd dbSize / data-dir / `/oplog/vseg_nof120/` 增长。
+- 判决：外推 60k oplog + 当前 dbSize <4GiB 且 etcd 盘剩余 >50% ⇒ “oplog on 可支撑 60k”；否则停手，建议编译 quota planner 走 oplog off 或缩小规模。
+- 只写 5k；不写 60k；不重启 target。
 
 ---
 

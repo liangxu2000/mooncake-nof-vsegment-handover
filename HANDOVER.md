@@ -99,7 +99,7 @@
 
 - **构建硬规范（NOF-096 定案）**：客户端重链必须使用 `$D/build/spdk-e12b7cb-src/build/lib` 的 **e12b7cb / wire v4** 静态 SPDK 库（真实命令 `/tmp/nof051/link.sh`），**禁止使用 `/usr/local/lib/libspdk_*.a`**（2026-11-20 已被整体替换，会导致 attach `rc=-19`）。每次构建记录库路径/md5、链接命令与产物 md5；`ldd` 不能证明静态库一致。
 
-- 当前任务：**NOF-119（单遍 ~20s 大数据集：60k keys/240GiB；先验证 NoF segment 容量可扩到 512GiB，再 plain/vseg 单遍读；2026-11-26）**。用户要求：**400 keys 太少，要很多 keys，最好一遍连续读 20s**。按当前 plain Avg 338.5µs、vseg Avg 371–400µs，20s 需 **~50–60k keys**；取 **60k keys = 240GiB**。**容量硬墙（当前环境事实）**：每 target NoF segment 现在注册为 **100GiB**，60k 需 plain 单 target 240G / vseg 每 target 120G ⇒ 先验证能否把 segment 注册容量扩到 **512GiB**（target bdev 77TB；若不行试 256G，仍不行停手回报）。**oplog 选择**：本单**主动选择** `enable_ha=true + enable_oplog=false`，目的只是不把 HA 日志变成 60k 大测试的变量；**不是断言当前环境 60k 会爆**（旧 node1/3 的 942MB 不外推）。A 段实测该配置能发布 quota；失败则回退手工 quota 或另议，不擅自开 oplog 写 60k。NOF-118（400-key 剩余 25µs 诊断）**暂缓**，先纠正 key 规模。**第四阶段文档：`第四阶段_node234/README.md`。**
+- 当前任务：**NOF-120（oplog-on 5k vseg 试水：当前环境实测 oplog 增长，不写 60k；2026-11-26）**。NOF-119 A 段完成：**512GiB 注册通过**（两 segment 各 549,755,813,888B，总 1TiB，无需重启 target）；**oplog off 时 vseg quota 不发布**（2 分钟内 enabled=0；同机 oplog on 对照 40s 发布成功）⇒ 按 A 段判据停手，未写 60k。手工 quota 回退不可用（planner 工具未构建、HTTP 404；构建工具另议）。**开发侧决策 (a)：先用正常配置（HA+oplog on）写 5k keys 试水，实测当前环境的 oplog 增长，再决定是否写 60k；不再用 node1/3 旧数据外推。** 环境：target B 已重建（PID 2391418、新 UUID `c19b91e1…`、11/11、0 ERROR）；node4 etcd 2389250；node3 target A 3329243 未动；旧 vseg/plain 数据因 UUID 变已失效，需新 cluster。NOF-118（400-key 剩余 25µs 诊断）**暂缓**。**第四阶段文档：`第四阶段_node234/README.md`。**
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -8552,3 +8552,77 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 单遍读 60k，不再加第 2 遍（用户要单遍 20s）；若时长明显 <15s 或 >30s，记录实际值，不调整 key 数重跑。
 - 日志与 target W9 窗口要覆盖整遍；n 很大（~1.9M/臂），注意磁盘。
 - 预计：A 15 分钟；plain 写+读 ~2 分钟；vseg 写+读 ~3–5 分钟；总计 **25–35 分钟**。
+
+---
+
+## NOF-119 A 段裁决（2026-11-26 · 回执已收，停手）
+
+### 1. 结果（[事实]，当前环境）
+
+| 前提 | 结果 | 证据 |
+|---|---|---|
+| NoF segment 容量扩到 512GiB | **通过** | 两个 segment 各 `549755813888` B（512GiB），总 1TiB；只需注册时传 size，**未重启 target** |
+| oplog off 发布 vseg quota | **不通过** | 2 分钟内 `enabled=0`、logical_capacity=0；日志 `no eligible psegment pool yet` → 每 10s 重试仍不发布 |
+| 同机 oplog on 对照 | **通过** | 40s 发布 generation=1、partitions=1、discovered_segments=2、logical_capacity=100GiB |
+| 手工 quota 回退 | **不可用** | planner 工具未构建；`POST /vsegment_quota` 等全部 404；构建需另议 |
+| target B 重建 | 完成 | PID 2391418、4457、11/11 online、strip256K、0 ERROR、新 UUID `c19b91e1…`；NQN/SN 还原 |
+
+- 结论：**quota 发布依赖 HA 的 OpLog 提交路径**（[推算]：两轮唯一变量是 `enable_oplog`；日志无显式 override 报错）。oplog off 这条路在现有构建下走不通。
+- 未写 60k；仅两次注册 + 一次失败探针；etcd-data 128M。
+- 环境：node4 etcd 2389250、target B 2391418；node3 target A 3329243 未动；node2 无残留。旧 vseg/plain 数据因 UUID 变已失效，需新 cluster。
+
+### 2. 开发侧决策
+
+用户未在三选一中拍板，授权开发侧决定；**选 (a)**：
+
+- 用正常配置（HA + oplog on）写 5k keys 试水，实测当前环境的 oplog 增长，再决定是否写 60k；
+- 不选 (b)：planner 工具未构建、HTTP 无路由，为它先编译不划算；只有在 5k 实测证明 oplog 不可接受时才走 (b)。
+- 不选 (c)：违背用户“大 keys、单遍 20s”的目标。
+- 不再用 node1/node3 旧数据外推；5k 的实测值决定下一步。
+
+---
+
+# NOF-120（待执行 · oplog-on 5k vseg 试水 · 不写 60k · 2026-11-26）
+
+## 目标
+
+- 用**正常 HA + oplog on** 起 vseg master（512GiB segments），写 **5,000 keys**（20GiB），实测当前环境的：
+  - etcd dbSize / data-dir 增长；
+  - `/oplog/vseg_nof120/` 的 key 数/字节增长；
+  - 写时长、`VSEGMENT_CREATING` 次数。
+- 用 5k 的**实测**增长判断 60k 是否可行；**本单不写 60k**。
+
+## A. 起 master / 注册 / quota
+
+1. target B（node4，PID 2391418，新 UUID）与 target A（node3，3329243）运行；不重启。
+2. 起 vseg master **`vseg_nof120`**（node4，50056/9006/8086、slot=1、etcd 127.0.0.1:2379、URMA、**enable_ha=true、enable_oplog=true**、`member_count=2 / extent=50GiB / stripe=2MiB / required_medium=nof / reserved_ratio=0 / io_alignment=4096 / submaster_count=1`）。
+3. 注册 node4 B → node3 A，容量 **512GiB**；确认 segment=2、quota generation=1、partitions=1、logical_capacity=100GiB、reconcile_fail=0。
+4. 记录 etcd 路径（从 etcd 进程 cmdline）、data-dir 大小、`etcdctl endpoint status --write-out=json` 的 dbSize。
+
+## B. 5k 写入与 oplog 测量
+
+1. 写前记录：
+   - etcd dbSize、data-dir `du -sb`；
+   - `/oplog/vseg_nof120/` 的 key 数/字节（`etcdctl get --prefix ... -w json` 或 count）。
+2. Writer：`--num_keys=2500`（每 segment 2500，总 **5,000 keys**）、T1/batch1、4MiB；`VSEGMENT_CREATING` 最多重试 3 轮；记录写时长与重试次数。
+3. 验收：`Keys=5000`、`logical_used=20,971,520,000`（5000×4MiB）；target A/B 写窗口各≈80,000（5000×16）。
+4. 写后同一口径记录 etcd dbSize、data-dir、`/oplog/vseg_nof120/` 增长；计算：
+   - 每 key oplog 增量；
+   - 线性外推 60k 的总 oplog；
+   - etcd 所在文件系统剩余空间。
+
+## C. 判决（必答）
+
+- 若 `外推 60k oplog + 当前 dbSize < 4GiB` **且** etcd 文件系统剩余 >50%：
+  - 判 **“oplog on 可支撑 60k”**，给出 5k 实测值/每 key 增量/外推值；**本单不写 60k**，下一单执行。
+- 否则：
+  - 判 **“oplog on 不适合 60k”**，给出实测值；建议 (b) 编译 `vsegment_quota_planner` 工具（不改 vseg 逻辑）走 oplog off，或 (c) 缩小规模/多遍；本单停手。
+- 不做旧数据外推；只报当前环境实测。
+
+## D. 边界
+
+- **只写 5,000 keys**（20GiB）；不写 60k；不跑性能。
+- 不重启 target；不改码/不重编/不装包；master 可重启，注册不持久需重注册。
+- 数据会覆盖旧目标区域；目标 B UUID 已变，旧数据本来已失效。
+- 若 quota/写入失败或 etcd 明显异常，立即停止并记录。
+- 预计 **10–15 分钟**。
