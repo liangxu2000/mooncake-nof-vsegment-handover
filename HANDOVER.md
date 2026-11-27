@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**无在途任务（NOF-142 完成；EID 高并发线收口；2026-11-27）**。NOF-142：vsegment 60k（m=2/stripe=2MiB/extent=256GiB）高并发 16t/batch16，只改 bench 客户端 `SPDK_URMA_EID_INDEX=0/1`，E0/E1 平衡 4 组（前 8 遍统计）——**E0 45,488.34 vs E1 91,481.57 MiB/s = 2.011（+101.11%）**；两方向 **+113.63% / +89.40%**，**4/4 块 E1 更快**；E0 seq=5 离群（38,702.82），**剔除后 E1/E0 = 1.916（+91.58%）**，结论不变；spread 19.93%/24.82% >10% ⇒ 不进正式表，按配对 A/B 判据成立。**EID1 高并发带宽收益：plain +48.31%、vsegment +101.11%（保守 +91.58%）；T1 单 key 无稳固收益；正式结果仍 NOF-127（P50 1.034×）**。裁定：**不复测离群、不升 32t、保留 vsegment master `vseg_nof142v` 2707317/2707320（Keys=60000）**；target B 2692715 / target A 3329243 / etcd 2690803 未重启。其他：NOF-141 plain EID1 +48.31%；NOF-140 T1 无稳固差别。
+- 当前任务：**NOF-143（T1 单并发 EID1：vsegment 与 plain 绝对值 · 2026-11-27）**。背景：NOF-142 证明高并发 EID1 收益（plain +48.31%、vsegment +101.11%），但 T1 单并发只在 plain 测过（NOF-140 3+3，无稳固差别），**vsegment 的 T1+E1 没有数**；用户要两者的单并发绝对值。做法：先在当前 `vseg_nof142v`（Keys=60000）上做 T1 E0/E1 平衡 3+3（E0→E1 / E1→E0 / E0→E1），再停 vseg master、起 `plain_nof135p`（Keys=60000）做同样 3+3，最后恢复 vseg master；**只改 bench env `SPDK_URMA_EID_INDEX=0/1`**；T1/batch1、60k、warmup=128、q4、verify=false、diag 关、每遍一遍≈20s；记 Avg/P50/P90/P99、failed、target W9、进程 environ；按 2026-11-12 聚合；**不报吞吐、不逐遍**；EID1 失败即停、不重启 target；不写数据/不改码；预计 10–15 分钟。其他：NOF-142 完成（vseg +101.11%/保守 +91.58%）；NOF-141 plain +48.31%；正式结果仍 NOF-127（P50 1.034×）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -10344,3 +10344,42 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - `logical_used=0` 是指标刷新被抑制（REFRESH_INTERVAL=1000000，同 NOF-134），数据以读取为准：16/16 遍 60k、failed=0。
 - 实际跑了 16 遍，按指令取前 4 组 8 遍；前 8 遍 E1 均值低于后 8 遍 ⇒ 取值保守，无择优。
 - E0 离群遍未复测；结论用保守值 +91.58%。
+
+---
+
+# NOF-143（待执行 · T1 单并发 EID1：vsegment 与 plain 绝对值 · 2026-11-27）
+
+## 背景
+
+- NOF-142 已证明高并发下 EID1 有显著带宽收益（plain +48.31%、vsegment +101.11%）；但 **T1 单并发下 vsegment + EID1 没有数**。
+- NOF-140 只在 plain 上做过 T1 3+3（E1 总后跑，判为无稳固差别）。
+- 本单只回答：**T1 单并发、EID1 时，vsegment 和 plain 各自的端到端时延绝对值是多少**；不做拆解（拆解另单）。
+
+## A. 预检与环境
+
+1. 当前：`vseg_nof142v` master 2707317/2707320（Keys=60000、enabled=1）、target B 2692715、target A 3329243、etcd 2690803；target/etcd 不动。
+2. 确认 vsegment 60k 可读（`segment_read --num_keys=30000`/segment）；`urma_admin show -d udmac0d1e2` EID 0–7 ACTIVE；`MC_EID_INDEX` unset。
+3. plain 数据：`plain_nof135p`（Keys=60000，master 2693369/2693372 可能已停）；测 plain 前停 vseg master、用原 cluster_id 起 plain master，等 Keys=60000；**只切 master，不重启 target/etcd、不写数据**。
+4. 若 plain master 起不来/Keys≠60000 ⇒ 停手回报，不补写、不重建。
+
+## B. T1 A/B（vsegment 先、plain 后）
+
+1. 每数据集：T1（`--num_threads=1 --batch_size=1`）、warmup=128、qpairs=4、verify=false、diag 关、sequential；每遍一遍 60k（≈20s），**禁止 `--duration`**。
+2. 只改 bench 客户端 env `SPDK_URMA_EID_INDEX=0/1`；target 保持 EID0。
+3. 平衡顺序：**E0→E1 / E1→E0 / E0→E1**（每臂 3 遍，共 6 遍/数据集）；vsegment 用 `--num_keys=30000`/segment，plain 用 `--num_keys=60000`。
+4. 每遍记录：**Avg/P50/P90/P99/P999/Max、failed、墙钟、target A/B W9avg/n**；另存 `/proc/<pid>/environ` 的 `SPDK_URMA_EID_INDEX`（env 自证）。
+5. EID1 初始化/读失败/rc≠0 ⇒ 停手，恢复 E0，不重启 target。
+
+## C. 聚合与交付
+
+- 按 `D:\gds性能\测试结果聚合方法_20261112.md`：Avg=各遍均值；P50/P90/P99=各遍同分位中位；spread=(max−min)/mean。
+- 分别给 **vsegment 的 E0/E1** 与 **plain 的 E0/E1** 两行表（Avg/P50/P90/P99 + spread + failed），再给各自 E1/E0；**E1 的绝对值是主交付**。
+- 这是 T1 EID 诊断，**不进正式表**；正式结果仍 NOF-127。正文不报吞吐、不逐遍罗列（原始值落 `run/nof143_rounds.csv`）。
+- 最后恢复 vsegment master `vseg_nof142v`（若恢复失败，记录实际末态并回报）。
+- 预计 **10–15 分钟**（两数据集各 6 遍 + 两次 master 切换）。
+
+## D. 边界
+
+- 不改码/不重编/不装包；**不重启 target/etcd**；不写数据（含不补写、不重建）。
+- 只允许 master 切换；若 plain 数据不可用，停手，不写/不重建。
+- 环境末态：优先恢复 vseg_nof142v（Keys=60000）；记录 master/target/etcd 状态。
