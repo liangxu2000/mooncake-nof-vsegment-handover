@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-145（vsegment T1 E1-only 打点拆解 · 重建 60k · 2026-11-27）**。背景：NOF-144 的拆解是 **plain**（query 83µs / 数据面 176µs / total 258µs；设备 IO 105–106µs ≈100µs 模型；额外 ~42µs 提交/派发 + 9µs 未归因），**plain 只是参照，最终优化对象是 vsegment**。当前 `vseg_nof142v` master 重启恢复失败（payload too large ~22.1MiB → partition degraded、数据不可读），本单**新建 vsegment 集群并重写 60k**，再做 diag-on T1 E1 3 遍拆解；不修复恢复 bug（另单）。做法：停 plain master（2771100/2771103，保留数据），新集群 `vseg_nof145v`（m=2/stripe=2MiB/extent=256GiB），注册 B→A、等 enabled=1，写 60k（要求 60,000/0、Keys=60000）；diag-on（`MC_STORE_TRANSFER_DIAG=1`、`MC_NOF_SLOW_TRACE_THRESHOLD_US=1`）、T1/batch1、`--num_keys=30000`/segment、warmup128、q4、verify=false、sequential；**只跑 E1 3 遍**，提取 query/prepare/submit/completion_wait/read_us/total、drain/max_subio/submit_span/dispatch_queue、target A/B W9，并与 plain NOF-144 对照；不改码/不重启 target/etcd；数据不可写/键数不对即停手；预计 15–20 分钟。其他：NOF-142 vsegment 高并发 EID1 +101.11%；NOF-143 T1 E1 vseg 230.31/plain 232.93µs；正式结果仍 NOF-127（P50 1.034×）。
+- 当前任务：**NOF-146（etcd NOSPACE 修复 + 续跑 NOF-145 · 2026-11-27）**。背景：NOF-145 建 `vseg_nof145v`、注册双 target、写 60k 到 **13,432 后 etcd NOSPACE**（dbSize 2.1GB / 默认 2GiB quota；历史多集群 oplog 2.25M+ 键），未进入 diag。**用户已授权：先 compact+defrag；若仍不够，提 `--quota-backend-bytes=8GiB`（需重启 etcd）；不删任何键。** NOF-146 步骤：① compact 到当前 revision + defrag，检查 dbSize/alarm；② 若仍不足，同一 data-dir + `--max-request-bytes=67108864 --quota-backend-bytes=8589934592` 重启 etcd，等 healthy、alarm 清除；失败即停手，不删键；③ 续写 60k：先查 `segment_write --help` 是否有 start_key/offset，有则从 13,432 续写剩余 46,568；没有则保留旧 partial 集群，新建 `vseg_nof145v2` 重写 60k（要求 60,000/0、Keys=60000）；④ 对写满的 vsegment 做 diag-on T1 E1 3 遍拆解（`MC_STORE_TRANSFER_DIAG=1`、`MC_NOF_SLOW_TRACE_THRESHOLD_US=1`、`--num_keys=30000`/segment、warmup128、q4、verify=false、sequential），提取 query/prepare/submit/completion_wait/read_us/total、drain/max_subio/submit_span/dispatch_queue、target A/B W9，与 plain NOF-144 对照；只跑 E1。边界：不改码/不重编；不重启 target；etcd 仅在 quota fallback 时重启；不删键；plain 数据保留；预计 15–25 分钟。其他：正式结果仍 NOF-127（P50 1.034×）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -10559,3 +10559,51 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 允许新建 vsegment 集群并写 60k（本单必要）；**不重启 target/etcd**；不改码/不重编。
 - 环境末态：优先保持 `vseg_nof145v` master 运行（Keys=60000）；记录 plain/vseg master、target/etcd 状态；node2 无 bench 残留。
 - 预计 **15–20 分钟**（重建 3–5 分钟 + 3 遍 diag + 聚合）。
+
+---
+
+# NOF-145 阻断（2026-11-27 · etcd NOSPACE）
+
+- 开跑前环境已死：etcd 2379 未监听、target B 4457 未监听、11 盘 vfio 悬空；plain master 2771100/2771103 仍在但报 `context deadline exceeded`（E=1929）。
+- 恢复：停 plain master → 11 盘 takeover -r -y（11/11 → nvme）→ 起 etcd（同 data-dir + 64MiB，PID 2822942）→ 起 target B（2824683，新 UUID `8bb484fa-bcc6-4475-aee3-387d3f8b466c`，RAID0 online 11/11、strip256K、ERROR=0）→ 建 `vseg_nof145v`（2825213/2825216，m=2/stripe=2MiB/extent=256GiB）、注册 B→A、enabled=1、segment=2。
+- 写 60k：**13,432 succeeded / 46,568 failed**，Keys 冻结 13432；etcd 报 `mvcc: database space exceeded` ×82,979、`alarm:NOSPACE`；dbSize **2.1GB**，默认 quota **2GiB**；WAL 367M + snap 2.1G = 2.4G；/home 1.1T 可用 ⇒ 磁盘不是瓶颈。
+- 原因：历史多集群 oplog 累积（vseg_nof142v 119,520 键、plain_nof135p 60,398、vseg_nof145v 26,638；总 2.25M+ 键）。
+- 按任务书 A.3 停手；**未 compact/defrag/删键/重启 etcd**，未进入 diag。
+- 末态：etcd 2822938/2822942 运行但 alarm:NOSPACE；target B 2824683、target A 3329243；`vseg_nof145v` master 2825213/2825216（Keys=13432、enabled=1、segment=2）；11 盘 vfio；plain_nof135p 数据保留未动；node2 无 bench 残留。
+
+---
+
+# NOF-146（待执行 · etcd NOSPACE 修复 + 续跑 NOF-145 · 2026-11-27）
+
+## 授权与原则
+
+- 用户已授权：**先 compact + defrag；若仍不够，提 `--quota-backend-bytes=8GiB`（需重启 etcd）；不删任何键。**
+- 不换 data-dir、不删业务键/历史集群键、不重启 target；失败即停手回报。
+
+## A. etcd 修复
+
+1. 记录当前 `endpoint status`（dbSize、revision、alarm）；`etcdctl compact` 到当前 revision，再 `etcdctl defrag`；复查 dbSize/alarm。
+2. 若 dbSize 降到 quota 以下且 `alarm:NOSPACE` 清除 ⇒ 进入 B。
+3. 若仍不足/仍 NOSPACE ⇒ 停 etcd，用同一 data-dir + `--max-request-bytes=67108864 --quota-backend-bytes=8589934592` 重启；等 healthy、alarm 清除。若重启失败 ⇒ 停手，不删键。
+4. 记录 compact/defrag/重启前后 dbSize、revision、alarm。
+
+## B. 续写 60k
+
+1. 先查 `segment_write --help` 是否有 start_key/offset：
+   - 有 ⇒ 对 `vseg_nof145v` 从 13,432 续写剩余 46,568，写满 60k；
+   - 没有 ⇒ **保留旧 partial 集群**，新建 `vseg_nof145v2`（m=2/stripe=2MiB/extent=256GiB），注册 B→A、enabled=1，重写 60k。
+2. 要求 **60,000 succeeded / 0 failed、Keys=60000**；若仍失败 ⇒ 停手回报（附 etcd dbSize/alarm、失败点）。
+3. 允许停旧 vseg master、起新 vseg master；**不重启 target/etcd（除 A.3 的 quota fallback）**。
+
+## C. diag E1 拆解（只跑 E1）
+
+1. 对写满的 vsegment 60k：diag-on（`MC_STORE_TRANSFER_DIAG=1`、`MC_NOF_SLOW_TRACE_THRESHOLD_US=1`）、T1/batch1、`--num_keys=30000`/segment、warmup=128、qpairs=4、verify=false、sequential；**只跑 E1 3 遍**；env 自证 `SPDK_URMA_EID_INDEX=1`。
+2. 提取 `get_into_breakdown` / `nof_slow_task` / target A/B W9 中位：query、nof_prepare、nof_submit、completion_wait、read_unattributed、read_us、total；drain、max_subio、submit_span、dispatch_queue；两 target W9avg/n。
+3. 与 **plain NOF-144** 对照（query 83、data 176、total 258 diag-on、device IO 105–106、submit/dispatch ~42）；明确 vsegment 的可优化段。
+4. diag-on 绝对值会膨胀；只看结构/占比与同轮相对值，不进正式表；若字段不足停手回报。
+
+## D. 边界
+
+- 不改码/不重编/不装包；**不重启 target**；etcd 仅在 quota fallback 时重启；不删键。
+- 允许停/起 master；plain 数据保留；环境末态优先保持 `vseg_nof145v`/`vseg_nof145v2` master（Keys=60000）。
+- 预计 **15–25 分钟**（etcd 修复 3–8 分钟 + 续写 2–3 分钟 + 3 遍 diag + 聚合）。
