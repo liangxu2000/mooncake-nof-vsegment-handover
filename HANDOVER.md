@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**无在途任务（NOF-144 完成；E1-only 拆解收口；2026-11-27）**。NOF-144（plain T1 E1-only，diag-on 3 遍）：**query 83µs（32%）、数据面 176µs（68%）、total 258µs**；数据面内设备 IO **105–106µs**（≈100µs 模型），额外 **~42µs 提交/派发 + 9µs 未归因**；query 比 100µs 模型低 17%，数据面高 76%。diag-on 绝对值比 diag-off 膨胀 ~14%（265.72 vs 232.93）⇒ 只看结构/占比，不当正式时延。**模型“200µs 量级”成立，但比例相反：瓶颈在数据面而非 query；字段无缺口，无需新打点**。裁定：**不立新单**；vsegment 拆解待重建/恢复后另议；提交/派发 ~42µs 列为后续优化候选（需改码/新阶段）；不调低 trace 阈值（本单已结束）。环境：`plain_nof135p` 2771100/2771103 运行（Keys=60000）；degraded vseg master 已停；target/etcd 未重启。正式结果仍 NOF-127（P50 1.034×）。
+- 当前任务：**NOF-145（vsegment T1 E1-only 打点拆解 · 重建 60k · 2026-11-27）**。背景：NOF-144 的拆解是 **plain**（query 83µs / 数据面 176µs / total 258µs；设备 IO 105–106µs ≈100µs 模型；额外 ~42µs 提交/派发 + 9µs 未归因），**plain 只是参照，最终优化对象是 vsegment**。当前 `vseg_nof142v` master 重启恢复失败（payload too large ~22.1MiB → partition degraded、数据不可读），本单**新建 vsegment 集群并重写 60k**，再做 diag-on T1 E1 3 遍拆解；不修复恢复 bug（另单）。做法：停 plain master（2771100/2771103，保留数据），新集群 `vseg_nof145v`（m=2/stripe=2MiB/extent=256GiB），注册 B→A、等 enabled=1，写 60k（要求 60,000/0、Keys=60000）；diag-on（`MC_STORE_TRANSFER_DIAG=1`、`MC_NOF_SLOW_TRACE_THRESHOLD_US=1`）、T1/batch1、`--num_keys=30000`/segment、warmup128、q4、verify=false、sequential；**只跑 E1 3 遍**，提取 query/prepare/submit/completion_wait/read_us/total、drain/max_subio/submit_span/dispatch_queue、target A/B W9，并与 plain NOF-144 对照；不改码/不重启 target/etcd；数据不可写/键数不对即停手；预计 15–20 分钟。其他：NOF-142 vsegment 高并发 EID1 +101.11%；NOF-143 T1 E1 vseg 230.31/plain 232.93µs；正式结果仍 NOF-127（P50 1.034×）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -10523,4 +10523,39 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 ## 末态与裁定
 
 - 环境：`plain_nof135p` 2771100/2771103 运行（Keys=60000、VSegment enabled=0、segment=1）；target B 2692715 / target A 3329243 / etcd 2690803 未重启；11 盘 vfio；node2 无 bench 残留；未改码/未重编/未写数据。
-- 裁定：**不立新单**；vsegment 同款拆解待重建/恢复后另议；数据面 ~42µs 提交/派发列为后续优化候选；不调低 trace 阈值（本单已结束）。
+- 裁定：**vsegment 同款拆解见 NOF-145**（新建集群重写 60k，不复用 degraded 数据）；数据面 ~42µs 提交/派发列为后续优化候选；不调低 trace 阈值。
+
+---
+
+# NOF-145（待执行 · vsegment T1 E1-only 打点拆解 · 重建 60k · 2026-11-27）
+
+## 目标
+
+- 用户明确：**plain 只是参照，最终优化对象是 vsegment**；本单做 **vsegment 的 E1 分段拆解**。
+- 当前 `vseg_nof142v` master 重启恢复失败（payload too large ~22.1MiB → partition degraded、数据不可读），**不复用旧数据**；本单新建 vsegment 集群并重写 60k，再做拆解。
+- **用户定规：只看 E1，不做 E0。**
+
+## A. 环境重建（必要写入）
+
+1. 停 plain master `plain_nof135p`（2771100/2771103），保留 plain 数据/日志；target B 2692715 / target A 3329243 / etcd 2690803 **不重启**。
+2. 新集群 `vseg_nof145v`：m=2 / stripe=2MiB / extent=256GiB；注册 target B → A，等 `enabled=1`、`vsegments=1`。
+3. 写 60k（T1/batch1，约 152s）；**要求 60,000 succeeded / 0 failed、Keys=60000**；写失败/键数不对 ⇒ 停手，不补写。
+4. 可复用 NOF-142 的脚本/参数；不改码/不重编/不重启 target/etcd。
+
+## B. diag-on T1 E1（只跑 E1）
+
+1. diag-on：`MC_STORE_TRANSFER_DIAG=1`、`MC_NOF_SLOW_TRACE_THRESHOLD_US=1`；T1/batch1、`--num_keys=30000`/segment、warmup=128、qpairs=4、verify=false、sequential；**只跑 E1 3 遍**，每遍一遍 60k；env 自证 `SPDK_URMA_EID_INDEX=1`；target 保持 EID0。
+2. 提取 `get_into_breakdown` / `nof_slow_task` / target A/B W9 中位：**query、nof_prepare、nof_submit、completion_wait、read_unattributed、read_us、total**；**drain、max_subio、submit_span、dispatch_queue**；两 target 的 W9avg/n。
+3. 与 **plain NOF-144** 对照：query 83、data 176、total 258、device IO 105–106、submit/dispatch ~42µs；说明 vsegment 的差异（尤其 completion_wait、两 target W9、child 聚合）。
+
+## C. 判读与交付
+
+- 输出 vsegment 分段表（E1 3 遍中位 + 占比）+ 与 plain 对照；明确 vsegment 的可优化段（query vs 数据面 vs 提交/派发/等待）。
+- diag-on 绝对值会膨胀；只看结构/占比与同轮相对值，不进正式表。
+- 若某段字段不足，停手回报，不擅自改码；新打点另单。
+
+## D. 边界
+
+- 允许新建 vsegment 集群并写 60k（本单必要）；**不重启 target/etcd**；不改码/不重编。
+- 环境末态：优先保持 `vseg_nof145v` master 运行（Keys=60000）；记录 plain/vseg master、target/etcd 状态；node2 无 bench 残留。
+- 预计 **15–20 分钟**（重建 3–5 分钟 + 3 遍 diag + 聚合）。
