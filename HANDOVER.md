@@ -10684,7 +10684,71 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 给 vsegment vs plain 对照表（中位 µs + 占比）；明确最大项和下一步改码候选。
 - 若字段不全/日志采样不足，列缺口，不猜；停手回报。
 
-## D. 边界
+## D. 交付格式（用户明确要求）
+
+### D.1 结构图（先图后表）
+
+输出 **Mermaid + ASCII 两份**，覆盖 key-level 与 task-level；每个点位编号，图上标明加法链与重叠关系。示例骨架（按实际字段补全）：
+
+```mermaid
+flowchart LR
+  K0[Key request] --> K1[K1 query_us]
+  K0 --> K2[K2 read_us]
+  K2 --> K3[K3 prepare + resolve]
+  K3 --> K4[K4 nof_submit]
+  K4 --> K5[K5 completion_wait]
+  K5 --> T1[Child task 1 timeline]
+  K5 --> T2[Child task 2 timeline]
+  K5 --> K6[K6 read_unattributed]
+  T1 --> K7[K7 aggregation / callback]
+  T2 --> K7
+  K7 --> K8[K8 total_us]
+  subgraph Task timeline (per child)
+    Q0[Q0 queued] --> Q1[Q1 dispatch_queue]
+    Q1 --> Q2[Q2 worker_setup + qos_fifo_wait]
+    Q2 --> Q3[Q3 head_to_first_submit]
+    Q3 --> Q4[Q4 submit_span]
+    Q4 --> Q5[Q5 drain]
+    Q5 --> Q6[Q6 observe_delay]
+  end
+```
+
+- 必须标清：`queue_to_first_submit + submit_span + drain ≈ task total`（源码 `transfer_task.h` 注释）；`first_completion/completion_gap/completion_span/observe_delay/max_subio/max_completion_gap/max_poll_return_gap` 是**重叠注解**，不能加总。
+- 图上每个点必须与下面表格的编号一致；vsegment 画 2 个 child task，plain 画 1 个 task（32×128KiB）。
+
+### D.2 大段表（只放可加总的段）
+
+| 段 | 编号 | 字段 | vsegment | plain | 差 | 占 total |
+|---|---|---|---|---|---|---|
+| 元数据 query | K1 | query_us | | | | |
+| 准备/解析 | K3 | nof_prepare_us + vsegment_resolve_us | | | | |
+| 提交 | K4 | nof_submit_us | | | | |
+| 数据面等待 | K5 | completion_wait_us | | | | |
+| 未归因 | K6 | read_unattributed_us | | | | |
+| 数据面小计 | K2 | read_us | | | | |
+| 整 key | K8 | total_us | | | | |
+
+### D.3 全点表（所有点都列，不遗漏）
+
+每行：**编号 / 层（key/task/subIO）/ 字段名 / 定义（一句话）/ vsegment 中位 / plain 中位 / 占对应 total / 是否可加总 / 在结构图的位置**。
+至少覆盖：`query_us`、`nof_prepare_us`、`vsegment_resolve_us`、`nof_submit_us`、`completion_wait_us`、`read_unattributed_us`、`read_us`、`total_us`、`dispatch_queue_us`、`worker_setup_us`、`qos_fifo_wait_us`、`head_to_first_submit_us`、`submit_span_us`、`drain_us`、`first_completion_us`、`completion_submit_gap_us`、`completion_span_us`、`observe_delay_us`、`max_subio_us`、`max_completion_gap_us`、`max_poll_return_gap_us`、`poll_calls`、`sub_io_count`。
+**可加总/重叠必须显式标注**；重叠字段不得进入任何 sum。
+
+### D.4 残差归因表（45–55µs）
+
+| 组成 | 来源字段 | vsegment | plain | 说明 |
+|---|---|---|---|---|
+| 前端 dispatch/worker/QoS | dispatch_queue + worker_setup + qos_fifo_wait | | | |
+| 提交跨度 | submit_span | | | |
+| 完成 gap/span | first_completion / completion_gap / completion_span | | | |
+| 第二 child/聚合 | whole-key completion_wait − 单 child task total | | | |
+| 观察延迟 | observe_delay | | | |
+| 未归因 | 差值 | | | |
+
+- 没有字段的部分写“未测/缺口”，不猜；下一单再决定改码打点。
+- 结论必须回答：**45–55µs 里最大项是什么、是否在客户端、下一步改哪一段**。
+
+## E. 边界
 
 - 只读日志；不改码/不重编/不跑 bench/不重启/不写。
 - 预计 **5–10 分钟**。
