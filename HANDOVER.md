@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**无在途任务（NOF-146 完成；vsegment E1 拆解收口；2026-11-27）**。NOF-146：compact+defrag 修复 etcd NOSPACE（dbSize 2.1→1.95GiB、alarm 清除；未提 quota、未删键），新建 `vseg_nof145v2` 写 60k（60,000/0）；diag-on T1 E1 稳定组 p1/p2/p4：**vsegment total 261µs（query 89 / 数据面 169）、plain 258（query 83 / 数据面 176）**；总差 +3µs（在 spread 内），vsegment 仅多 `vsegment_resolve` 2µs；`drain/max_subio`（客户端 child task 尾部/最慢子IO）104 vs 105–106，target W9 44–45µs 才是设备执行；**分段结构几乎重合，vsegment 不多付数据面成本**。共同瓶颈：completion_wait 150/160 与 drain 104/105 的差 **~45–55µs 是残差**（含 submit_span+dispatch 15/37、第二 child、回调/聚合），不是单一字段；精确拆分需代码打点。p3 客户端侧离群（P50 381，target W9 正常）已剔除。**裁定：p3 不单独立项、采样不全不追、etcd 余量 99MB 下次写前先 compact/defrag（不够再提 quota 8GiB）、提交/派发/等待列为后续优化目标但需改码/新阶段**。环境：`vseg_nof145v2` 2828887/2828890（Keys=60000）；etcd 2822942（dbSize 1.91GiB、alarm 空）；target B 2824683/A 3329243；plain 数据保留。正式结果仍 NOF-127（P50 1.034×）。
+- 当前任务：**NOF-147（零改码：重解析 NOF-144/146 日志的完整 timing 字段 · 2026-11-27）**。背景：NOF-144 plain / NOF-146 vsegment 的 `completion_wait − drain` 差 **~45–55µs 是残差**；可测 `submit_span + dispatch` 仅 **15/37µs**；需要把剩余拆成 queue/worker/QoS、submit、completion gap、poll gap、observe delay、第二 child/聚合，再决定改码优化点。做法：**只读现有 NOF-144/146 日志**（vsegment p1/p2/p4、plain 3 遍），用 Python 提取 `nof_slow_task` 全字段（total / dispatch_queue / worker_setup / qos_fifo_wait / head_to_submit / submit_span / drain / first_completion / completion_submit_gap / completion_span / observe_delay / max_subio / max_completion_gap / max_poll_return_gap / poll_calls 等）与 `get_into_breakdown`（query/read/completion_wait/total）；按 task/key 计算残差归因，给 vsegment vs plain 对照表；**不改码/不跑 bench/不重启/不写**；字段不够则列缺口、停手回报，再议改码打点。预计 5–10 分钟。其他：NOF-146 完成（vseg total 261 vs plain 258，结构几乎重合；target W9 44–45µs 是设备执行）；正式结果仍 NOF-127（P50 1.034×）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -10652,3 +10652,39 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 环境：`vseg_nof145v2` master 2828887/2828890（Keys=60000、enabled=1、segment=2、E=1 FATAL=0）；etcd 2822942（dbSize 2.0GB、alarm 空）；target B 2824683（UUID 8bb484fa…、RAID0 online 11/11、ERROR=0）、target A 3329243；11 盘 vfio；node2 无 bench 残留；未删键；plain 数据保留。
 - **裁定：① p3 不单独立项；② get_into_breakdown 采样不全不追（nof_slow_task 全量、样本 ≥2.2 万）；③ etcd 余量仅 99MB，下次新建 60k 集群前先 compact/defrag，不够再按已授权提 quota 8GiB；④ 提交/派发/等待 ~45–55µs 列为下一步优化目标，但需改码/新阶段，当前不做。**
 - 正式结果仍 NOF-127（P50 1.034×）。
+
+---
+
+# NOF-147（待执行 · 零改码：重解析 NOF-144/146 完整 timing 字段 · 2026-11-27）
+
+## 目标
+
+- 拆开 `completion_wait − drain` 的 **~45–55µs 残差**，回答：多少是 queue/worker/QoS、submit、completion gap、poll gap、observe delay、第二 child/聚合；为后续改码优化定点。
+- **只读现有日志；不跑 bench、不改码、不重启、不写。**
+
+## A. 数据源
+
+- NOF-144 plain：`run/nof144*`、node2 3 份 diag 日志（`get_into_breakdown` + `nof_slow_task`）。
+- NOF-146 vsegment：`run/nof146*`、node2 5 份 diag 日志（稳定组 p1/p2/p4；p3 离群可单列）。
+- 先清点文件大小/行数/字段；若日志已被清理，停手回报清单，不重跑。
+
+## B. 字段提取（每 task / 每 key）
+
+- `nof_slow_task`：`total_us`、`dispatch_queue_us`、`worker_setup_us`、`qos_fifo_wait_us`、`qos_fifo_full/partial/zero_wait_us`、`head_to_submit_us`、`first_credit_wait_us`、`submit_credit_wait_us`、`submit_span_us`、`drain_us`、`first_completion_us`、`completion_submit_gap_us`、`completion_span_us`、`observe_delay_us`、`max_subio_us`、`max_subio_idx/cid`、`max_completion_gap_us`、`max_poll_return_gap_us`、`poll_calls`、`sub_io_count`、`qpair_id`、`lane`、`worker_idx`。
+- `get_into_breakdown`：`query_us`、`read_us`、`nof_prepare_us`、`nof_submit_us`、`completion_wait_us`、`read_unattributed_us`、`total_us`；`vsegment_resolve_us`。
+- 按 task 取中位；按 key 聚合（vsegment 2 child tasks/key；plain 1 task/key）。
+
+## C. 残差归因
+
+- 计算 `completion_wait − drain`（vseg 150−104、plain 160−105）的组成：
+  - **前端**：`queue_to_first_submit`（dispatch + worker_setup + qos_fifo_wait + head_to_submit）、`submit_span`；
+  - **完成**：`first_completion_us`、`completion_submit_gap`、`completion_span`、`max_completion_gap`、`max_poll_return_gap`、`observe_delay`；
+  - **第二 child/聚合**：whole-key `completion_wait` vs 单 child task `total_us`（vseg）；
+  - **未归因残差**。
+- 给 vsegment vs plain 对照表（中位 µs + 占比）；明确最大项和下一步改码候选。
+- 若字段不全/日志采样不足，列缺口，不猜；停手回报。
+
+## D. 边界
+
+- 只读日志；不改码/不重编/不跑 bench/不重启/不写。
+- 预计 **5–10 分钟**。
