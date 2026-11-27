@@ -10149,12 +10149,12 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 
 ---
 
-# NOF-140 完成（2026-11-26 · SPDK_URMA_EID_INDEX 0 vs 1 · 正式 T1 · **无稳定差别，维度关闭**）
+# NOF-140 完成（2026-11-26 · SPDK_URMA_EID_INDEX 0 vs 1 · **plain-only** · 正式 T1 · **无稳定差别，维度关闭**）
 
 ## 条件
 
 - 环境：`plain_nof135p` 2509048/2509051（Keys=60000）、target B 2458315、target A 3329243、etcd 2455814；全程未动。
-- 数据：现成 plain 60k；`MC_EID_INDEX` 两机均 unset（与 NOF-138 隔离）。
+- 数据：现成 **plain** 60k（单 target B；**不是 vsegment**）；`MC_EID_INDEX` 两机均 unset（与 NOF-138 隔离）。
 - 每遍：`SPDK_URMA_EID_INDEX=0/1` 只加在 bench 客户端进程；`segment_read --num_keys=60000 --num_threads=1 --batch_size=1`、warmup=128、q4、verify=false、diag 关、sequential；每遍一遍 60k（16–19s）。
 - 顺序：E0→E1→E0→E1→E0→E1（各 3 遍）；六遍 `/proc/<pid>/environ` 均自证到对应 `SPDK_URMA_EID_INDEX`。
 - 预检：target B `/proc/2458315/environ` 无该变量 ⇒ target 默认 EID0；`urma_admin show -d udmac0d1e2` 的 EID 0–7 全 ACTIVE；实际 SPDK 树无 `lib/` 源码，但二进制三处均含该 env 字符串。
