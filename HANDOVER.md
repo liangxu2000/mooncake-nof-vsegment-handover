@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-150（第一刀：vsegment 两半并行观察 · 清场 + clean 基线 + A/B · 2026-11-27）**。背景：NOF-149 3 遍完整；**用户裁定：不存在快慢基线，p3 快值（cw 167）是异常数据/测试窗口问题，按异常剔除；基线用 p1/p2（cw 245/249、drain 175/178、残差 71/72）**。结构稳：B 35.2/35.4/33.7（4.9%）、设备 first_completion 42/43、query 93.7、submit 5、resolve 3；device W9 38.7–39.4、两 target 同步。**用户明确 node2/3/4 独占，谁影响都能 kill** ⇒ 本单先清掉 node2 外部 ql_master（1049544/1049540）及 node3/4 非我方进程，记录 PID/命令；然后在 clean window 用旧二进制跑 2 遍基线（异常则补 1 遍，最多 3 遍），再改 `VSegmentOperationState::wait_for_completion`（`transfer_task.cpp:2455-2461`：先轮询全部 child `isReady`，再逐个 `get()`），硬规范重编 bench，E1 T1 60k diag-on 3 遍；同 clean window 对比 C observe/serial_gap/cw/残差；不改 submit/plain/target/master；构建/连接失败回退；预计 30–40 分钟。其他：NOF-148 的 16µs 在慢基线为 28/30，p3 快异常 25，按异常剔除；跨异常不比较。
+- 当前任务：**NOF-151（回退第一刀 + 只读排查 diag 行不全 vs P50 · 2026-11-27）**。背景：NOF-150 第一刀**无收益且破坏打点语义**——清场后旧二进制完整遍基线 P50 **374.27 / 376.80 / 380.05（spread 1.5%）**；新二进制 ABBA 平衡块 **379.66 vs 366.29（新慢 3.6%）**，正向配对 3/3 偏新、反向 2/2 偏旧，**5/5 对“后跑更快”⇒ 顺序效应**；新补丁把 `get_begin` 移到全部 ready 之后，①变负、get_block=0、④失效。**裁定：回退新二进制/源码到旧（bb4a07a3）**；第一刀方向暂停。另发现 **diag 行不全的遍 P50 更低（270–321）vs 完整遍 374–388**，影响所有 diag-on 数据可比性；先只读排查行数不全原因（采样/日志截断/退出 flush/磁盘），再决定基线。未来 A/B 强制 **ABBA + 每臂 ≥2 遍完整行**。不改 target/etcd、不写；预计 10–15 分钟。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -11015,3 +11015,74 @@ P1 --①1.8--> P2 --②139.9 [drain 121.0]--> P3 --③11.0--> P4 --④5.3--> P5(
 - 只改这一处 vsegment 客户端编排；不改 submit/plain/target/master。
 - 构建/连接失败回退；环境末态保持 `vseg_nof145v2`。
 - 预计 **30–40 分钟**（清场 + clean 基线 + 构建 + 3 遍）。
+
+---
+
+# NOF-150 完成（2026-11-27 · 第一刀 · **无收益 + 打点语义被破坏；已决定回退**）
+
+## 清场与 clean 基线
+
+- 用户授权 node2/3/4 独占：`sudo -n kill -TERM` 终止 node2 ql master 1049544（5.8% CPU，14:59 起）、node4 ql client 2811209（42.8% CPU，15:02 起）、node4 ql http-metadata-server 1305724（:8080）；普通 kill 被拒（跨用户），必须 sudo。我方 etcd/target A/B/master 全在位。
+- 旧二进制 clean 基线（完整遍 p2/p4/p6）：**P50 374.27 / 376.80 / 380.05（spread 1.5%）**；Avg 380.06/382.79/388.18；W9 B 38.67/39.14/38.66、A 39.11/39.29/39.37。
+- **重要：diag 行不全（BAD）的遍 P50 更低**（295.62/320.94/275.06/289.34…）；完整遍 374–388。不能把行数完整度与 P50 脱钩比较。
+
+## 构建与 A/B
+
+- 新 bench：md5 **8b6d2f9d…**、480,981,312B；SPDK 静态库（libspdk_nvme.a 5a90008f…、libspdk_env_dpdk.a 2be37321…）；`/usr/local/lib/libspdk` 引用 **0**；旧 bench 备份 `stress_cluster_bench.nof150_old`（**bb4a07a3…**）。
+- 24 次运行全部 failed=0、rc=0、Total keys=60000；设备 `first_completion_from_submit` 稳定 42–46µs。
+- **ABBA 平衡块（双方完整行）：new 379.66 vs old 366.29 ⇒ 新慢 3.6%**。
+- 正向配对 3/3 偏新、反向配对 2/2 偏旧；**5/5 对都是“后跑者更快”⇒ 顺序效应成立，正向结论作废**。
+- **改动无收益**：真实效应 ≤ 噪声，[未验证] 有无小幅收益。
+
+## 打点语义被破坏
+
+- 补丁把 `get_begin` 移到“全部 child ready 之后”，导致 **① 变负（−122～−230µs）、get_block_us 恒 0、op 观测≈0、④ 失效（127～240µs）**；①/③/④ 不能再按 NOF-148/149 口径拆。
+- 若继续该方向，必须新增 `observe_begin_mono_ns`，不能复用 `get_begin`；但本单 ABBA 已显示无收益，先回退。
+
+## 偏差/未验证
+
+- 任务书 C 段“3 遍稳定”未达成（new P50 269.22/368.97/318.92/321.49，spread 大）；改用配对/反向/ABBA 共 9 次补充运行，偏离原设计。
+- 源码树 `/home/l00955908/mooncake-nof-vsegment-2/src/Mooncake` 无 `.git`，无法记录 HEAD/status；只记录补丁文本与 bench md5。
+- `run/nof150_pair_rounds.csv` 列错位（缺 op_lines/child_lines 表头），已按语义手工对齐；`nof150_abba.sh` 首跑 `SEQ: unbound variable`，修正后重跑。
+- 未重跑 NOF-148 口径 16µs 拆分（新二进制语义已破）。
+
+## 环境末态
+
+- `stress_cluster_bench` = **新 8b6d2f9d**（480,981,312B）；旧 **bb4a07a3** 备份保留。回退：`cp stress_cluster_bench.nof150_old stress_cluster_bench`。
+- 源码 `transfer_task.cpp` 已改（`#include <thread>` + 2456-2466 轮询块），未回退。
+- 服务未动：etcd 2822942、target B 2824683、`vseg_nof145v2` master 2828887/2828890、target A 3329243；Keys=60000、alarm 空；dbSize 2,048,806,912B。
+- node2/3/4 无 bench/脚本残留；load 8.56/13.3/14.8。
+
+## 裁定
+
+- **回退新二进制与源码到旧**；第一刀方向暂停，不再保留“并行观察”补丁。
+- **diag 行不全 vs P50 偏低**影响所有 diag-on 数据可比性，先只读排查；未来 A/B 强制 **ABBA 平衡块 + 每臂 ≥2 遍完整行**，单臂单遍结论无效。
+- 不重启 target/etcd、不写。
+
+---
+
+# NOF-151（待执行 · 回退第一刀 + 只读排查 diag 行不全 vs P50 · 2026-11-27）
+
+## A. 回退
+
+1. 用 `stress_cluster_bench.nof150_old` 覆盖当前 `stress_cluster_bench`；核对 md5 **bb4a07a3…**、size 480,981,376B。
+2. 回退 `transfer_task.cpp` 补丁（移除 `#include <thread>` 与 2456-2466 轮询块，恢复原 `for (child) child.get()` 语义）；源码树无 git，按补丁文本反向编辑或从备份恢复，记录改前/改后 md5。
+3. 不重启 target/etcd、不写数据；回退后确认 `get_begin` 语义恢复（下一单再跑）。
+
+## B. 只读排查 diag 行不全 vs P50（不跑 bench、不改码）
+
+1. 用现有 NOF-149/150 日志（old/new、完整/BAD 遍）列：P50、key_lines、op_lines、child_lines、日志文件大小、最后一行时间戳、是否结尾截断/采样。
+2. 检查 `MC_STORE_TRANSFER_DIAG` 采样、`MC_NOF_SLOW_TRACE_THRESHOLD_US=1`、日志限速/缓冲、进程退出 flush、磁盘、日志轮转；确认行数不全是“采样/截断”还是“真实丢数据”。
+3. 回答：**BAD 遍的低 P50 是真实更快（日志跟不上/采样），还是测量被扭曲（丢行）**；据此决定未来基线是否只能用完整行，还是需要修日志/采样。
+4. 若现有证据不足，列缺口并提出下一步受控实验（如更高阈值/同步 flush/只开一部分打点）；**本单不擅自跑**。
+
+## C. 交付
+
+- 表：pass / P50 / key/op/child lines / 完整度 / 日志大小 / 最后时间戳 / 结论。
+- 一句话结论：行数不全的原因 + 对 P50 的影响 + 未来 A/B 基线政策（ABBA + 完整行 + ≥2 遍）。
+- 不改正式结果。
+
+## D. 边界
+
+- 只回退二进制/源码；不改 target/etcd、不写数据；只读日志；不跑 bench（除非另单批准）。
+- 预计 **10–15 分钟**。
