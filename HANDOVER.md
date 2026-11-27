@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**无在途任务（NOF-140 完成；EID 两个变量均关闭；2026-11-26）**。NOF-140：plain 60k、正式 T1，只改 bench env `SPDK_URMA_EID_INDEX=0/1`，E0→E1 交替 3 遍；聚合 **E0 261.23/258.67/268.36/288.07 vs E1 247.51/244.86/256.23/272.49（Avg/P50/P90/P99）**，E1/E0 = **0.947/0.947/0.955/0.946**；但 **E1 P50 spread 6.5% > 表面改善 5.34%**，配对差 **+0.18% / −7.75% / −8.56%** 不一致、E1 始终后跑 ⇒ 判为**向下时间漂移，非稳定 EID 效应**；按判据 **SPDK EID 维度关闭**。结合同事澄清（`MC_EID_INDEX` 是 Transfer Engine 内存通道，NoF 不走它），**两个 EID 变量均关闭，不复测 vsegment**。`plain_nof135p` master 暂保持运行（无写入）；target/etcd 未动。正式结果仍为 NOF-127（P50 1.034×）。
+- 当前任务：**NOF-141（高并发下 SPDK_URMA_EID_INDEX 0 vs 1 · 平衡顺序 · 2026-11-27）**。背景：同事称 EID 收益只在**高并发**明显；NOF-140 的 T1 时延 A/B 无稳固差别，NOF-138 的高并发测的是 `MC_EID_INDEX`（层级不对，NoF 不走 TE 内存通道）。本单用 **`SPDK_URMA_EID_INDEX`**（NoF 数据面）在高并发下重测，并把 E0/E1 顺序做平衡以分离漂移。做法：`plain_nof135p` 2509048/2509051 不动，只改 bench 客户端 env；主档 **16t/batch16**，**E0→E1 / E1→E0 交替 4 组（每臂 8 遍）**；若主档无稳固差别，升一档 **32t/batch16**（每臂 4 遍，平衡顺序）。记吞吐（主指标）、Avg/P50/P90/P99（批时延，仅诊断）、failed、target B W9、进程 environ；平衡配对 + pass 趋势判 EID vs 漂移；E1 在两个方向都稳定 >5% 才记收益，否则关闭 SPDK EID 线；不逐遍罗列；EID1 失败即停、不重启 target；不改码/不重启 master/target/etcd/不写数据；预计 5–8 分钟。其他：NOF-140 完成（SPDK EID T1 无稳固差别）；NOF-138 带宽口径 MC_EID_INDEX −0.44%；两个 EID 变量当前均关闭，本单是最后复核；正式结果仍为 NOF-127（P50 1.034×）；环境 `plain_nof135p` 运行（Keys=60000）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -10188,3 +10188,40 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - **EID 线（`MC_EID_INDEX` 与 `SPDK_URMA_EID_INDEX`）全部关闭**；无在途任务。
 - `plain_nof135p` master 暂保持运行（无写入、零成本）；target/etcd 未动，数据完整。
 - 如需释放 node4，仅停 master 2509048/2509051，**不要停 etcd/target、不删数据**；以后可同集群重启复用 plain 基线。
+
+---
+
+# NOF-141（待执行 · 高并发下 SPDK_URMA_EID_INDEX 0 vs 1 · 平衡顺序 · 2026-11-27）
+
+## 背景
+
+- 同事称 EID 的收益只在**高并发**下明显；NOF-140 的 T1 时延 A/B 无稳固差别。
+- NOF-138 的高并发测的是 `MC_EID_INDEX`（Transfer Engine 内存通道，NoF 不走它，层级不对）；**NoF 数据面的 `SPDK_URMA_EID_INDEX` 还没在高并发下测过**。
+- 本单在高并发下重测，并把 E0/E1 的顺序做平衡，分离“EID 效应”与“时间漂移”。
+
+## A. 条件
+
+- 环境：`plain_nof135p` 2509048/2509051（Keys=60000）、target B 2458315、target A 3329243、etcd 2455814；**全部不动**，target 保持 EID0。
+- 数据：现成 plain 60k；不重写、不切 vsegment。
+- 只改 bench 客户端进程 env：`SPDK_URMA_EID_INDEX=0/1`；`MC_EID_INDEX` unset；既有 `SPDK_URMA_DEV_NAME=udmac0d1e2` 保留。
+- 主档读法：`segment_read --num_keys=60000 --num_threads=16 --batch_size=16`、warmup=128、qpairs=4、verify=false、diag 关、sequential；每遍一遍 60k（约 9–10s），**禁止 `--duration`**。
+- 顺序（平衡）：**E0→E1 / E1→E0 交替 4 组 = 每臂 8 遍（共 16 遍）**；序列固定为 E0,E1, E1,E0, E0,E1, E1,E0, E0,E1, E1,E0, E0,E1, E1,E0；每遍记录序号与时间戳。
+- 若主档 16t/batch16 无稳固差别，**升一档 32t/batch16**（仍 q4；每臂 4 遍，E0→E1/E1→E0 各 2 组，共 8 遍）。**不要直接上 batch32**（在途 4GiB，可能撞 inflight 限制）；32t 起不来/失败则记录错误即停，不追。
+- 每遍记录：**吞吐（MiB/s，主指标）、Avg/P50/P90/P99（批时延，仅诊断）、failed、墙钟、target B W9avg/n**；另存该遍 bench 进程 `/proc/<pid>/environ` 中 `SPDK_URMA_EID_INDEX` 值（env 自证）。
+- EID1 初始化/读失败/rc≠0 ⇒ **停手**，恢复 E0，不重启 target，回报错误原文。
+
+## B. 聚合与判读
+
+- 吞吐：各臂各遍 bench 报告值的算术平均 + spread；时延：Avg=各遍均值、P50/P90/P99=各遍同分位中位（2026-11-12 方法）。
+- **平衡配对**：分别算“E0 先跑”的块和“E1 先跑”的块内的 E1/E0（或 E1−E0）；再算吞吐/P50 对 pass 序号的趋势。
+- **只有两个方向都稳定 E1 更好，才是 EID 效应；只有 E1 后跑时更好 = 时间漂移。**
+- 判据：E1 吞吐在**两个方向都 >5%** 且 block 级一致（≥3/4 块）⇒ 记“高并发 EID 收益”，再议 vsegment 高并发复测；否则 **关闭 SPDK EID 线，不再复测 vsegment**。
+- 正文给聚合表 + 平衡配对结论；**不逐遍罗列**（原始值落 `run/nof141_rounds.csv`）；批时延不与正式 T1 表混比。
+- 预检：`strings <bench> | grep SPDK_URMA_EID_INDEX` 应命中（NOF-140 已确认）；`urma_admin show -d udmac0d1e2` 的 EID 0–7 应全 ACTIVE；target B `/proc/2458315/environ` 应无该变量（默认 0）。
+
+## C. 边界
+
+- 不改码/不重编/不装包/不重启 master/target/etcd；**只改 bench env**。
+- 不写数据、不切 vsegment；target EID 只读不改。
+- 环境末态：`plain_nof135p` 保持运行；target/etcd 未动。
+- 预计 **5–8 分钟**（主档约 3 分钟；升 32t 再加 2–3 分钟）。
