@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-148（vsegment child 完成/聚合/observe 打点 · 只加日志不改逻辑 · 2026-11-27）**。背景：NOF-147 完成——残差全在客户端；plain 最大项 **submit_span 26.8µs**（32 次串行提交），vsegment 最大项 **两 child 完成差/聚合 16µs**；vseg 残差 39µs = 前端 11.1 + submit 9.5 + 聚合 16 + 未归因 2；plain 54µs = 前端 14.3 + submit 26.8 + 聚合 11 + 未归因 1；completion/observe 字段缺失。本单只在 runtime 加最小时间戳（每个 child `get()` 前后、`complete_to_observe`、`serial_gap`、`last_completion`、`observed_total`、key 聚合），**不改变等待顺序/业务逻辑**；构建 bench（supercache@aadab957 + SPDK e12b7cb/bd5ee124d 静态库），E1 T1 60k 3 遍，拆开 vseg 16µs；构建/连接失败回退旧二进制并停手；不重启 target/etcd、不写；预计 20–30 分钟。其他：NOF-146 vseg total 261 vs plain 258；正式结果仍 NOF-127（P50 1.034×）。
+- 当前任务：**NOF-149（改码前基线：vsegment 3 遍 diag-on · 2026-11-27）**。背景：NOF-148 完成——打点已在 aadab957/运行时二进制/日志中存在，无需改码；零改码重解析 p4 把 vseg 残差 38µs 拆成 **①1.8 提交前 + ②139.9（含 drain 121）+ ③11.0 observe + ④5.3 key 聚合**；**16µs 是 key 聚合（cw − 最慢 child task total），不是 child skew**（skew 24.4 已含在②）；child.get() 串行在 `transfer_task.cpp:2455-2461`，submitVSegment 串行在 `2548-2558`；child1 head→first_submit 10µs vs child0 1µs，76.2% 场景 child1 最慢。**改码前先补 3 遍 diag-on 基线**（现有只有 p3/p4 全量，p3 离群），确保改完能判；E1 T1 60k、只读、不写/不重启/不改码；同时记录 node2 ql/tent_store master（14:59 起）是否为干扰；预计 10–15 分钟。其他：正式结果仍 NOF-127（P50 1.034×）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -10839,3 +10839,97 @@ flowchart LR
 ## D. 边界
 
 - 只加日志不改逻辑；不改 target；不重启 etcd/target；不写数据；构建/运行失败回退；预计 **20–30 分钟**。
+
+---
+
+# NOF-148 完成（2026-11-27 · 打点已存在，零改码重解析）
+
+## A 段结论：不需要加日志/重编
+
+- `nof_vsegment_child`、`nof_vsegment_operation`、`nof_slow_task`、`get_into_breakdown` 在 aadab957 已实现，运行时二进制 strings 4/4 命中，日志已全量落盘：**child 120,256 / operation 60,128 / key 60,128**。
+- 本单改为只读重解析；未构建、未改码、未重启、未写。
+
+## 数据与口径
+
+- 完整全量 diag-on：p3、p4（各 60,128 全量）；p1/p2/p5 行数不全，未采用；p3 离群（drain 185 / cw 252 / 残差 69），**p4 与 NOF-147 的 39µs 对齐（drain 121 / cw 158 / 残差 38）⇒ 以 p4 为基线**。
+- 关联完整性（p4）：ops=60,128 / child=60,128 / task=60,128 / key=60,128，joined=60,128，miss 全 0；last_child_idx：0=14,307、1=45,821。
+
+## P1–P5 结构（p4 中位，µs）
+
+```
+P1 --①1.8--> P2 --②139.9 [drain 121.0]--> P3 --③11.0--> P4 --④5.3--> P5(cw=158.0)
+                  │
+                  ├─ child0: get_block 127.0 → observe 11.3
+                  └─ child1: serial_gap 11.4 → get_block 22.0 → observe 11.5
+```
+
+| 段 | 含义 | 中位 | P90 | 可加性 |
+|---|---|---|---|---|
+| ① | get_begin→first_submit（提交前） | 1.8 | 3.8 | additive |
+| ② | first_submit→最慢 child complete（含 drain 121.0） | 139.9 | 158.3 | additive |
+| ③ | 最慢 child complete→最后 get_end（observe） | 11.0 | 14.3 | additive |
+| ④ | key 聚合（cw − op 观测） | 5.3 | 11.7 | additive（P4 之后） |
+| — | cw（key completion_wait） | 158.0 | 178.0 | 终点 |
+
+- 校验：①+②+③=**152.7** vs op 观测 **151.7**（差 +1.0）；+④≈158.0。
+
+## 残差归因（cw − drain = 38µs）
+
+| 编号 | 成分 | 中位 | 占比 | 性质 |
+|---|---|---|---|---|
+| A | 提交前（get_begin→first_submit） | 1.8 | 4.7% | additive，客户端 |
+| B | 段2 − drain（提交跨度+完成回调/分发） | 21.2 | 55.7% | additive，客户端 |
+| C | observe（最后 child 完成→get() 返回） | 11.0 | 28.9% | additive，child.get() 串行 |
+| D | key 聚合/回调（cw − op 观测） | 5.3 | 14.0% | additive，客户端 |
+| — | 合计 | 39.3 | — | vs 38.0（+1.3） |
+
+## 16µs 的真身
+
+- **不是“两 child 完成差”**：skew 24.4µs 已完全含在②段内，不是独立可加项。
+- **16µs = key 级聚合 = cw − 最慢 child task total**（158.0 − 143.0 = 15.0）；再拆为 `op 观测 − task total = 8.7` + `cw − op 观测 = 6.3/5.3`。
+- **child.get() 串行**：`transfer_task.cpp:2455-2461`，代价 = child1 serial_gap **11.4µs** + 末 child observe **11.0µs**；76.2% 场景 child1 最慢，根因之一是 `submitVSegment` 串行派发（`2548-2558`）：child0 head→first_submit 1µs，child1 10µs。
+
+## 偏差/未验证
+
+- p3 与 p4 差异大（残差 69 vs 38）；p3 离群原因 [未验证]，怀疑机器负载。
+- op 观测（计算 151.7）vs 日志 `observed_total_us`（163.0）差 −10.3µs：基线不同（started_at vs min(get_begin)），已标注非等口径。
+- fifo_wait 全为 0 ⇒ 本结论不含 QoS 排队成本。
+- node2 有他人进程：PID 1049544 `mooncake_master --port=50055 --metrics_port=9003 --http_metadata_server_port=8015`（父进程 1049540 `tent_store_run`，14:59 起）；端口不冲突，对 p3/p4 差异影响 [未验证]，未触碰。
+
+## 环境末态
+
+- node4：etcd 2822942、target B 2824683、`vseg_nof145v2` master 2828887/2828890；alarm 空；dbSize 2,048,471,040B。
+- node2：无 stress_cluster_bench / nof148_parse.py 残留；日志未被改写。未改码/未重建/未重启/未写/未跑 bench。
+
+---
+
+# NOF-149（待执行 · 改码前基线：vsegment 3 遍 diag-on · 2026-11-27）
+
+## 目标
+
+- 现有完整 diag-on 只有 p3/p4，且 p3 离群；**改码前先补 3 遍完整基线**，否则改完无法判断收益。
+- 同时记录 node2 的 ql/tent_store master 是否为干扰。
+
+## A. 条件
+
+- 当前 `vseg_nof145v2` 60k（Keys=60000）、E1、T1/batch1、`--num_keys=30000`/segment、warmup=128、qpairs=4、verify=false、sequential；diag-on。
+- **不改码/不重编/不重启/不写 bench 数据**；target/etcd 不动。
+- 新 tag（如 `nof149_e1_p1..p3`），确保 child/op/task/key 四表全量（child:op = 2:1，op:key = 1:1）；若某遍行数不全，标记并补 1 遍（最多 4 遍），不要用不完整遍。
+
+## B. 采集与聚合
+
+1. 3 遍完整 diag-on；每遍记录端到端 Avg/P50/P90/P99、failed；child/op/task/key 行数与关联完整性。
+2. 按 p4 同口径提取 P1–P5：①get_begin→first_submit、②first_submit→最慢 child complete（含 drain）、③observe、④cw−op 观测；给中位/P90 与 additive 校验。
+3. 残差 A–D（提交前/段2−drain/observe/key 聚合）与 16µs 拆分；三遍逐遍列，给稳定组聚合（异常遍按规则整轮剔除）。
+4. 记录 node2 ql/tent_store master（PID/端口/启动时间/load）；若负载高或与本测试时间重叠，标注；**不杀他人进程**。
+
+## C. 交付
+
+- 结构图（P1–P5，Mermaid + ASCII）+ 大段表 + 全点表 + 残差归因表（同 NOF-147/148 格式）。
+- 结论：3 遍基线是否稳定、p3 离群是否复现、16µs 是否稳定；给出改码前基线值和可接受噪声范围。
+- 不改正式结果；不跑改码。
+
+## D. 边界
+
+- 只读测试；不改码/不重编/不重启 target/etcd/不写；不杀 ql 进程；环境末态保持 `vseg_nof145v2`。
+- 预计 **10–15 分钟**。
