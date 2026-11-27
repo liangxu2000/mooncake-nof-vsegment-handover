@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-149（改码前基线：vsegment 3 遍 diag-on · 2026-11-27）**。背景：NOF-148 完成——打点已在 aadab957/运行时二进制/日志中存在，无需改码；零改码重解析 p4 把 vseg 残差 38µs 拆成 **①1.8 提交前 + ②139.9（含 drain 121）+ ③11.0 observe + ④5.3 key 聚合**；**16µs 是 key 聚合（cw − 最慢 child task total），不是 child skew**（skew 24.4 已含在②）；child.get() 串行在 `transfer_task.cpp:2455-2461`，submitVSegment 串行在 `2548-2558`；child1 head→first_submit 10µs vs child0 1µs，76.2% 场景 child1 最慢。**改码前先补 3 遍 diag-on 基线**（现有只有 p3/p4 全量，p3 离群），确保改完能判；E1 T1 60k、只读、不写/不重启/不改码；同时记录 node2 ql/tent_store master（14:59 起）是否为干扰；预计 10–15 分钟。其他：正式结果仍 NOF-127（P50 1.034×）。
+- 当前任务：**NOF-150（第一刀：vsegment 两半并行观察 · 2026-11-27）**。背景：NOF-149 3 遍完整但基线**双模态**——慢模态 p1/p2 **cw 245/249、drain 175/178、残差 71/72**；快模态 p3 **cw 167、drain 99、残差 66**；cw spread 37.2% >10%，但结构稳：**B=35.2/35.4/33.7（4.9%）、C=23.3/23.2/17.4、设备 first_completion 42/43（0/4.6%）、query 93.7（4.3%）、submit 5（0%）、resolve 3（0%）**；device W9 恒 38.7–39.4µs、两 target 同步 ⇒ **双峰在客户端完成观察路径，不是设备/单 target**。**裁定：不补基线遍、不单独查双峰**；用慢模态 p1+p2 作改码前基线，改码后按同模态配对 ≥2 遍。本单只改 `VSegmentOperationState::wait_for_completion`（`transfer_task.cpp:2455-2461`）：先轮询全部 child `isReady`，再逐个 `get()`；**不改 submit、不改 plain/target/master**；按硬规范重编 bench；E1 T1 60k diag-on 3 遍；构建/连接失败回退；预计 20–30 分钟。其他：NOF-148 的 16µs 是模态相关（慢模态 cw−task_total 28/30，快模态 25；NOF-148 p4 15），跨模态不可比。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -10933,3 +10933,78 @@ P1 --①1.8--> P2 --②139.9 [drain 121.0]--> P3 --③11.0--> P4 --④5.3--> P5(
 
 - 只读测试；不改码/不重编/不重启 target/etcd/不写；不杀 ql 进程；环境末态保持 `vseg_nof145v2`。
 - 预计 **10–15 分钟**。
+
+---
+
+# NOF-149 完成（2026-11-27 · 改码前基线 · **双模态：慢 p1/p2、快 p3**）
+
+## 条件与完整性
+
+- 3 遍全部完整（child 120,256 / op 60,128 / key 60,128 / task 60,128，关联 miss 0，0 failed）；E1、T1/batch1、60k、diag-on。
+- 慢模态 p1/p2：cw 245/249、drain 175/178、残差 71/72；快模态 p3：cw 167、drain 99、残差 66。
+
+## 逐遍结构（µs）
+
+| 段 | p1 | p2 | p3 | 说明 |
+|---|---|---|---|---|
+| ① 提交前 | 6.8 | 6.9 | 5.7 | |
+| ② first_submit→最慢完成（含 drain） | 206.8 | 210.4 | 133.9 | |
+| ③ observe（最后完成→get_end） | 23.3 | 23.2 | 17.4 | |
+| ④ key 聚合 | 6.7 | 6.7 | 9.6 | |
+| cw | 245.0 | 249.0 | 167.0 | |
+| drain | 175.0 | 178.0 | 99.0 | |
+| 残差 A/B/C/D | 6.8/35.2/23.3/6.7 | 6.9/35.4/23.2/6.7 | 5.7/33.7/17.4/9.6 | |
+| cw − 最慢 child task total | 28.0 | 30.0 | 25.0 | NOF-148 p4 为 15.0 |
+
+## 稳定性
+
+- **不稳**：cw spread 37.2%、drain 52.4%、② 41.7%、③ 27.4%、skew 66.8% ⇒ 不能进正式表、不能取三遍均值。
+- **稳**：B（段2−drain）**35.2/35.4/33.7（4.9%）**；残差 **71/72/66（8.6%）**；设备 `first_completion_from_submit` **42/43µs（0%/4.6%）**；query **93.7（4.3%）**；submit **5（0%）**；resolve **3（0%）**。
+- **双峰不是设备/单 target**：target B W9 38.69/38.70/39.32µs、target A 39.44/39.18/39.44µs；同遍 node3/node4 cw 差 ≤16µs 且同向（p1 244/245、p2 256/243、p3 176/160）。
+- 慢模态特征：drain 175→99 翻倍，但设备 `first_completion` 仍 42µs ⇒ **客户端完成观察/轮询路径变慢**。
+
+## 判读
+
+- **双峰是客户端全局的**，不是设备、不是单一 target；慢模态在 NOF-146 p3 也出现过，属双稳态，不是单次离群。
+- **NOF-148 的 16µs 是模态相关值**：本次 cw−最慢 child task total = 28/30/25（慢/慢/快），NOF-148 p4 快模态 15.0；**改码收益必须同模态配对比较，跨模态直接比会得出错误结论**。
+- **改码前基线用慢模态 p1+p2**（cw 245/249，spread 1.6%）；快模态 p3（cw 167）作第二参考。
+- 双峰根因 [未验证]：已排除设备/单 target；未排除 node2 CPU 频率/中断亲和/他人进程。node2 ql_master（PID 1049544，6.4% CPU，14:59 起，load 7.6–9.4/308 核）与测试窗口重叠，影响 [未验证]，未触碰；`nvidia-smi` 无法通信，影响 [未验证]。
+- NOF-149 绝对延迟高于 NOF-146 p4（cw 167/245/249 vs 158），16:02 后机器状态变化，原因 [未验证]。
+
+## 环境末态
+
+- node4：etcd 2822942、target B 2824683、`vseg_nof145v2` master 2828887/2828890；Keys=60000、segments=2、alarm 空；dbSize 2,048,507,904B（读测试期间 +36,864B）。
+- node2：无 bench/parse 残留；新增 nof149 日志 3 份（各 ≈1.0GB）。未改码/未重编/未重启/未写。
+
+---
+
+# NOF-150（待执行 · 第一刀：vsegment 两半并行观察 · 2026-11-27）
+
+## 目标
+
+- 只改 `VSegmentOperationState::wait_for_completion`（`transfer_task.cpp:2455-2461`）：**先轮询全部 child 是否 `isReady()`，全部 ready 后再逐个 `get()`**；`get()` 此时不应阻塞。
+- 不改 `submitVSegment`、不改 plain 路径、不改 target/master；预期压 C observe（慢模态 23.3/23.2µs）与 child1 serial_gap，目标 ~11µs。
+- **不混第二刀（submit 重叠）**；本单只验证并行观察。
+
+## A. 改码与构建
+
+1. 源码 supercache@aadab957；改 `VSegmentOperationState::wait_for_completion` 的循环：
+   - 现：`for (child) { child.get(); ... }` 串行阻塞；
+   - 改：先 `while (存在 !isReady())` 轮询等待；全部 ready 后再 `for (child) child.get()` 收集错误/observe 时间戳。
+   - 保持错误处理、`submission_failed`、observation 时间戳、日志字段不变。
+2. 硬规范构建：SPDK `$D/build/spdk-e12b7cb-src/build/lib` 的 e12b7cb/bd5ee124d wire v4 **静态库**，禁止 `/usr/local/lib/libspdk_*.a`；记录源码 HEAD/status、库路径/md5、链接命令、bench md5；保留旧二进制回退。
+3. 构建失败/新二进制无法连接 ⇒ 回退旧二进制并停手。
+
+## B. 测试（同模态配对）
+
+- `vseg_nof145v2` 60k、E1、T1/batch1、diag-on、3 遍；不改 target/etcd、不写。
+- 改码前基线：**慢模态 p1/p2 cw 245/249、残差 71/72、C 23.3/23.2**；快模态 p3 cw 167、残差 66、C 17.4。
+- 改码后每遍标记模态（按 cw/drain 落点）；**同模态配对 ≥2 遍**再比较；若快/慢混合，逐遍列出，不跨模态平均。
+- 指标：cw、drain、A–D、C observe、child serial_gap、child get_block、query/submit/resolve、target A/B W9、failed。
+- 成功判据：同模态下 C observe / serial_gap / cw / 残差下降，failed=0、无回归；若没有下降或变慢，如实回报，不强行归因。
+
+## C. 边界
+
+- 只改这一处；不改 submit/plain/target/master；不重启 target/etcd；不写数据。
+- 构建/连接失败回退；环境末态保持 `vseg_nof145v2`。
+- 预计 **20–30 分钟**。
