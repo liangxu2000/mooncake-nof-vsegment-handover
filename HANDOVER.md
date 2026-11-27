@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-142（vsegment 高并发 + SPDK_URMA_EID_INDEX 0/1 · 平衡 A/B · 2026-11-27）**。背景：NOF-141 在 plain 高并发 16t/batch16 下实测 **E1/E0 吞吐 1.483（+48.31%）**；平衡配对 E0 先跑均值 **+49.24%**、E1 先跑 **+47.39%**，**8/8 块 E1 更快（最低 +45.37%）** ⇒ **SPDK EID1 的高并发带宽收益成立，不是漂移**；T1 口径 NOF-140 仍无稳固差别。本单把同一 A/B 移到 **vsegment 60k**：优先现成 m=2 正式数据（NOF-129 `vseg_nof128` / NOF-134 `vseg_nof134v1`），备选 m=1（NOF-135）；**只读、不写、不重启 target/etcd**；必要时可停 plain master、启动对应 vsegment master 恢复元数据；若数据不可用即停手回报。高并发 16t/batch16、E0→E1 / E1→E0 交替 4 组（每臂 8 遍），吞吐为主、批时延诊断；E1 两个方向都 >5% 且 ≥3/4 块一致才记 vsegment 收益；预计 10–15 分钟。其他：NOF-141 完成（plain EID1 +48.31%）；NOF-140 T1 无稳固差别；正式结果仍为 NOF-127（P50 1.034×）；环境 `plain_nof141p` 2693369/2693372 运行（Keys=60000）。
+- 当前任务：**无在途任务（NOF-142 完成；EID 高并发线收口；2026-11-27）**。NOF-142：vsegment 60k（m=2/stripe=2MiB/extent=256GiB）高并发 16t/batch16，只改 bench 客户端 `SPDK_URMA_EID_INDEX=0/1`，E0/E1 平衡 4 组（前 8 遍统计）——**E0 45,488.34 vs E1 91,481.57 MiB/s = 2.011（+101.11%）**；两方向 **+113.63% / +89.40%**，**4/4 块 E1 更快**；E0 seq=5 离群（38,702.82），**剔除后 E1/E0 = 1.916（+91.58%）**，结论不变；spread 19.93%/24.82% >10% ⇒ 不进正式表，按配对 A/B 判据成立。**EID1 高并发带宽收益：plain +48.31%、vsegment +101.11%（保守 +91.58%）；T1 单 key 无稳固收益；正式结果仍 NOF-127（P50 1.034×）**。裁定：**不复测离群、不升 32t、保留 vsegment master `vseg_nof142v` 2707317/2707320（Keys=60000）**；target B 2692715 / target A 3329243 / etcd 2690803 未重启。其他：NOF-141 plain EID1 +48.31%；NOF-140 T1 无稳固差别。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -10305,3 +10305,42 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 - 允许停 plain master、启动 vsegment master（仅为读取现有数据）；若需重建则停手。
 - 环境末态：记录实际 master（plain 或 vsegment）、Keys、target/etcd 状态；node2 无 bench 残留。
 - 预计 **10–15 分钟**。
+
+---
+
+# NOF-142 完成（2026-11-27 · vsegment 高并发 · **SPDK EID1 +101.11%（保守 +91.58%）**）
+
+## 条件
+
+- 环境：新集群 `vseg_nof142v`（m=2 / stripe=2MiB / extent=256GiB），写 60k（152s，60,000/0 failed，Keys=60000，enabled=1，vsegments=1）；target B 2692715、target A 3329243、etcd 2690803 全程未重启。
+- 背景：旧候选集群 `vseg_nof134v1` 等恢复失败（logical_used=0、partition degraded、payload too large）⇒ 旧数据不可用，故重建；重建后先完成正式配置的 60k 写入。
+- 读取：vsegment 60k（`--num_keys=30000`/segment）、16t/batch16、warmup=128、qpairs=4、verify=false、diag 关、sequential；每遍一遍（约 10–15s）。
+- 只改 bench 客户端 `SPDK_URMA_EID_INDEX=0/1`；target 保持 EID0；E0/E1 平衡交替 4 组（前 8 遍统计；后 8 遍仅存档，不参与统计）。
+- 16/16 遍读取成功：Total keys=60000 / failed=0 / 234.38 GB。
+
+## 结果（前 4 组 8 遍；吞吐主指标，时延为批时延）
+
+| 臂 | 遍数 | 吞吐 MiB/s | 吞吐 spread | Avg µs | P50 µs | P90 µs | P99 µs |
+|---|---|---|---|---|---|---|---|
+| E0 | 4 | **45,488.34** | 19.93% | 22,602.9 | 21,336.0 | 21,832.3 | 23,284.1 |
+| E1 | 4 | **91,481.57** | 24.82% | 11,210.5 | 11,322.9 | 12,065.0 | 12,863.9 |
+| E1/E0 | — | **2.011（+101.11%）** | — | 0.496 | 0.531 | 0.553 | 0.552 |
+
+- 4 块增益：0→1 **+117.62%**、1→0 **+93.67%**、0→1 **+109.65%**、1→0 **+85.14%**；两方向均值 **+113.63% / +89.40%**，**4/4 块 E1 更快**。
+- 异常轮：E0 seq=5 为 38,702.82 MiB/s（其余 3 遍 spread 1.4%）；**剔除后 E1/E0 = 1.916（+91.58%）**，结论不变，原因 [未验证]，不复测。
+- 两臂 spread 19.93%/24.82% >10% ⇒ 按 2026-11-12 方法**不进正式汇总表**；本单按配对 A/B 判据成立。
+- 批时延 9.8–26.4ms（16×4MiB/批），**不可与正式 T1/batch1（P50≈252–254µs）比**。
+
+## 判读
+
+- **vsegment 高并发 16t/batch16 下，`SPDK_URMA_EID_INDEX=1` 有显著吞吐收益：45.5k → 91.5k MiB/s（+101.11%；保守剔除离群 +91.58%）**；两个方向、4/4 块一致 ⇒ 成立，且幅度大于 plain（+48.31%）。
+- T1 单 key 口径 NOF-140 无稳固差别 ⇒ **EID1 是高并发带宽优化，不是单 key 时延优化**；正式结果仍为 NOF-127（P50 1.034×/Avg 1.040×/P90 1.046×/P99 1.371×）。
+- 裁定：**不复测 E0 seq=5、不升 32t**；EID 高并发线以 16t 数据收口；保留 vsegment master `vseg_nof142v` 2707317/2707320（Keys=60000），target/etcd 未动。
+- 若后续要做部署配置，建议客户端 `SPDK_URMA_EID_INDEX=1` 用于高并发读；T1 场景无收益。
+
+## 偏差
+
+- 旧 vsegment 集群恢复失败，本单重建了新集群并写了 60k（152s）；这是环境准备，不是性能测试的一部分。
+- `logical_used=0` 是指标刷新被抑制（REFRESH_INTERVAL=1000000，同 NOF-134），数据以读取为准：16/16 遍 60k、failed=0。
+- 实际跑了 16 遍，按指令取前 4 组 8 遍；前 8 遍 E1 均值低于后 8 遍 ⇒ 取值保守，无择优。
+- E0 离群遍未复测；结论用保守值 +91.58%。
