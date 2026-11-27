@@ -70,7 +70,7 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 | master | **`plain_nof135p` 2509048/2509051 运行中**：Keys=60000（当前 plain 基线，先保留） |
 | etcd | 2455814；`--max-request-bytes=67108864`；dbSize 1931.57MiB、raftIndex 2,261,561 |
 | node2 | 无 bench/register 残留；客户端 md5 bb4a07a3…（未重编） |
-| 当前任务 | **NOF-141（高并发 SPDK_URMA_EID_INDEX 0 vs 1 · 平衡顺序；主档 16t/batch16 每臂 8 遍）**；`plain_nof135p` 保持运行 |
+| 当前任务 | **NOF-142（vsegment 高并发 + SPDK_URMA_EID_INDEX 0/1 · 平衡 A/B；优先现成 m=2 数据）**；plain_nof141p 保持运行 |
 | 风险 | node4 非独占：外部用户 `computin` 16:20–16:50 多次登录；本次重建后未被清；若再次清场/资源争用，停手回报 |
 
 ---
