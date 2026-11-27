@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-144（T1 端到端拆解：query vs 数据面 · plain 先做 · 2026-11-27）**。背景：NOF-143 完成 T1 单并发 EID1 绝对值——**vsegment P50 230.31µs、plain 232.93µs（0.989×）**；各自 E1/E0 P50 为 0.918/0.937，3/3 块 E1 更快，但 spread ~9%、vseg P99 368.20 vs plain 256.10（1.438×）⇒ 仅诊断，不进正式表。**环境裁定：切回可读的 `plain_nof135p`**；degraded vseg master 停掉（日志/数据保留），vsegment 重启恢复失败另立只读排查单。**NOF-144**：在 plain 60k 上做 T1 diag-on 分段（沿用 NOF-108/131 配置），3 遍 E0 + 3 遍 E1，提取 query/resolve/prepare/submit/completion_wait/read_us/target W9 中位，对照“100µs query + 100µs 数据面”模型；不改码/不重启 target/etcd/不写；现有 diag 不够则停手回报，再议新打点。预计 10–15 分钟。其他：NOF-142 vsegment 高并发 EID1 +101.11%/保守 +91.58%；NOF-141 plain +48.31%；正式结果仍 NOF-127（P50 1.034×）。
+- 当前任务：**NOF-144（T1 E1-only 打点拆解：query vs 数据面 · plain 先做 · 2026-11-27）**。背景：NOF-143 完成 T1 单并发 EID1 绝对值——**vsegment P50 230.31µs、plain 232.93µs（0.989×）**；E1 比 E0 低 6–8%，但 spread ~9%、vseg P99 1.438× ⇒ 仅诊断。**用户定规：以后只看 E1，不做 E0**（E0 历史数据仅参考）。**环境裁定：切回可读的 `plain_nof135p`**；degraded vseg master 停掉（日志/数据保留），vsegment 重启恢复失败另立只读排查单。**NOF-144**：在 plain 60k 上做 T1 diag-on 分段（沿用 NOF-108/131 配置），**只跑 E1 3 遍**，提取 query/resolve/prepare/submit/completion_wait/read_us/target W9 中位，对照“100µs query + 100µs 数据面”模型；不改码/不重启 target/etcd/不写；现有 diag 不够则停手回报，再议新打点。预计 8–12 分钟。其他：NOF-142 vsegment 高并发 EID1 +101.11%/保守 +91.58%；NOF-141 plain +48.31%；正式结果仍 NOF-127（P50 1.034×）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -10437,28 +10437,29 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 
 ---
 
-# NOF-144（待执行 · T1 端到端拆解：query vs 数据面 · plain 先做 · 2026-11-27）
+# NOF-144（待执行 · T1 E1-only 打点拆解：query vs 数据面 · plain 先做 · 2026-11-27）
 
 ## 目标
 
-- 用户模型：**~200µs 端到端 = 100µs query + 100µs 数据面**；NOF-143 实测 vsegment/plain E1 P50 **230/233µs**。
-- 先用**现有 diag** 把 plain 的端到端拆成 query 与数据面各段，验证 100+100 模型；**不改码**。
+- 用户模型：**~200µs 端到端 = 100µs query + 100µs 数据面**；NOF-143 实测 plain E1 P50 **232.93µs**。
+- **用户定规：以后只看 E1，不做 E0。** 本单只跑 E1。
+- 先用**现有 diag** 把 plain 的 E1 端到端拆成 query 与数据面各段，验证 100+100 模型；**不改码**。
 
 ## A. 环境
 
 - 停 degraded vseg master（2767544/2767547），起 `plain_nof135p`（Keys=60000，master 2693369/2693372）；target B 2692715 / target A 3329243 / etcd 2690803 不动；不写数据。
-- 确认 plain 60k 可读、failed=0；`SPDK_URMA_EID_INDEX=1`（T1 E1 当前最佳）；`MC_EID_INDEX` unset。
+- 确认 plain 60k 可读、failed=0；`SPDK_URMA_EID_INDEX=1`；`MC_EID_INDEX` unset。
 
 ## B. 采集
 
-1. 沿用 **NOF-108/131 的 diag 配置**（diag on；`VSEG_DIAGNOSTIC` / `MC_STORE_TRANSFER_DIAG` 等按历史脚本），T1/batch1、60k、warmup=128、qpairs=4、verify=false、sequential；**E0 3 遍 + E1 3 遍**（平衡交替），每遍一遍 60k；不写、不重启。
+1. 沿用 **NOF-108/131 的 diag 配置**（diag on；`VSEG_DIAGNOSTIC` / `MC_STORE_TRANSFER_DIAG` 等按历史脚本），T1/batch1、60k、warmup=128、qpairs=4、verify=false、sequential；**只跑 E1 3 遍**（每遍新进程，env 自证 `SPDK_URMA_EID_INDEX=1`），每遍一遍 60k；不写、不重启。
 2. 提取每遍 `get_into_breakdown` / `query_rpc_breakdown` / `transfer_data_breakdown` / `nof_slow_task` 与 target W9；按段取中位：**query、resolve、prepare、submit、completion_wait、read_us、target W9**；给总时延与各段占比。
-3. 对比 E0/E1；对比用户模型 **100µs query + 100µs 数据面**。
+3. 只对比用户模型 **100µs query + 100µs 数据面**；不跑 E0、不做 E0/E1 对比。
 4. **注意**：diag-on 绝对时延会膨胀；主要看同轮段占比与相对值，不把 diag-on 绝对值当正式时延。
 
 ## C. 判读与交付
 
-- 输出一张分段表（E0/E1 各段中位、占比）；明确 query 段与数据面各多少 µs；与 100/100 模型的差异。
+- 输出一张分段表（E1 各段中位、占比）；明确 query 段与数据面各多少 µs；与 100/100 模型的差异。
 - 若现有 diag 字段不足以拆出某段（例如 submit/wait 混在一起），**列出缺口、停手回报**，不擅自改码；新打点另单。
 - 这是诊断，不进正式表；正文不报吞吐、不逐遍（原始值落 `run/nof144_rounds.csv`）。
 
@@ -10466,4 +10467,4 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 
 - 不改码/不重编/不装包；不重启 target/etcd；不写数据。
 - 环境末态：plain master 保持；vseg 停（degraded）；记录状态。
-- 预计 **10–15 分钟**。
+- 预计 **8–12 分钟**。
