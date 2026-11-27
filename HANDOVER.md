@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**无在途任务（NOF-146 完成；vsegment E1 拆解收口；2026-11-27）**。NOF-146：compact+defrag 修复 etcd NOSPACE（dbSize 2.1→1.95GiB、alarm 清除；未提 quota、未删键），新建 `vseg_nof145v2` 写 60k（60,000/0）；diag-on T1 E1 稳定组 p1/p2/p4：**vsegment total 261µs（query 89 / 数据面 169）、plain 258（query 83 / 数据面 176）**；总差 +3µs（在 spread 内），vsegment 仅多 `vsegment_resolve` 2µs；设备 IO 104 vs 105–106；**分段结构几乎重合，vsegment 不多付数据面成本**。共同瓶颈：completion_wait 150/160，其中设备 104–105，**~45–55µs 在提交/派发/等待**。p3 客户端侧离群（P50 381，target W9 正常）已剔除。**裁定：p3 不单独立项、采样不全不追、etcd 余量 99MB 下次写前先 compact/defrag（不够再提 quota 8GiB）、提交/派发/等待列为后续优化目标但需改码/新阶段**。环境：`vseg_nof145v2` 2828887/2828890（Keys=60000）；etcd 2822942（dbSize 1.91GiB、alarm 空）；target B 2824683/A 3329243；plain 数据保留。正式结果仍 NOF-127（P50 1.034×）。
+- 当前任务：**无在途任务（NOF-146 完成；vsegment E1 拆解收口；2026-11-27）**。NOF-146：compact+defrag 修复 etcd NOSPACE（dbSize 2.1→1.95GiB、alarm 清除；未提 quota、未删键），新建 `vseg_nof145v2` 写 60k（60,000/0）；diag-on T1 E1 稳定组 p1/p2/p4：**vsegment total 261µs（query 89 / 数据面 169）、plain 258（query 83 / 数据面 176）**；总差 +3µs（在 spread 内），vsegment 仅多 `vsegment_resolve` 2µs；`drain/max_subio`（客户端 child task 尾部/最慢子IO）104 vs 105–106，target W9 44–45µs 才是设备执行；**分段结构几乎重合，vsegment 不多付数据面成本**。共同瓶颈：completion_wait 150/160 与 drain 104/105 的差 **~45–55µs 是残差**（含 submit_span+dispatch 15/37、第二 child、回调/聚合），不是单一字段；精确拆分需代码打点。p3 客户端侧离群（P50 381，target W9 正常）已剔除。**裁定：p3 不单独立项、采样不全不追、etcd 余量 99MB 下次写前先 compact/defrag（不够再提 quota 8GiB）、提交/派发/等待列为后续优化目标但需改码/新阶段**。环境：`vseg_nof145v2` 2828887/2828890（Keys=60000）；etcd 2822942（dbSize 1.91GiB、alarm 空）；target B 2824683/A 3329243；plain 数据保留。正式结果仍 NOF-127（P50 1.034×）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -10471,7 +10471,7 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 
 ---
 
-# NOF-144 完成（2026-11-27 · plain T1 E1-only · **query 83 / 数据面 176µs；设备 IO 105–106µs**）
+# NOF-144 完成（2026-11-27 · plain T1 E1-only · **query 83 / 数据面 176µs；drain/max_subio 105–106µs**）
 
 ## 条件
 
@@ -10511,7 +10511,7 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 
 - **“200µs 量级”成立**：total 258µs（diag-on；diag-off 232.93）。
 - **比例相反**：query **83µs（32%）** 比模型低 17%；数据面 **176µs（68%）** 比模型高 76%。
-- **数据面内设备 IO 105–106µs，正好接近 100µs 模型**（+5–6µs）；额外 **~42µs 在提交/派发/排队**（submit_span 26 + dispatch_queue 11 + 其他），另有 **9µs 未归因**。
+- **数据面内 `drain/max_subio` 105–106µs（客户端 child task 尾部/最慢子IO），接近 100µs 模型；target W9 44–45µs 才是设备执行**（+5–6µs 是对 100µs 模型；不是纯设备）；额外 **~42µs 在提交/派发/排队**（submit_span 26 + dispatch_queue 11 + 其他），另有 **9µs 未归因**。
 - **瓶颈在数据面，不在 query**；现有 diag 字段无缺口，**无需新打点**。
 - 可行动的优化点是数据面的 **~42µs 提交/派发开销**；这属于后续优化候选，需改码/新阶段，当前结果不变。
 
@@ -10639,7 +10639,7 @@ reader 的元数据（node4）和数据（node3/node4）都跨节点
 
 - `nof_slow_task` 中位：drain **104** vs 105、max_subio **104** vs 106、submit_span **9** vs 26、dispatch_queue **6** vs 11、total **126** vs 148。
 - 占比：query **34.1%**、completion_wait **57.5%**、数据面 **64.8%**。
-- **判读：vsegment 与 plain 分段结构几乎重合；vsegment 仅多 2µs `vsegment_resolve`，总差 +3µs 在 spread 内；vsegment 不多付数据面成本。** 共同瓶颈是 completion_wait 150/160，其中设备只 104–105µs，**~45–55µs 在提交/派发/等待**（与 NOF-144 一致）。
+- **判读：vsegment 与 plain 分段结构几乎重合；vsegment 仅多 2µs `vsegment_resolve`，总差 +3µs 在 spread 内；vsegment 不多付数据面成本。** 共同瓶颈是 completion_wait 150/160 与 drain 104/105 的 **~45–55µs 残差**：其中 submit_span+dispatch 可测为 15/37µs，第二 child、回调/聚合等需代码打点再拆；target W9 44–45µs 才是设备执行，drain 是客户端 task 尾部跨度。
 
 ## 偏差
 
