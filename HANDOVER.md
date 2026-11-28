@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-153（null bdev 4MiB 单包客户端拆解 · E0/E1 · 2026-11-28）**。背景：NOF-152 已证明 **4MiB 单包成立**——`MC_NOF_SUBMIT_CHUNK_BYTES=4194304` 下 400 keys 在 target 上 **400 写 IO / 528 读 IO（400+128 warmup）**，没有 12,800 切分；T1 单并发 **E0 P50 中位 219.4µs、E1 179.3µs（E1/E0 0.817，−18.27%）**；target 每 IO 仅 **33µs**（push JFC wait 31.5µs=92.8%、W9 1.3µs），**差额 ~146–186µs 在客户端/传输**。本单继续用 null bdev（无 SSD）+ 备用端口独立 plain master（50057/9007/8087，非 HA/非 oplog，不写 etcd，已确认不影响 vseg）复现 400 keys，**diag-on** 跑 E0/E1 各 3 遍，拆 query/prepare/submit/completion_wait/drain/max_subio + target JFC/W9/TOTAL，定位 E1 省下的 ~40µs 和 146–186µs 的客户端构成；不改码/不重启 target/etcd/不写 SSD；null bdev 不可用即停；预计 15–20 分钟。其他：第一刀已回退（bench bb4a07a3、源码语义恢复）；正式结果仍 NOF-127（P50 1.034×）。
+- 当前任务：**NOF-153（null bdev 4MiB 单包客户端拆解 · E0/E1 · 2026-11-28）**。背景：NOF-152 已证明 **4MiB 单包成立**——`MC_NOF_SUBMIT_CHUNK_BYTES=4194304` 下 400 keys 在 target 上 **400 写 IO / 528 读 IO（400+128 warmup）**，没有 12,800 切分；T1 单并发 **E0 P50 中位 219.4µs、E1 179.3µs（E1/E0 0.817，−18.27%）**；target 单遍仅 **33µs**（push JFC wait 31.5µs=92.8%、W9 1.3µs），但**该 33µs 未标 EID，不能归到 E0 或 E1**。本单继续用 null bdev（无 SSD）+ 备用端口独立 plain master（50057/9007/8087，非 HA/非 oplog，不写 etcd）复现 400 keys，**diag-on** 跑 E0/E1 各 3 遍；**target 侧必须按 EID 分开**：逐遍记录 target 周期块的 TOTAL / push JFC wait / W9 / W4a / W7 / W8 / W10 / n，按时间戳与 pass 对齐，输出 **E0 一张表、E1 一张表**（逐遍 + 中位）；**若无法按 pass 对齐，停手说明，不得用单遍无 EID 的 33µs 代替**。同时拆客户端 query/prepare/submit/completion_wait/drain/max_subio，定位 146–186µs 和 E1 省下的 ~40µs；不改码/不重启 target/etcd/不写 SSD；null bdev 不可用即停；预计 15–25 分钟。其他：第一刀已回退（bench bb4a07a3、源码语义恢复）；正式结果仍 NOF-127（P50 1.034×）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -11203,15 +11203,17 @@ P1 --①1.8--> P2 --②139.9 [drain 121.0]--> P3 --③11.0--> P4 --④5.3--> P5(
 
 - bench env：`MC_NOF_SUBMIT_CHUNK_BYTES=4194304`、`SPDK_URMA_MAX_IO_SIZE=8388608`；E0→E1→E0→E1→E0→E1（各 3 遍）；T1/batch1、400 keys、warmup128、qpairs4、verify=false、**diag-on**（`MC_STORE_TRANSFER_DIAG=1`、`MC_NOF_SLOW_TRACE_THRESHOLD_US=1`）；target EID0。
 - 每遍记录：`get_into_breakdown`（query/read/prepare/submit/completion_wait/total）、`nof_slow_task` 全字段（dispatch/submit_span/drain/max_subio/completion gap/poll gap）、target JFC/W9/TOTAL、read_ops（应为 ~528）、failed。
+- **target 侧必须按 EID 分开**：每遍记录 target 周期块的时间戳 / n / TOTAL / push JFC wait / W9 / W4a / W7 / W8 / W10，生成 `eid,pass,...` CSV，按时间戳与 pass 对齐；**E0 一张表、E1 一张表（逐遍 + 中位）**。若 target 统计块无法对齐到 pass，停手说明；**不得用单遍无 EID 的 33µs 代替**。
 - 要求日志完整（400 keys 应产生 400+ 行；若不全，标记并补 1 遍，不混用不完整遍）。
 
 ## C. 判读与交付
 
 - 结构图（总量→大段→子段）+ 大段表 + 全点表 + E0/E1 归因表；明确 **146–186µs 的组成**、**E1 省在哪一段**、**target JFC 是否 E0/E1 有差**。
+- **必须给 E0 target 表、E1 target 表（逐遍 + 中位）**；明确 E0 target vs E1 target 的 TOTAL / push JFC / W9 是否不同；客户端表也按 E0/E1 分开。
 - 若 target JFC E0/E1 相同 ⇒ 18% 差额在客户端/传输；若不同 ⇒ 报 target/URMA 路径。
 - 诊断，不写正式表；400 keys P99 仅供参考。
 
 ## D. 边界
 
 - 不改码/不重编/不重启 target/etcd；不写 SSD；保留 vseg；null bdev/master 测试后清理。
-- 预计 **15–20 分钟**。
+- 预计 **15–25 分钟**。
