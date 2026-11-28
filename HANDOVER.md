@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-155（拆包梯度 E0/E1 · plain NoF + null bdev · 2026-11-28）**。背景：NOF-153 在 4MiB 不拆包下测到 E0 target TOTAL 88.6µs/IO、E1 33.4µs/IO，差 55.2µs 100% 在 push JFC；客户端 query 109/109、read_us 133/77、`read_us−target_us`≈44µs 两侧相同 ⇒ E2E 的 55µs 降幅完全来自 target。本单固定 4MiB key，把**客户端 submit chunk** 设为 4MiB/2MiB/1MiB/512KiB/256KiB/128KiB，E0/E1 各 2 遍 ABBA + 4MiB 漂移锚点（共 26 遍），null bdev、400 keys、diag-on；每尺寸给 **target 拆解表 + 端到端拆解表**，客户端表加 `target_us`、`read_us−target_us`（仅 N=1 可解释为网络+框架）、`N`、`read_us−N×target_us`。**NOF-154 已取消（trace env 撤回）**。不改码/不重启 target/etcd/不写 SSD；null bdev/master 清理。预计 25–40 分钟。其他：正式结果仍 NOF-127（P50 1.034×）；后续 E0/E1 对比必须 target final dump 按 EID + 客户端按 EID 两表齐全。
+- 当前任务：**NOF-155 完成（2026-11-28，拆包梯度 E0/E1）· 待裁定**。结果：26/26 遍、failed=0、拆包自证 100%；**target 单 IO 随拆细下降**（E0 88.6→37.5µs、E1 33.4→26.9µs；E0−E1 差 55.2→10.6µs，仍几乎全是 push JFC），**但每 key target 串行累加暴涨**（E0 88.6→1200.8µs、E1 33.4→861.5µs），**端到端 P50 不降反升**（E0 231.7→258.5、E1 181.2→241.1；ΔP50 50.5→17.4）。4M–256K E1 优势稳定 46.8–57.2µs，128K 收窄到 17.4µs；128K·E1 单 IO 从 17.7 回升到 26.9µs（未验证）。**结论：拆细不是 T1 优化；正式 128KiB/32 IO 正落在端到端最差一端；建议下一单反过来验证“放大 chunk”**（真实 vsegment，2MiB chunk vs 128KiB，先 400-key 探针；vsegment 是否认 `MC_NOF_SUBMIT_CHUNK_BYTES` 未测）。报告：`第四阶段_node234/NOF155_拆包梯度_E0E1_2026-11-28.md`。**NOF-154 已取消（trace env 撤回）**。正式结果仍 NOF-127（P50 1.034×）；后续 E0/E1 对比必须 target final dump 按 EID + 客户端按 EID 两表齐全。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -11329,3 +11329,39 @@ P1 --①1.8--> P2 --②139.9 [drain 121.0]--> P3 --③11.0--> P4 --④5.3--> P5(
 
 - 不改码/不重编/不重启 target/etcd；不写 SSD；保留 vseg；null bdev/master 测试后清理。
 - 预计 25–40 分钟（26 遍 × 400 keys + 日志对齐）。
+
+---
+
+# NOF-155 完成（2026-11-28 · 拆包梯度 E0/E1 · **拆细无端到端收益**）
+
+## 结果
+
+- **26/26 遍 failed=0**；拆包自证 100%：`sub_ios=N`、`blocks=chunk/512`、`read_ops=528·N`；target n=531/1059/≈2113/4227/8451/16897（比 528·N 多 1–3，warmup 尾巴）。
+- **target 单 IO**：E0 **88.6→37.5µs（−58%）**，E1 **33.4→26.9µs（−19%）**；E0−E1 差 **55.2→10.6µs（−81%）**，逐档与 push JFC 差重合（55.2/55.4、41.2/41.3、34.8/34.7、29.5/29.6、22.7/22.5、10.6/10.2）。
+- **每 key target 串行累加（N×单IO）**：E0 **88.6→1200.8µs（13.6×）**，E1 **33.4→861.5µs（25.8×）**。
+- **端到端 P50**：E0 **231.7→258.5µs（+27）**，E1 **181.2→241.1µs（+60）**；256K E0 289.1 为峰值。**没有一档比 4M 更快**。
+- **E1 相对 E0 的 P50 优势**：4M 50.5 / 2M 51.5 / 1M 53.3 / 512K 46.8 / 256K 57.2 / 128K **17.4**（µs）。
+- **res = read − N×单IO**：4M +42/+50 → 128K **−1023.8/−721.0** ⇒ IO 在 4 qpair 上深度重叠，target 串行账未落到墙钟；`read_us−target_us` 在 N>1 时不是纯网络。
+- **push 占比**：4M/2M 93–98%；1M 89–96%；512K 83–94%；256K 76–89%；128K 80–84%。回执“93–98%”只对 4M/2M 成立。
+- **128K·E1 单 IO 回升**：17.7→26.9µs（push 13.5→21.4、W9 3.6→5.0），E0 仍 40.4→37.5；原因未验证。
+
+## 偏差
+
+- 客户端 P50 漂移：4M·E0 锚点 seq1 266.49 vs seq25 215.44（~51µs/19%），target 同臂均 88.6 ⇒ 漂移在客户端/系统；尺寸间比较置信度低，尺寸内 ABBA 较稳。
+- 400 keys、diag-on、null bdev：绝对值不与正式 60k/diag-off/SSD 表相减；diag-on 膨胀 12–14%。
+- 解析两次修正：客户端逐 key 日志在 node2 `run/nof155_read_*.log`（scp 26 份/95M）；`nof155_b_rounds.csv` 初版列错位（`grep -oE` 把 `P50:` 的 50 匹配进去），已用 `.out` 摘要重取，原日志未改。
+- target 统计块无 EID 标签；按每遍 `---- 新连接进入 ----` final dump 对齐。
+
+## 判决
+
+- **拆细不是 T1 时延优化**：target 单 IO 降，但每 key 端到端不降反升；正式 128KiB/32 IO 正落在端到端最差一端。
+- `read_us−target_us` 仅 N=1 可近似为“网络+框架”；N>1 必须同时看 `N` 与 `res`，负 res=重叠。
+- **建议下一单反过来验证“放大 chunk”**：真实 vsegment 路径，`MC_NOF_SUBMIT_CHUNK_BYTES=2MiB`（每 2MiB child 1 IO）vs 128KiB，E1/E0，先 400-key 探针；vsegment child 是否认该 env 未测（旧 NOF-015 认为固定 128KiB）。target JFC 旋钮需重启，暂不动。
+
+## 报告
+
+- `第四阶段_node234/NOF155_拆包梯度_E0E1_2026-11-28.md`（每尺寸 target 表 + 端到端表、结构图、汇总）。
+
+## 环境末态
+
+- plain_nof155 master 3057292 已退出、:50057 不监听；Null155 bdev/subsystem 已删；etcd 2822942、target B 2824683、vseg master 2828887/2828890 存活；Keys=60000、enabled=1、dbSize 2,048,806,912B 未变；未写 SSD。
