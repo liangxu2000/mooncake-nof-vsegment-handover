@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-157（128K query 差复现重跑 · E0/E1 · 2026-11-28）**。背景：NOF-155/156 在 128K 看到 query E0 69/76（两遍都低）、E1 94/82；query=Master RPC、EID 不作用于它，但用户要求重跑复核。本单：128K E0/E1 各 3 遍（顺序 E0→E1→E1→E0→E0→E1）+ 4M E0/E1 前后各 1 遍锚点（共 10 遍）；**60,000 keys**、null bdev（512GiB）、diag-on、target EID0；验证 ① E0 3 遍是否都<80（复现）、② E1 是否仍漂移、③ 4M 前后锚点能否解释、④ target 128K E1 t/IO 回升是否复现。**结果另写 `NOF157_128K_query_复现_2026-11-28.md`**；不改码/不重启 target/etcd/不写 SSD；null bdev/master 清理；预计 40–60 分钟。NOF-155 结论不变：拆细不是 T1 优化；正式 128KiB/32 IO 在偏差端。**“放大 chunk”顺延 NOF-158（未下发）**。正式结果仍 NOF-127（P50 1.034×）。
+- 当前任务：**NOF-157 完成（2026-11-28，128K query 差复现 · 60,000 keys）· 待裁定下一步**。结果：10 遍 failed=0；**128K query E0 88/85/84（中位 85）、E1 86/82/83（中位 83），Δ+2.0µs ⇒ NOF-155/156 的 E0 低值（69/76）在 60k 下不复现，query 无稳定臂间差**；4M 前后锚点 query 漂移 +1.0/+0.0µs。**target 128K E1 仍更快：38.9 vs 29.4µs/IO（Δ9.5），P50 277.2 vs 234.7（Δ42.5）、read 181/141（Δ40.0）⇒ 400-key 的“128K E1 优势掉到 17.4µs”是 query 污染，作废；128K E1 实际仍快 42.5µs**。拆细仍不改善端到端（128K 比 4M 慢：E0 277.2 vs ~237.9、E1 234.7 vs ~177.9）。数据质量：5 遍 key 明细少 3–58 行（<0.1%），target n/read_ops 完整，**接受并标注、不重跑**。报告：`第四阶段_node234/NOF157_128K_query_复现_2026-11-28.md`；NOF-155 报告已按此更新。**下一步 NOF-158（未下发）：真实 vsegment 验证“放大 chunk”（2MiB vs 128KiB）**。正式结果仍 NOF-127（P50 1.034×）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -11508,3 +11508,40 @@ P1 --①1.8--> P2 --②139.9 [drain 121.0]--> P3 --③11.0--> P4 --④5.3--> P5(
 
 - 不改码/不重编/不重启 target/etcd/不写 SSD；保留 vseg；null bdev/master 测试后清理。
 - 预计 40–60 分钟（60k×10 遍 + 日志与 target 对齐）；若单遍 128K 日志 >1GB 或 target 对齐失败 ⇒ 停手回报。
+
+---
+
+# NOF-157 完成（2026-11-28 · 60k keys · **128K E0 query 低不复现；E1 数据面优势成立**）
+
+## 结果
+
+- **10/10 遍 failed=0**；60,000 keys、每遍 60,128 读；128K `sub_ios=32/blocks=256`、read_ops=1,924,098；4M `sub_ios=1/blocks=8192`、read_ops=60,130。
+- **128K query**：
+
+| 臂 | 3 遍 query | 中位 | P50 3 遍 | 中位 | read 中位 | target t/IO 3 遍 | 中位 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| E0 | 88.0/85.0/84.0 | **85.0** | 294.3/277.2/264.8 | **277.2** | **181.0** | 37.7/39.3/38.9 | **38.9** |
+| E1 | 86.0/82.0/83.0 | **83.0** | 244.1/223.9/234.7 | **234.7** | **141.0** | 25.7/29.6/29.4 | **29.4** |
+| Δ(E0−E1) | +2.0 | — | +42.5 | — | +40.0 | +9.5 | — |
+
+- **4M 前后锚点**：query E0 89→90（+1.0）、E1 90→90（0.0）；P50 E0 235.7→240.1（+4.4）、E1 175.3→180.4（+5.1）；target E0 89.1/89.0、E1 33.8/33.8。窗口极稳。
+- **target 128K E1 更快复现**：38.9 vs 29.4µs/IO；push JFC 中位 32.4 vs 23.0；W9 均 5.9。
+- **判决**：
+  - NOF-155/156 的 128K E0 query 低（69/76）在 60k 下**不复现**（88/85/84，全部 ≥84）；E1 的 94/82 漂移也消失（86/82/83，极差 4µs）；**query 无稳定臂间差**（Δ+2.0）。
+  - NOF-155 的「128K E1 优势掉到 17.4µs」**作废**：60k 下 P50 差 **42.5µs**，query 仅 +2.0，read 差 40.0，target t/IO 差 9.5（push JFC）。
+  - 拆细仍不改善端到端：128K 比 4M 慢（E0 277.2 vs ~237.9；E1 234.7 vs ~177.9）。
+- **数据质量**：5 遍 key 明细少 3–58 行（0.005–0.096%），target n/read_ops 完整，failed=0；**接受并标注，不重跑**。每遍 1 个 ~28ms query 离群（q_max 28,036–28,919µs），中位不受影响、Avg 被抬高，以 P50/中位为准。
+
+## 建场修正
+
+- 第一轮沿用 1600MB null bdev 写 400 keys：容量无余量导致 1 个写失败、Keys 399→358（allocated=358×4MiB）；重建 512GiB 后写 60k：Keys=60000、evicted=0、write_ops=60000、write_bytes=251,658,240,000。第一轮数据废弃。
+
+## 环境末态
+
+- plain_nof157 master 3080751 已退出、:50057 不监听；Null157 bdev/subsystem 已删；etcd 2822942、target B 2824683、vseg master 2828887/2828890 存活；Keys=60000、enabled=1、dbSize 2,048,806,912B 未变；未写 SSD。
+- node2 他人 `/home/ql/3rd/http-metadata-server -addr :18080` 常驻，与 8087 不冲突，未动。
+
+## 报告与下一步
+
+- 报告：`第四阶段_node234/NOF157_128K_query_复现_2026-11-28.md`；NOF-155 报告 5.4/5.4.1/6.1/8.3 已更新。
+- **NOF-158（未下发）**：真实 vsegment 验证“放大 chunk”（`MC_NOF_SUBMIT_CHUNK_BYTES=2MiB` vs 128KiB，E1/E0，先 400-key 探针；vsegment child 是否认 env 未测）。
