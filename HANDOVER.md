@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-151（回退第一刀 + 只读排查 diag 行不全 vs P50 · 2026-11-27）**。背景：NOF-150 第一刀**无收益且破坏打点语义**——清场后旧二进制完整遍基线 P50 **374.27 / 376.80 / 380.05（spread 1.5%）**；新二进制 ABBA 平衡块 **379.66 vs 366.29（新慢 3.6%）**，正向配对 3/3 偏新、反向 2/2 偏旧，**5/5 对“后跑更快”⇒ 顺序效应**；新补丁把 `get_begin` 移到全部 ready 之后，①变负、get_block=0、④失效。**裁定：回退新二进制/源码到旧（bb4a07a3）**；第一刀方向暂停。另发现 **diag 行不全的遍 P50 更低（270–321）vs 完整遍 374–388**，影响所有 diag-on 数据可比性；先只读排查行数不全原因（采样/日志截断/退出 flush/磁盘），再决定基线。未来 A/B 强制 **ABBA + 每臂 ≥2 遍完整行**。不改 target/etcd、不写；预计 10–15 分钟。
+- 当前任务：**NOF-152（plain NoF + bdev_null · 4MiB 单包 E0/E1 · 2026-11-27）**。背景：第一刀（NOF-150）无收益且破坏打点语义，已决定回退；**NOF-151 取消/并入本单，回退作为第 0 步**；diag 行不全的数据质量另单。**目标**：plain NoF（不开 vsegment）+ target null bdev（不碰 SSD）+ 客户端 `MC_NOF_SUBMIT_CHUNK_BYTES=4MiB` + `SPDK_URMA_MAX_IO_SIZE=8MiB`，T1 单并发读 400 keys，E0/E1 各 3 遍，确认每个 key 是否为**一个 4MiB IO**（target IO 计数 ~400，而不是 12,800），并测 4MiB 单包时延/带宽。**预检**：target 是否支持 `bdev_null`/`-Z`、能否不重启现有 target/etcd 添加 null bdev namespace、JFC 是否可取；若需重启 target/etcd ⇒ 停手回报，不在本单重启。**边界**：先回退 NOF-150 旧 bench/source（bb4a07a3）；不改码/不写 SSD/不重启 target/etcd；null bdev 不可用即停，不回退到 SSD；预计 20–30 分钟。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -11086,3 +11086,51 @@ P1 --①1.8--> P2 --②139.9 [drain 121.0]--> P3 --③11.0--> P4 --④5.3--> P5(
 
 - 只回退二进制/源码；不改 target/etcd、不写数据；只读日志；不跑 bench（除非另单批准）。
 - 预计 **10–15 分钟**。
+
+---
+
+## NOF-151 取消/并入 NOF-152（2026-11-27）
+
+- 用户改为先做 **plain NoF + bdev_null 的 4MiB 单包实验**；NOF-151 的回退部分并入 NOF-152 第 0 步；diag 行不全的数据质量另单（NOF-153 待定）。
+- 如 NOF-151 已启动，停掉；不改环境。
+
+---
+
+# NOF-152（待执行 · plain NoF + bdev_null · 4MiB 单包 E0/E1 · 2026-11-27）
+
+## 目标
+
+- plain NoF（**不开 vsegment**），target 用 **null bdev / -Z**（不碰 SSD），客户端设 `MC_NOF_SUBMIT_CHUNK_BYTES=4MiB`，让一个 4MiB key 成为一个 4MiB IO。
+- T1 单并发、400 keys，E0/E1 各 3 遍；确认 target IO 计数 **~400**（而不是 12,800），测 4MiB 单包时延/带宽。
+- 单并发诊断；不写正式表。
+
+## 0. 回退 NOF-150
+
+- 用 `stress_cluster_bench.nof150_old` 覆盖当前 `stress_cluster_bench`；核对旧 md5 **bb4a07a3…**、size 480,981,376B。
+- 回退 `transfer_task.cpp` 补丁（移除 `#include <thread>` 与 2456-2466 轮询块）；记录改前/后 md5；不重启 target/etcd。
+
+## A. 预检（能不动环境就不动）
+
+1. target B/A 是否支持 `bdev_null`（`rpc.py bdev_null_create` / `bdev_get_bdevs`）与 `-Z`；能否**不停止/不重启现有 target/etcd**，用现有 target 的 RPC 添加 null bdev namespace，或在**备用端口**起一个独立的 null-bdev target。**若必须重启现有 target/etcd ⇒ 停手回报，不在本单重启。**
+2. 记录 target `max_io_size`；确认旧 bench 支持 `MC_NOF_SUBMIT_CHUNK_BYTES` 与 `SPDK_URMA_MAX_IO_SIZE`。
+3. JFC：确认 target URMA JFC/时间戳怎么取；若只有计数，如实说明。
+4. 若 null bdev 无法在不重启现有 target/etcd 的前提下使用 ⇒ 停手；**不回退到 SSD**。
+
+## B. 搭建 plain NoF（仅 A 通过后）
+
+- 用 null bdev namespace / 独立 null-bdev target（备用端口、唯一 NQN）；注册 plain NoF segment；新 plain cluster `plain_nof152`（**不动现有 vseg master/target/etcd**；若必须停 vseg master 才能起新 master，停手回报）。
+- 写 400 keys（null bdev，verify=false），Keys=400；写失败即停。
+- 若搭建失败，停手；不写 SSD、不重启 target。
+
+## C. E0/E1 4MiB 单包测试
+
+- bench env：`MC_NOF_SUBMIT_CHUNK_BYTES=4194304`、`SPDK_URMA_MAX_IO_SIZE=8388608`；E0→E1→E0→E1→E0→E1（各 3 遍）；T1/batch1、400 keys、warmup128、qpairs4、verify=false、diag 关；target 保持 EID0。
+- 记录 P50/Avg/P90/P99、failed、target IO 计数、JFC、W9。
+- **验证是否一个 4MiB IO**：400 keys 应为 ~400 个 target IO（加 warmup 略多）；若 ~12,800（32×400），说明 chunk/transport/target 仍在切，报告实际层。
+- 给 E0/E1 对照：4MiB 单包时延/带宽；不写正式表。
+
+## D. 边界
+
+- 除回退外不改码；不重启 target/etcd；不写 SSD；保留现有 vseg 数据；若搭建必须重启现有 target/etcd ⇒ 停手回报。
+- 环境末态记录 master/targets；旧 bench 保留；无残留。
+- 预计 **20–30 分钟**。

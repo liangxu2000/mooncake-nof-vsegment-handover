@@ -70,7 +70,7 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 | master | **`plain_nof135p` 2509048/2509051 运行中**：Keys=60000（当前 plain 基线，先保留） |
 | etcd | 2455814；`--max-request-bytes=67108864`；dbSize 1931.57MiB、raftIndex 2,261,561 |
 | node2 | 无 bench/register 残留；客户端 md5 bb4a07a3…（未重编） |
-| 当前任务 | **NOF-151（回退第一刀二进制/源码 + 只读排查 diag 行不全 vs P50）**；新 bench 8b6d2f9d、旧 bb4a07a3 备份；vseg_nof145v2 运行 |
+| 当前任务 | **NOF-152（plain NoF + bdev_null · 4MiB 单包 E0/E1；先回退第一刀）**；vseg_nof145v2 保留；null bdev 不能动现有 target/etcd |
 | 风险 | node4 非独占：外部用户 `computin` 16:20–16:50 多次登录；本次重建后未被清；若再次清场/资源争用，停手回报 |
 
 ---
