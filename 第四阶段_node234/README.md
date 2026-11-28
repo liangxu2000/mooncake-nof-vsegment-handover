@@ -70,7 +70,7 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 | master | **`plain_nof135p` 2509048/2509051 运行中**：Keys=60000（当前 plain 基线，先保留） |
 | etcd | 2455814；`--max-request-bytes=67108864`；dbSize 1931.57MiB、raftIndex 2,261,561 |
 | node2 | 无 bench/register 残留；客户端 md5 bb4a07a3…（未重编） |
-| 当前任务 | **NOF-154（URMA completion push E0/E1 机制取证 · 只读）**；target E0 88.6 / E1 33.4µs，push JFC 差 55.2µs；加 Trace 臂 `SPDK_URMA_STAGE_TRACE_US=100` + `SPDK_URMA_TRACE=1`（先 strings 核对，仅客户端）；vseg 保留 |
+| 当前任务 | **NOF-155（拆包梯度 E0/E1 · plain NoF + null bdev）**；4MiB/2MiB/1MiB/512KiB/256KiB/128KiB × E0/E1，各 2 遍 ABBA + 4MiB 锚点；每尺寸 target 表 + 端到端表，加 `target_us`/`read_us−target_us`/`N`/`read_us−N×target_us`；vseg 保留 |
 | 风险 | node4 非独占：外部用户 `computin` 16:20–16:50 多次登录；本次重建后未被清；若再次清场/资源争用，停手回报 |
 
 ---

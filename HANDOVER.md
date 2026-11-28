@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-154（URMA completion push E0/E1 机制取证 · 只读 · 2026-11-28）**。背景：NOF-153 按 EID 分开后**修正 NOF-152**——target 侧 **E0 TOTAL 88.6µs/IO、E1 33.4µs/IO，差 55.2µs；其中 push JFC wait 差 55.2µs=100%**；客户端 query 两侧均 109µs、wait−drain 残差 22/23µs，**客户端无差**。NOF-152 的“target 33µs”是 **E1 单侧值**，同窗口 E0 一直 ~89µs；E1 的 18% 差额在 **target 侧 URMA completion push**，不是 Mooncake 客户端。本单只读取证：`urma_admin show -d udmac0d1e2` 的 EID/端口/link、client `Selected URMA device ... EID`、target EID/jetty/JFC 映射、`num_jetty_per_ep=1`/`jfc_depth=4096`、poll 行为；必要时复跑 null bdev E0/E1 3 遍取 target final dump，确认 55µs；**另加 Trace 臂**（同事提示）：`SPDK_URMA_STAGE_TRACE_US=100` + `SPDK_URMA_TRACE=1`，先 `strings` 核对两端二进制是否支持，仅客户端进程启用，E0/E1 各 1 遍；100 无输出再试 50/10；target 不重启。**不改码、不重启 target/etcd、不写 SSD**；若 trace/配置必须在 target 侧生效 ⇒ 停手回报。预计 15–30 分钟。其他：正式结果仍 NOF-127（P50 1.034×）；后续 E0/E1 对比必须 target final dump 按 EID + 客户端按 EID 两表齐全。
+- 当前任务：**NOF-155（拆包梯度 E0/E1 · plain NoF + null bdev · 2026-11-28）**。背景：NOF-153 在 4MiB 不拆包下测到 E0 target TOTAL 88.6µs/IO、E1 33.4µs/IO，差 55.2µs 100% 在 push JFC；客户端 query 109/109、read_us 133/77、`read_us−target_us`≈44µs 两侧相同 ⇒ E2E 的 55µs 降幅完全来自 target。本单固定 4MiB key，把**客户端 submit chunk** 设为 4MiB/2MiB/1MiB/512KiB/256KiB/128KiB，E0/E1 各 2 遍 ABBA + 4MiB 漂移锚点（共 26 遍），null bdev、400 keys、diag-on；每尺寸给 **target 拆解表 + 端到端拆解表**，客户端表加 `target_us`、`read_us−target_us`（仅 N=1 可解释为网络+框架）、`N`、`read_us−N×target_us`。**NOF-154 已取消（trace env 撤回）**。不改码/不重启 target/etcd/不写 SSD；null bdev/master 清理。预计 25–40 分钟。其他：正式结果仍 NOF-127（P50 1.034×）；后续 E0/E1 对比必须 target final dump 按 EID + 客户端按 EID 两表齐全。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -11277,39 +11277,55 @@ P1 --①1.8--> P2 --②139.9 [drain 121.0]--> P3 --③11.0--> P4 --④5.3--> P5(
 ## 裁定
 
 - **更正 NOF-152 报告**：target 33µs → E0 88.6 / E1 33.4；差额在 target push JFC，不在客户端。
-- **NOF-154**：只读查 URMA completion push E0/E1 机制；确认是否 UB 侧 EID/口差异。
+- **NOF-154 已取消（2026-11-28，trace env 撤回）；由 NOF-155 拆包梯度实验取代**。
 - **未来 E0/E1 对比规则**：target final dump 按 EID + 客户端按 EID，两表齐全后才出结论。
 
 ---
 
-# NOF-154（待执行 · URMA completion push E0/E1 机制取证 · 只读 · 2026-11-28）
+# NOF-154（已取消 · 2026-11-28 · 由 NOF-155 取代）
+
+> 用户 2026-11-28 撤回 trace env（`SPDK_URMA_STAGE_TRACE_US` / `SPDK_URMA_TRACE` 不加），并改为 NOF-155 拆包梯度实验。本单不执行；EID/jetty/JFC 取证不再单独做。
+
+---
+
+# NOF-155（待执行 · 拆包梯度 E0/E1 · plain NoF + null bdev · 2026-11-28）
 
 ## 目标
 
-- 查清 E0 target push JFC **86.9µs** vs E1 **31.7µs** 的机制：EID0/EID1 对应的 URMA 设备/物理口/jetty/JFC 映射，为什么 completion push 等待差 55µs。
-- 判断这是 **UB/URMA 侧 EID/口差异** 还是 Mooncake/客户端问题；若确认 UB 侧，「E1 更快」不是 Mooncake 能优化的。
-- 只读；不改码、不重启 target/etcd、不写 SSD。
+- 固定 4MiB key，把同一个包按客户端 submit chunk 拆成 **4MiB（不拆）/ 2MiB / 1MiB / 512KiB / 256KiB / 128KiB**；每个尺寸跑 E0、E1。
+- 回答：拆得越细，target 单 IO 的 TOTAL/push JFC 降多少、端到端每 key 的 `read_us` 降多少；target 侧收益是否被“更多 IO 的网络在飞+框架开销”抵消。
+- 400 keys 诊断，不写正式表；4MiB 作为本单**同窗口锚点**。
 
-## A. 取证
+## A. 环境（复用 NOF-153 方法）
 
-1. `urma_admin show -d udmac0d1e2`：EID 0–7 的值、link、端口/plane；确认 EID0/EID1 是否不同物理口。
-2. 客户端日志 `Selected URMA device ... EID index 0/1`；target `eid_index=0`；对照 E0/E1 连接。
-3. target URMA/jetty/JFC 证据：jetty 数、JFC 深度/共享、push C2H 路径、`num_jetty_per_ep=1`、`jfc_depth=4096`；target 日志 `push JFC wait` 行。
-4. 若现有日志不足：用 NOF-153 的 null bdev + 备用端口 plain master 复跑 400 keys E0/E1 各 3 遍，取 target final dump 与客户端 `poll_calls/empty`；不改 target 配置。
-5. 若需要修改 target URMA 配置或重启才能继续 ⇒ 停手列方案，不在本单执行。
-6. **Trace 臂（同事提示，2026-11-28）**：`SPDK_URMA_STAGE_TRACE_US=100` + `SPDK_URMA_TRACE=1`。
-   - 先 precheck：对**客户端 bench 二进制**和**现役 target 二进制**分别 `strings | grep SPDK_URMA_STAGE_TRACE_US` / `SPDK_URMA_TRACE`；记录命中与否（缺失的一侧不得假装打开）。
-   - 命中项只在 **bench 客户端进程** export；target **不重启、不改 env**（现役 target 未带 trace env 起，若 trace 必须在 target 侧生效 ⇒ 停手回报，不重启）。
-   - 用 NOF-153 的 null bdev + 备用端口 plain master，400 keys、chunk=4MiB、diag on，**E0 / E1 各 1 遍**带两个 trace env；若 `STAGE_TRACE_US=100` 无输出，仅客户端重试 50 / 10 两档，target 不动。
-   - 抓：URMA stage trace 行（阶段名 + 耗时）、target push JFC 相关行、客户端 `poll_calls/empty`；与 E0/E1 的 55µs 对齐判读。
+- 运行时在 target B 创建 `Null155` bdev + null155 subsystem/listener（不重启 target/etcd）；备用端口独立 plain master（50057/9007/8087，非 HA/非 oplog，cluster `plain_nof155`）；注册 null NoF segment；写 400 keys，Keys=400。
+- 保留 vseg master/target/etcd；不写 SSD；null bdev 不可用即停；若需重启 target/etcd ⇒ 停手回报。
+- **本单“拆包单位”=`MC_NOF_SUBMIT_CHUNK_BYTES`（plain NoF 客户端 submit chunk），不是 vsegment stripe**；vsegment 不参与。
+- **4MiB 锚点必须在本单同窗口重跑**（NOF-153 环境已清理，不能跨会话直接当基线）；NOF-153 的 4MiB 值只作交叉核对。
 
-## B. 判读与交付
+## B. 测试矩阵（每尺寸 E0/E1 各 2 遍，ABBA）
 
-- EID 映射表 + E0/E1 target TOTAL/push JFC/W9 + 客户端 poll；明确 55µs 是 UB 侧还是客户端/URMA provider。
-- Trace 结果按「阶段名 → E0 耗时 / E1 耗时 → 是否解释 55µs」单列；trace 缺哪一侧、哪一档阈值无输出，都要写明。
-- 若确认 UB 侧 EID/口差异：结论「E1 是部署/URMA 侧旋钮，不是 Mooncake 可优化项」；给后续是否值得做 target EID/配置试验的建议（另单、需重启）。
-- 若证据不足：列缺口，不猜。
+- 尺寸（字节）：`4194304 / 2097152 / 1048576 / 524288 / 262144 / 131072`。
+- 每尺寸顺序：`E0 → E1 → E1 → E0`（2 遍/臂，平衡“后跑者更快”）；尺寸顺序 4M→2M→1M→512K→256K→128K；末尾再补 4M `E0 → E1` 各 1 遍作漂移锚点（共 26 遍）。
+- 每遍独立 bench 进程；env：`MC_NOF_SUBMIT_CHUNK_BYTES=<size>`、`SPDK_URMA_MAX_IO_SIZE=8388608`、`MC_STORE_TRANSFER_DIAG=1`、`MC_NOF_SLOW_TRACE_THRESHOLD_US=1`、`SPDK_URMA_EID_INDEX=0/1`；target EID0 不动。
+- 参数：T1/batch1、400 keys、warmup128、qpairs4、verify=false、diag-on。
+- **每遍验证拆包生效**：客户端 params 的 `blocks` = size/512（4M 8192、2M 4096、1M 2048、512K 1024、256K 512、128K 256）；target n / read_ops 对应倍数（4M≈1、2M≈2、1M≈4、512K≈8、256K≈16、128K≈32）；不符即停手说明。
+- 每遍 failed=0；`get_into_breakdown` 至少 400 条 measured（warmup 128 另计）；行数不全标记并补跑，不混用。
+- target 统计**按 EID 分开**：每遍按 `---- 新连接进入 ----` 后的 final dump 对齐；记录 n/TOTAL/push JFC/W9/parse/post/rsp，生成 `size,eid,pass,...` CSV；对齐失败停手说明，不得用未标 EID 的块代替。
 
-## C. 边界
+## C. 交付（每个尺寸两张表）
 
-- 只读/现有日志优先；不改码/不重启 target/etcd/不写 SSD；null bdev/master 测试后清理；trace env 只加在客户端进程，不写系统 env；预计 15–30 分钟。
+每个尺寸给 **target 拆解表** + **端到端拆解表**，格式参照 `第四阶段_node234/E0_E1_关键结果_2026-11-27.md`（E0/E1 两列 + 差）。
+
+1. **target 表**（µs/IO，中位）：TOTAL、push JFC wait、W9、parse、post WR、send rsp、n/遍、`N=IO/key`。
+2. **端到端表**（µs/key，中位）：query、prepare、submit、completion_wait、read_unattributed、read_us、total_us、task total、drain、max_subio、poll_calls；另加：
+   - `target_us`：同尺寸/EID 的 target TOTAL/IO（**均值**，target dump 只有均值，标注）；
+   - `read_us − target_us`：用户口径“网络在飞+框架开销”，**仅 N=1 时可这样解释**；
+   - `N` 与 `read_us − N×target_us`：N>1 时扣除 target 串行账的余量（**可为负，负值=IO 在 target 侧重叠**）。
+3. **汇总表**：尺寸 × [E0 target TOTAL、E1 target TOTAL、Δtarget；E0 read_us、E1 read_us、Δread；E0/E1 的 `read_us−target_us`]；直接看 target 收益与端到端收益是否同步缩小。
+4. **结构图 + 判读**：回答“拆得越细，target 侧降多少、端到端降多少、差额是否被更多 IO 的框架/网络开销吃掉”；证据不足列缺口，不猜。
+
+## D. 边界
+
+- 不改码/不重编/不重启 target/etcd；不写 SSD；保留 vseg；null bdev/master 测试后清理。
+- 预计 25–40 分钟（26 遍 × 400 keys + 日志对齐）。
