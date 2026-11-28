@@ -70,7 +70,7 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 | master | **`plain_nof135p` 2509048/2509051 运行中**：Keys=60000（当前 plain 基线，先保留） |
 | etcd | 2455814；`--max-request-bytes=67108864`；dbSize 1931.57MiB、raftIndex 2,261,561 |
 | node2 | 无 bench/register 残留；客户端 md5 bb4a07a3…（未重编） |
-| 当前任务 | **NOF-158（60k 全梯度重跑）**：4M/2M/1M/512K/256K/128K × E0/E1，26 遍；Null158/segment 512GiB、写 60k；每尺寸 target 表 + 端到端表，格式照 NOF-155；结果另写 `NOF158_60k全梯度_E0E1_2026-11-28.md`；NOF-159 放大 chunk 未下发 |
+| 当前任务 | **NOF-158 完成（60k 全梯度）**：5/6 尺寸复现 400-key；target E0 88.7→38.0µs、keyTg 89→1217、P50 238→279（无净收益）；**512K E1 例外**（60k 49.0 vs 400k 16.5，Δ1.2）；**6/26 遍 SLOW**，E1 也可中招；报告 `NOF158_60k全梯度_E0E1_2026-11-28.md`；下一步 NOF-159 放大 chunk（未下发） |
 | 风险 | node4 非独占：外部用户 `computin` 16:20–16:50 多次登录；本次重建后未被清；若再次清场/资源争用，停手回报 |
 
 ---
