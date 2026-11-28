@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-158 完成（2026-11-28，60k 全梯度重跑）· 待裁定下一步**。结果：26/26 failed=0、60k keys、拆包自证 100%；**5/6 尺寸复现 400-key 趋势**：target 单 IO E0 **88.7→38.0µs（−57%）**、每 key 串行累加 **88.7→1217µs（13.7×）**、端到端 P50 E0 **238→279µs**、E1 **176→230µs**（无净收益）。**E1 P50 优势**：4M +61.7 / 2M +37.7 / 1M +61.0 / **512K +15.8** / 256K +53.5 / 128K +49.2µs；128K 与 NOF-157 的 +42.5 同量级，400-key 17.4 作废。**唯一例外 512K**：60k E1 target **49.0µs**（400-key 16.5，两遍 48.9/49.1），Δ(E0−E1) 从 +29.5 塌到 **+1.2**，原因未验证，512K 不作 E1 收益代表点。**6/26 遍（23%）target push 慢化**（1.9–2.3×，客户端同步变慢，已核对 n）；主表剔除 SLOW + 含 SLOW 敏感性双给；**seq26 E1 慢到 88.6µs ⇒ 快/慢不是 EID 固有属性**，NOF-153 的 E0/E1 差只在正常窗口成立。报告：`第四阶段_node234/NOF158_60k全梯度_E0E1_2026-11-28.md`（每尺寸 target 表 + 端到端表）。**下一步 NOF-159（未下发）：真实 vsegment 验证“放大 chunk”（2MiB vs 128KiB）**。正式结果仍 NOF-127（P50 1.034×）。
+- 当前任务：**NOF-159（512K/128K 复测 · 60k · E0/E1 · 2026-11-28）**。背景：NOF-158 全梯度里 **512K E1 异常**（60k target 49.0µs、两遍 48.9/49.1；400-key 为 16.5，Δ 从 29.5 塌到 1.2），且 128K E1 的 +49.2µs 需复核；另有 6/26 遍 target push 慢化。本单只测 **512K 和 128K**：60,000 keys、Null159/segment 512GiB、plain NoF + null bdev；每尺寸 E0/E1 **各 3 个正常遍**（SLOW 不计、同臂补跑到 3 个），4M E0/E1 前后锚点（各 1 遍）用于慢化状态判断；T1/warmup128/qpairs4/diag-on、`SPDK_URMA_STAGE_TRACE_US=0`；target EID0。结果另写 `NOF159_512K_128K_复测_2026-11-28.md`。不改码/不重启 target/etcd/不写 SSD；null bdev/master 清理；预计 25–40 分钟。**“放大 chunk”顺延 NOF-160（未下发）**。正式结果仍 NOF-127（P50 1.034×）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -11636,5 +11636,59 @@ P1 --①1.8--> P2 --②139.9 [drain 121.0]--> P3 --③11.0--> P4 --④5.3--> P5(
 ## 报告与下一步
 
 - 报告：`第四阶段_node234/NOF158_60k全梯度_E0E1_2026-11-28.md`（每尺寸 target 表 + 端到端表）。
-- **NOF-159（未下发）**：真实 vsegment 验证“放大 chunk”（`MC_NOF_SUBMIT_CHUNK_BYTES=2MiB` vs 128KiB，E1/E0，先 400-key 探针；vsegment child 是否认 env 未测）。
-- 512K·E1 异常与慢化根因待裁定；target JFC 调参需重启，暂不做。
+- **NOF-159（当前）**：512K/128K 复测（60k、E0/E1 各 3 个正常遍、4M 前后锚点）。
+- **NOF-160（未下发）**：真实 vsegment 验证“放大 chunk”（`MC_NOF_SUBMIT_CHUNK_BYTES=2MiB` vs 128KiB，E1/E0，先 400-key 探针；vsegment child 是否认 env 未测）。
+- 512K·E1 异常与慢化根因待 NOF-159；target JFC 调参需重启，暂不做。
+
+---
+
+# NOF-159（待执行 · 512K/128K 复测 · 60k · E0/E1 · 2026-11-28）
+
+## 目标
+
+- 复核 **512K E1 异常**：NOF-158 60k 下 E1 target 49.0µs（两遍 48.9/49.1），400-key 为 16.5µs；用 **3 个正常遍**确认它是真实尺寸效应还是 NOF-158 的时段状态。
+- 复核 **128K**：确认 E1 target ~27–29 vs E0 ~38–39、P50 差 ~42–49µs 是否稳定。
+- 处理慢化：每臂必须有 **3 个非 SLOW 正常遍**；SLOW 遍不计入中位，同尺寸/EID 补跑；4M E0/E1 前后锚点用于判断窗口是否处于慢化状态。
+- 结果另写 md（开发侧写）：`NOF159_512K_128K_复测_2026-11-28.md`。
+
+## A. 环境（复用 NOF-158 方法）
+
+- 运行时在 target B 创建 `Null159` bdev + null159 subsystem/listener（不重启 target/etcd）；null bdev **512GiB**，NoF segment **512GiB**；备用端口 plain master 50057/9007/8087（非 HA/非 oplog，cluster `plain_nof159`）。
+- **写 60,000 keys × 4MiB（240GiB）**，用 4M chunk 一次；验收 `write_ops=60000`、`write_bytes=251,658,240,000`、`master_key_count=60000`、`evicted_key_count=0`；不齐即停手。
+- 每遍读取 60,000 measured + 128 warmup = **60,128 keys**。
+- 参数：T1/batch1、qpairs4、verify=false、diag-on（`MC_STORE_TRANSFER_DIAG=1`、`MC_NOF_SLOW_TRACE_THRESHOLD_US=1`）；**`SPDK_URMA_STAGE_TRACE_US=0`**；`SPDK_URMA_MAX_IO_SIZE=8388608`；客户端 `SPDK_URMA_EID_INDEX=0/1`；target EID0 不动。
+- 日志量：`get_into_breakdown`/`nof_slow_task` 各约 60,128 行/遍；确认 node2 余量 ≥20GB；`URMA_SLOW_IO` >100k 行/遍或单遍日志 >2GB ⇒ 停手回报。
+
+## B. 测试矩阵（16 遍基线 + SLOW 补跑）
+
+| # | chunk | EID | 作用 |
+|---:|---:|---:|---|
+| 1 | 4M | E0 | 前锚点 |
+| 2 | 4M | E1 | 前锚点 |
+| 3–8 | 512K | E0,E1,E1,E0,E0,E1 | 3 遍/臂，ABBA |
+| 9–14 | 128K | E0,E1,E1,E0,E0,E1 | 3 遍/臂，ABBA |
+| 15 | 4M | E1 | 后锚点 |
+| 16 | 4M | E0 | 后锚点 |
+
+- 每遍独立 bench 进程；`MC_NOF_SUBMIT_CHUNK_BYTES` = 4M/512K/128K；其余同上。
+- **SLOW 规则**：与 NOF-158 相同（target push 升至正常 1.9–2.3×、客户端 wait/read/P50 同步升高；逐块核对 target n 排除对齐错误）。SLOW 遍**不计入 3 个正常遍**，在同尺寸/EID 末尾补跑，直到每臂有 3 个正常遍（每臂最多补 2 遍；超过则停手回报）。
+- 每遍验证：512K `sub_ios=8/blocks=1024`、read_ops≈481,026；128K `sub_ios=32/blocks=256`、read_ops≈1,924,098；4M `sub_ios=1/blocks=8192`、read_ops≈60,130；target n≈read_ops（+1–6）；`failed=0`、`Total queries=60000`；`get_into_breakdown` ≥60,000 行（允许 ≤128 行缺失并标注）。
+- target 统计按 EID 分开：每遍按 `---- 新连接进入 ----` 后的 final dump 对齐；记录 n/TOTAL/push JFC/W9；生成 `seq,chunk,eid,pass,slow,...` CSV。
+
+## C. 交付
+
+1. **逐遍表**：seq/chunk/EID、是否 SLOW、target TOTAL/push/W9/n、客户端 query/read/wait/total/P50/Avg、key 行数。
+2. **512K 汇总**：3 个正常遍/臂的 target TOTAL/push/W9、query/read/wait/P50（中位）、Δ(E1−E0)；与 400-key（46.0/16.5，Δ29.5）和 NOF-158（50.2/49.0，Δ1.2）对照。
+3. **128K 汇总**：同上；与 NOF-157（38.9/29.4，P50 277.2/234.7）和 NOF-158（38.0/27.3，P50 278.7/229.5）对照。
+4. **4M 锚点**：前后各 E0/E1 的 target/push/P50；判断窗口是否整体慢化。
+5. **判决（必答）**：
+   - 512K E1 在 3 个正常遍下是 **~49µs（真实异常）** 还是回到 **~16–20µs（NOF-158 时段状态）**？E0 是否仍 ~50µs？
+   - 128K E1 是否仍比 E0 快 42–49µs（P50）？target 是否仍 27–29 vs 38–39？
+   - 4M 锚点是否正常？若锚点也慢，窗口状态不可用，需说明。
+   - 本轮 SLOW 次数/分布；E1 是否再次中招。
+6. 原始 CSV `run/nof159_rounds.csv`、逐遍日志 `run/nof159_read_*.log`、target 片段路径；不改仓库文档。
+
+## D. 边界
+
+- 不改码/不重编/不重启 target/etcd/不写 SSD；保留 vseg；null bdev/master 测试后清理。
+- 预计 25–40 分钟（16 遍基线 + 最多 4 遍补跑；512K ~28s/遍、128K ~36s/遍）。
