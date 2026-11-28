@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-157 完成（2026-11-28，128K query 差复现 · 60,000 keys）· 待裁定下一步**。结果：10 遍 failed=0；**128K query E0 88/85/84（中位 85）、E1 86/82/83（中位 83），Δ+2.0µs ⇒ NOF-155/156 的 E0 低值（69/76）在 60k 下不复现，query 无稳定臂间差**；4M 前后锚点 query 漂移 +1.0/+0.0µs。**target 128K E1 仍更快：38.9 vs 29.4µs/IO（Δ9.5），P50 277.2 vs 234.7（Δ42.5）、read 181/141（Δ40.0）⇒ 400-key 的“128K E1 优势掉到 17.4µs”是 query 污染，作废；128K E1 实际仍快 42.5µs**。拆细仍不改善端到端（128K 比 4M 慢：E0 277.2 vs ~237.9、E1 234.7 vs ~177.9）。数据质量：5 遍 key 明细少 3–58 行（<0.1%），target n/read_ops 完整，**接受并标注、不重跑**。报告：`第四阶段_node234/NOF157_128K_query_复现_2026-11-28.md`；NOF-155 报告已按此更新。**下一步 NOF-158（未下发）：真实 vsegment 验证“放大 chunk”（2MiB vs 128KiB）**。正式结果仍 NOF-127（P50 1.034×）。
+- 当前任务：**NOF-158（60k 全梯度重跑 · 4M/2M/1M/512K/256K/128K × E0/E1 · 2026-11-28）**。背景：NOF-155 的梯度是 400-key，NOF-157 只补了 60k 的 4M/128K；用户要求**全部重跑**并按 `NOF155_拆包梯度_E0E1_2026-11-28.md` 的格式整理。本单：**60,000 keys**、Null158/segment 512GiB、plain NoF + null bdev、写 60k 一次；按 NOF-155 矩阵 26 遍（每尺寸 E0→E1→E1→E0，末尾 4M E0/E1 锚点）；T1/warmup128/qpairs4/diag-on，`SPDK_URMA_STAGE_TRACE_US=0` 关闭逐 IO trace；target EID0。每尺寸给 target 拆解表 + 端到端拆解表（含 `target_us`/`read_us−target_us`/`N`/`res`），另写 `NOF158_60k全梯度_E0E1_2026-11-28.md`。不改码/不重启 target/etcd/不写 SSD；null bdev/master 清理；预计 40–60 分钟。**“放大 chunk”顺延 NOF-159（未下发）**。正式结果仍 NOF-127（P50 1.034×）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -11544,4 +11544,54 @@ P1 --①1.8--> P2 --②139.9 [drain 121.0]--> P3 --③11.0--> P4 --④5.3--> P5(
 ## 报告与下一步
 
 - 报告：`第四阶段_node234/NOF157_128K_query_复现_2026-11-28.md`；NOF-155 报告 5.4/5.4.1/6.1/8.3 已更新。
-- **NOF-158（未下发）**：真实 vsegment 验证“放大 chunk”（`MC_NOF_SUBMIT_CHUNK_BYTES=2MiB` vs 128KiB，E1/E0，先 400-key 探针；vsegment child 是否认 env 未测）。
+- **NOF-158（当前）**：60k 全梯度重跑（4M/2M/1M/512K/256K/128K × E0/E1），按 NOF-155 格式整理。
+- **NOF-159（未下发）**：真实 vsegment 验证“放大 chunk”（`MC_NOF_SUBMIT_CHUNK_BYTES=2MiB` vs 128KiB，E1/E0，先 400-key 探针；vsegment child 是否认 env 未测）。
+
+---
+
+# NOF-158（待执行 · 60k 全梯度重跑 · 4M/2M/1M/512K/256K/128K × E0/E1 · 2026-11-28）
+
+## 目标
+
+- 把 NOF-155 的**全梯度**在 **60,000 keys** 下重跑一遍：4M/2M/1M/512K/256K/128K × E0/E1。
+- 输出格式与 `NOF155_拆包梯度_E0E1_2026-11-28.md` 一致：每个尺寸一张 target 拆解表 + 一张端到端拆解表，另加汇总表/结构图/判读/偏差/环境。
+- 验证 60k 下是否复现 400-key 的趋势：target 单 IO 下降、每 key 串行累加暴涨、端到端不降反升、E1 优势 4M–256K ~47–57µs 与 128K ~42.5µs。
+- 结果另写 md（开发侧写）：`NOF158_60k全梯度_E0E1_2026-11-28.md`；本单不写正式表。
+
+## A. 环境（复用 NOF-157 的 60k 方法）
+
+- 运行时在 target B 创建 `Null158` bdev + null158 subsystem/listener（不重启 target/etcd）；null bdev **512GiB**（≥256GiB），NoF segment **512GiB**；备用端口 plain master 50057/9007/8087（非 HA/非 oplog，cluster `plain_nof158`）。
+- **写 60,000 keys × 4MiB（240GiB）**，用 4M chunk 一次；验收 `write_ops=60000`、`write_bytes=251,658,240,000`、`master_key_count=60000`、`evicted_key_count=0`；不齐即停手。
+- 每遍读取 **60,000 measured + 128 warmup = 60,128 keys**；128K 目标端 IO 约 1,924,096/遍，4M 约 60,128/遍。
+- 保留 vseg master/target/etcd；不写 SSD；null bdev 不可用即停；若需重启 target/etcd ⇒ 停手回报。
+- 参数：T1/batch1、qpairs4、verify=false、diag-on（`MC_STORE_TRANSFER_DIAG=1`、`MC_NOF_SLOW_TRACE_THRESHOLD_US=1`）；**`SPDK_URMA_STAGE_TRACE_US=0` 显式关闭逐 IO trace**；`SPDK_URMA_MAX_IO_SIZE=8388608`；客户端 `SPDK_URMA_EID_INDEX=0/1`；target EID0 不动。
+- 日志量：`get_into_breakdown` 60,128 行/遍、`nof_slow_task` 60,128 行/遍；开始前确认 node2 目标目录余量 ≥20GB；若 `URMA_SLOW_IO` >100k 行/遍或单遍日志 >2GB ⇒ 停手回报，不自行删日志。
+
+## B. 测试矩阵（26 遍，与 NOF-155 相同）
+
+- 尺寸顺序：4M→2M→1M→512K→256K→128K。
+- 每尺寸顺序：`E0 → E1 → E1 → E0`（2 遍/臂，ABBA）。
+- 末尾 4M 锚点：`E0 → E1` 各 1 遍（seq25–26）。
+- 每遍独立 bench 进程，env `MC_NOF_SUBMIT_CHUNK_BYTES` = 对应尺寸。
+- 每遍验证：
+  - `sub_ios=N`、`blocks=chunk/512`；
+  - read_ops ≈ 60,128×N（4M 60,130、2M 120,258、1M 240,514、512K 481,026、256K 962,050、128K 1,924,098）；
+  - target n ≈ read_ops（+1–6）；
+  - `failed=0`、`Total queries=60000`；
+  - `get_into_breakdown` ≥60,000 行（允许 ≤128 行缺失，<0.22%，标注；<60,000 停手/补跑该遍）。
+- target 统计按 EID 分开：每遍按 `---- 新连接进入 ----` 后的 final dump 对齐；记录 n/TOTAL/push JFC/W9/parse/post/rsp；生成 `seq,chunk,eid,pass,...` CSV；对齐失败停手说明。
+
+## C. 交付（按 NOF-155 格式）
+
+1. **每个尺寸两张表**：
+   - target 表（µs/IO，2 遍中位；4M 含锚点 3 遍）：TOTAL、push JFC wait、W9、parse、post WR、send rsp、push 占比、n/遍、N。
+   - 端到端表（µs/key，中位）：query、prepare+unattributed*、submit、completion_wait、read_us、total_us、task total、task drain、task max_subio、P50、Avg、`target_us`（target TOTAL/IO 均值）、`read_us−target_us`、`N`、`res=read−N×target`（可为负）。
+2. **汇总表**：尺寸 × [E0/E1 target t/IO、Δ；E0/E1 keyTg=N×t、Δ；E0/E1 read、Δ；E0/E1 P50、Δ；E0/E1 res]。
+3. **60k vs 400-key 对照**：只比方向/臂间差，不直接相减绝对值；标出 60k 是否复现 400-key 的“target 降、端到端不降/E1 优势”。
+4. **结构图 + 判读**：回答“拆得越细，target 降多少、端到端降多少、差额去哪”；特别确认 128K E1 的 42.5µs 优势是否在其他尺寸/60k 下同量级。
+5. 原始 CSV `run/nof158_rounds.csv`、逐遍日志 `run/nof158_read_*.log`、target 片段路径；不改仓库文档。
+
+## D. 边界
+
+- 不改码/不重编/不重启 target/etcd/不写 SSD；保留 vseg；null bdev/master 测试后清理。
+- 预计 40–60 分钟（26 遍 × 60k + 写 60k + 日志对齐）；单遍日志 >2GB 或 target 对齐失败 ⇒ 停手回报。
