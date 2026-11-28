@@ -70,7 +70,7 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 | master | **`plain_nof135p` 2509048/2509051 运行中**：Keys=60000（当前 plain 基线，先保留） |
 | etcd | 2455814；`--max-request-bytes=67108864`；dbSize 1931.57MiB、raftIndex 2,261,561 |
 | node2 | 无 bench/register 残留；客户端 md5 bb4a07a3…（未重编） |
-| 当前任务 | **NOF-156 完成（不重跑）**：26 份日志各 528 行；128K query E0 69/76 都低、E1 94/82；query=Master RPC，EID 不作用；4M 锚点 102/90/79 说明漂移普遍；raw ΔP50 17.4 含 15.5 query，归一≈33；下一步建议 NOF-157 验证放大 chunk（2MiB vs 128KiB，真实 vsegment），待确认 |
+| 当前任务 | **NOF-157（128K query 差复现重跑）**：128K E0/E1 各 3 遍 + 4M 前后锚点（共 10 遍）；验证 E0 是否 3 遍都<80、E1 是否仍漂移、target 128K E1 t/IO 回升是否复现；结果另写 `NOF157_128K_query_复现_2026-11-28.md`；vseg 保留 |
 | 风险 | node4 非独占：外部用户 `computin` 16:20–16:50 多次登录；本次重建后未被清；若再次清场/资源争用，停手回报 |
 
 ---

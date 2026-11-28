@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-156 完成（2026-11-28，复核 128K query 差）· 决定不重跑**。结果：26 份 `nof155_read_*.log` 各 528 行；**128K query 逐遍 E0 69.0/76.0（两遍都<80，非单遍离群）、E1 94.0/82.0（两遍差 12µs）**；B 段严格触发条件（E0 两遍<80 且 E1 两遍>85）未满足（E1 第二遍 82<85），未重跑。**裁定：不重跑**——query 是 Master RPC、EID 不作用于它；4M·E0 锚点 query 102/90/79（极差 23µs）说明遍间漂移普遍；与 query 无关的 `read_us` 差 36.5µs 已给出数据面结论。128K raw ΔP50 17.4 含 15.5µs query 差，同 query 归一后约 33µs；E0 两遍都低在本窗口成立，但**可复现性 [未验证]**，报告按此表述。**NOF-155 结论不变：拆细不是 T1 优化；正式 128KiB/32 IO 在偏差端。下一步建议 NOF-157 验证“放大 chunk”**（真实 vsegment，2MiB vs 128KiB，E1/E0，400-key 探针；vsegment child 是否认 env 未测），待用户确认后下发。报告 `第四阶段_node234/NOF155_拆包梯度_E0E1_2026-11-28.md`。正式结果仍 NOF-127（P50 1.034×）。
+- 当前任务：**NOF-157（128K query 差复现重跑 · E0/E1 · 2026-11-28）**。背景：NOF-155/156 在 128K 看到 query E0 69/76（两遍都低）、E1 94/82；query=Master RPC、EID 不作用于它，但用户要求重跑复核。本单：128K E0/E1 各 3 遍（顺序 E0→E1→E1→E0→E0→E1）+ 4M E0/E1 前后各 1 遍锚点（共 10 遍）；null bdev、400 keys、diag-on、target EID0；验证 ① E0 3 遍是否都<80（复现）、② E1 是否仍漂移、③ 4M 前后锚点能否解释、④ target 128K E1 t/IO 回升是否复现。**结果另写 `NOF157_128K_query_复现_2026-11-28.md`**；不改码/不重启 target/etcd/不写 SSD；null bdev/master 清理；预计 25–35 分钟。NOF-155 结论不变：拆细不是 T1 优化；正式 128KiB/32 IO 在偏差端。**“放大 chunk”顺延 NOF-158（未下发）**。正式结果仍 NOF-127（P50 1.034×）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -11431,20 +11431,78 @@ P1 --①1.8--> P2 --②139.9 [drain 121.0]--> P3 --③11.0--> P4 --④5.3--> P5(
 - 1M 的 query 反向差（E0 108/99 vs E1 93/89）也是两遍一致，不是单遍造成。
 - **B 段触发条件未满足**：E0 两遍 69/76 均<80，但 E1 为 94（>85）+ 82（<85）；且日志无缺失/行数 528，故未重跑。
 
-## 裁定：不重跑
+## 裁定：当时不重跑（用户 2026-11-28 覆核后要求重跑）
 
 - `query_us` 是 **Master 元数据 RPC**，`SPDK_URMA_EID_INDEX` 只作用于 NoF 数据面，EID 因果上不应改变 query。
 - 4M·E0 锚点 query 三遍 **102/90/79（极差 23µs）** ⇒ query 遍间漂移普遍；再跑 6 遍只会再采一次漂移，不能证明因果。
 - 与 query 无关的 `read_us` 差 **36.5µs** 已给出数据面结论；raw ΔP50 17.4 含 15.5µs query 差，同 query 归一后约 33µs。
-- E0 两遍都低在本窗口成立，但**可复现性 [未验证]**；报告已按“非单遍离群、但不可复现”表述，不再消耗环境。
+- E0 两遍都低在本窗口成立，但**可复现性 [未验证]**；报告已按“非单遍离群、但不可复现”表述。
+- **用户 2026-11-28 覆核：要求重跑复核。NOF-157 = 128K query 复现重跑（本单 B 段）；“放大 chunk”顺延为 NOF-158（未下发）。**
 
 ## 偏差 / 环境
 
 - `[未验证]` 528 行中哪 400 行属 measured；全量 528 与后 400 的 query 差 ≤2µs，不影响判决。
-- `[未验证]` E1 两遍 94/82 的成因；未重跑。
+- `[未验证]` E1 两遍 94/82 的成因；由 NOF-157 重跑复核。
 - 环境零变更：:50057 / plain master / Null156 / null15x subsystem 均 0；etcd 2822942、target B 2824683、vseg master 2828887/2828890 存活；Keys=60000、enabled=1。
 - 产物：`run/nof156_query_per_pass.csv`（27 行）、`run/nof156_query_per_pass.txt`（83 行）。
 
 ## 下一步
 
-- 建议 **NOF-157**：真实 vsegment 路径验证“放大 chunk”——`MC_NOF_SUBMIT_CHUNK_BYTES=2MiB`（每个 2MiB child 1 IO）vs 128KiB，E1/E0，先 400-key 探针；vsegment child 是否认该 env 未测（旧 NOF-015 认为固定 128KiB）。待用户确认后下发。
+- **NOF-157（当前）**：128K query 复现重跑（B 段），结果另写 md。
+- **NOF-158（未下发）**：真实 vsegment 路径验证“放大 chunk”——`MC_NOF_SUBMIT_CHUNK_BYTES=2MiB`（每个 2MiB child 1 IO）vs 128KiB，E1/E0，先 400-key 探针；vsegment child 是否认该 env 未测（旧 NOF-015 认为固定 128KiB）。
+
+---
+
+# NOF-157（待执行 · 128K query 差复现重跑 · E0/E1 · 2026-11-28）
+
+## 目标
+
+- 在**新窗口**复现 NOF-155/156 的 128K query 差：E0 69/76（两遍都低）vs E1 94/82。
+- 同时验证 target 侧 128K·E1 单 IO 回升（17.7→26.9µs）是否复现。
+- 128K E0/E1 各 3 遍；4M E0/E1 在 128K 前后各 1 遍作 query 漂移锚点（共 10 遍）。
+- 结果另写 md（开发侧写）：`NOF157_128K_query_复现_2026-11-28.md`；本单不写正式表。
+
+## A. 环境（复用 NOF-155/156 方法）
+
+- 运行时在 target B 创建 `Null157` bdev + null157 subsystem/listener（不重启 target/etcd）；备用端口 plain master 50057/9007/8087（非 HA/非 oplog，cluster `plain_nof157`）；注册 null NoF segment；写 400 keys，Keys=400。
+- 写数据用 **4M chunk** 一次；读按下面矩阵切 128K/4M。
+- 保留 vseg master/target/etcd；不写 SSD；null bdev 不可用即停；若需重启 target/etcd ⇒ 停手回报。
+- 参数：T1/batch1、400 keys、warmup128、qpairs4、verify=false、diag-on（`MC_STORE_TRANSFER_DIAG=1`、`MC_NOF_SLOW_TRACE_THRESHOLD_US=1`）；`SPDK_URMA_MAX_IO_SIZE=8388608`；客户端 `SPDK_URMA_EID_INDEX=0/1`；target EID0 不动。
+
+## B. 测试矩阵（10 遍，逐遍独立 bench 进程）
+
+顺序（前后 4M 锚点夹住 128K）：
+
+| # | chunk | EID | 作用 |
+|---:|---:|---:|---|
+| 1 | 4M | E0 | 前锚点 |
+| 2 | 4M | E1 | 前锚点 |
+| 3 | 128K | E0 | 主测 |
+| 4 | 128K | E1 | 主测 |
+| 5 | 128K | E1 | 主测 |
+| 6 | 128K | E0 | 主测 |
+| 7 | 128K | E0 | 主测 |
+| 8 | 128K | E1 | 主测 |
+| 9 | 4M | E1 | 后锚点 |
+| 10 | 4M | E0 | 后锚点 |
+
+- 每遍 env：`MC_NOF_SUBMIT_CHUNK_BYTES=4194304` 或 `131072`；其余同上。
+- 每遍验证：128K `sub_ios=32/blocks=256`、read_ops≈16896、target n≈16897；4M `sub_ios=1/blocks=8192`、read_ops≈529、target n≈531；failed=0；`get_into_breakdown` 528 行（400 measured + 128 warmup）；不符即停手说明。
+- target 统计按 EID 分开：每遍按 `---- 新连接进入 ----` 后的 final dump 对齐；记录 n/TOTAL/push JFC/W9/parse/post/rsp；生成 `seq,chunk,eid,pass,...` CSV；对齐失败停手说明。
+
+## C. 交付（给原始表，开发侧写 md）
+
+1. **逐遍表**（10 行）：chunk/EID/seq、query 中位/P25/P75/min/max、read/wait/total 中位、P50、Avg、`get_into_breakdown` 行数；target n/TOTAL/push JFC/W9；128K 标 `N=32`、4M 标 `N=1`。
+2. **128K 汇总**：E0 3 遍、E1 3 遍的 query 中位、P50 中位、read 中位、target t/IO 中位；与 NOF-155/156 的 72.5/88.0、69/76/94/82、target 37.5/26.9 对照。
+3. **4M 锚点**：前/后各 E0/E1 的 query 与 P50；判断窗口内漂移方向/幅度。
+4. **判决**（必答）：
+   - 128K E0 query 是否 3 遍都 <80（复现“E0 低”）？
+   - E1 是 3 遍都高、还是继续 94/82 式漂移？E0/E1 差是否稳定？
+   - 4M 前后锚点的 query 漂移能否解释 128K 的臂间差？
+   - target 128K E1 t/IO 是否仍高于 E0（E1 回升复现）？
+5. 原始 CSV `run/nof157_rounds.csv`、日志 `run/nof157_read_*.log`、target 片段路径；不改仓库文档。
+
+## D. 边界
+
+- 不改码/不重编/不重启 target/etcd/不写 SSD；保留 vseg；null bdev/master 测试后清理。
+- 预计 25–35 分钟（10 遍 × 400 keys + 日志对齐）。
