@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-156（复核 NOF-155 的 128K query 差 · 只读回读 + 条件重跑 · 2026-11-28）**。背景：NOF-155 的 128K（N=32）**query E0 72.5 vs E1 88.0µs（差 15.5µs）**；E0 72.5 是 12 个臂最低、E1 88 正常；query=Master RPC，EID 不作用于它；raw ΔP50 17.4 含此差，同 query 归一后约 33µs。本单：① 从 26 份 `run/nof155_read_*.log` 逐遍提取 query 中位/P25/P75/min/max 与行数（重点 128K seq21–24、1M seq9–12），判断 72.5 是单遍离群还是 E0 两遍都低；② **仅当**“128K E0 两遍都<80 且 E1 两遍都>85”或日志缺失/行数不足时，重跑 128K E0/E1 各 3 遍 ABBA + 4M 锚点（null bdev/400 keys/diag-on），验证 query 差是否复现；否则只回读不重跑。不改码/不重启 target/etcd/不写 SSD；null bdev/master 清理。预计 10–15 分钟（回读）/25–35 分钟（含重跑）。NOF-155 结论仍：**拆细不是 T1 优化；正式 128KiB/32 IO 在偏差端；建议下一单验证放大 chunk**。报告 `第四阶段_node234/NOF155_拆包梯度_E0E1_2026-11-28.md`。正式结果仍 NOF-127（P50 1.034×）。
+- 当前任务：**NOF-156 完成（2026-11-28，复核 128K query 差）· 决定不重跑**。结果：26 份 `nof155_read_*.log` 各 528 行；**128K query 逐遍 E0 69.0/76.0（两遍都<80，非单遍离群）、E1 94.0/82.0（两遍差 12µs）**；B 段严格触发条件（E0 两遍<80 且 E1 两遍>85）未满足（E1 第二遍 82<85），未重跑。**裁定：不重跑**——query 是 Master RPC、EID 不作用于它；4M·E0 锚点 query 102/90/79（极差 23µs）说明遍间漂移普遍；与 query 无关的 `read_us` 差 36.5µs 已给出数据面结论。128K raw ΔP50 17.4 含 15.5µs query 差，同 query 归一后约 33µs；E0 两遍都低在本窗口成立，但**可复现性 [未验证]**，报告按此表述。**NOF-155 结论不变：拆细不是 T1 优化；正式 128KiB/32 IO 在偏差端。下一步建议 NOF-157 验证“放大 chunk”**（真实 vsegment，2MiB vs 128KiB，E1/E0，400-key 探针；vsegment child 是否认 env 未测），待用户确认后下发。报告 `第四阶段_node234/NOF155_拆包梯度_E0E1_2026-11-28.md`。正式结果仍 NOF-127（P50 1.034×）。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -11410,3 +11410,41 @@ P1 --①1.8--> P2 --②139.9 [drain 121.0]--> P3 --③11.0--> P4 --④5.3--> P5(
 
 - 只读优先；不重编/不改码/不重启 target/etcd/不写 SSD；null bdev/master 测试后清理。
 - 预计 10–15 分钟（只回读）；触发重跑则 25–35 分钟。
+
+---
+
+# NOF-156 完成（2026-11-28 · 逐遍 query 回读 · **不重跑**）
+
+## 结果
+
+- 26 份 `run/nof155_read_*.log` 全部在位，各 **528 行**（400 measured + 128 warmup）；seq21–24 = 128K E0/E1/E1/E0 确认。
+- **128K query 逐遍**：
+
+| seq | EID | query 中位 | P25–P75 | read | total | P50 |
+|---:|---|---:|---:|---:|---:|---:|
+| 21 | E0 | 69.0 | 68–75 | 177.0 | 250.0 | 253.9 |
+| 24 | E0 | 76.0 | 75–78 | 177.0 | 256.0 | 263.2 |
+| 22 | E1 | 94.0 | 92–97 | 140.0 | 238.0 | 245.7 |
+| 23 | E1 | 82.0 | 80–85 | 141.0 | 227.5 | 236.5 |
+
+- 与 NOF-155 报告对账：E0 2 遍中位 72.5、E1 88.0、P50 258.55/241.1 均精确复现。
+- 1M 的 query 反向差（E0 108/99 vs E1 93/89）也是两遍一致，不是单遍造成。
+- **B 段触发条件未满足**：E0 两遍 69/76 均<80，但 E1 为 94（>85）+ 82（<85）；且日志无缺失/行数 528，故未重跑。
+
+## 裁定：不重跑
+
+- `query_us` 是 **Master 元数据 RPC**，`SPDK_URMA_EID_INDEX` 只作用于 NoF 数据面，EID 因果上不应改变 query。
+- 4M·E0 锚点 query 三遍 **102/90/79（极差 23µs）** ⇒ query 遍间漂移普遍；再跑 6 遍只会再采一次漂移，不能证明因果。
+- 与 query 无关的 `read_us` 差 **36.5µs** 已给出数据面结论；raw ΔP50 17.4 含 15.5µs query 差，同 query 归一后约 33µs。
+- E0 两遍都低在本窗口成立，但**可复现性 [未验证]**；报告已按“非单遍离群、但不可复现”表述，不再消耗环境。
+
+## 偏差 / 环境
+
+- `[未验证]` 528 行中哪 400 行属 measured；全量 528 与后 400 的 query 差 ≤2µs，不影响判决。
+- `[未验证]` E1 两遍 94/82 的成因；未重跑。
+- 环境零变更：:50057 / plain master / Null156 / null15x subsystem 均 0；etcd 2822942、target B 2824683、vseg master 2828887/2828890 存活；Keys=60000、enabled=1。
+- 产物：`run/nof156_query_per_pass.csv`（27 行）、`run/nof156_query_per_pass.txt`（83 行）。
+
+## 下一步
+
+- 建议 **NOF-157**：真实 vsegment 路径验证“放大 chunk”——`MC_NOF_SUBMIT_CHUNK_BYTES=2MiB`（每个 2MiB child 1 IO）vs 128KiB，E1/E0，先 400-key 探针；vsegment child 是否认该 env 未测（旧 NOF-015 认为固定 128KiB）。待用户确认后下发。
