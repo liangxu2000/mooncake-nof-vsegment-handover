@@ -70,7 +70,7 @@ node4：master + etcd + target B（11 盘 RAID0，strip 256KiB，nsid1，4457）
 | master | **`plain_nof135p` 2509048/2509051 运行中**：Keys=60000（当前 plain 基线，先保留） |
 | etcd | 2455814；`--max-request-bytes=67108864`；dbSize 1931.57MiB、raftIndex 2,261,561 |
 | node2 | 无 bench/register 残留；客户端 md5 bb4a07a3…（未重编） |
-| 当前任务 | **NOF-159（512K/128K 复测 · 60k）**：E0/E1 各 3 个正常遍（SLOW 不计、补跑）+ 4M 前后锚点；查清 512K E1 是否仍 49µs、128K E1 是否仍快 42–49µs；结果另写 `NOF159_512K_128K_复测_2026-11-28.md`；NOF-160 放大 chunk 未下发 |
+| 当前任务 | **NOF-159 完成**：512K E1 正常 16.7（E0 46.9），NOF-158 的 49.0 是慢化窗口、异常撤回；128K target E1 28.5 vs E0 38.1（−9.6 稳定），但 P50 +47.0 反向（wait 抖动）⇒ 128K 以 target 为准；报告 `NOF159_512K_128K_复测_2026-11-28.md`；NOF-160 放大 chunk 未下发 |
 | 风险 | node4 非独占：外部用户 `computin` 16:20–16:50 多次登录；本次重建后未被清；若再次清场/资源争用，停手回报 |
 
 ---
