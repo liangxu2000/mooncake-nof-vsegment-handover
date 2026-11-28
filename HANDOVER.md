@@ -105,7 +105,7 @@
 
 - **用户约束（2026-11-26 确认，后续不再提）**：① `stripe=2MiB` 固定，**不采用 4MiB/每 key 单 member 方案**——用 vsegment 就是要 key 拆到多个 member；② master/etcd 必须在**远端 node4**，不移到 node2；③ 当前只做 **member_count=2 / 双 target**，不加第三 target；④ **暂不改 vsegment 逻辑代码**。调优路线：**先拆解定位、再定向调**，不再逐个试已证否的旋钮（qpairs/workers/partitions/extent/layout/chunk）。
 
-- 当前任务：**NOF-154（URMA completion push E0/E1 机制取证 · 只读 · 2026-11-28）**。背景：NOF-153 按 EID 分开后**修正 NOF-152**——target 侧 **E0 TOTAL 88.6µs/IO、E1 33.4µs/IO，差 55.2µs；其中 push JFC wait 差 55.2µs=100%**；客户端 query 两侧均 109µs、wait−drain 残差 22/23µs，**客户端无差**。NOF-152 的“target 33µs”是 **E1 单侧值**，同窗口 E0 一直 ~89µs；E1 的 18% 差额在 **target 侧 URMA completion push**，不是 Mooncake 客户端。本单只读取证：`urma_admin show -d udmac0d1e2` 的 EID/端口/link、client `Selected URMA device ... EID`、target EID/jetty/JFC 映射、`num_jetty_per_ep=1`/`jfc_depth=4096`、poll 行为；必要时复跑 null bdev E0/E1 3 遍取 target final dump，确认 55µs。**不改码、不重启 target/etcd、不写 SSD**；若必须改 target/URMA 配置或重启 ⇒ 停手回报。预计 15–25 分钟。其他：正式结果仍 NOF-127（P50 1.034×）；后续 E0/E1 对比必须 target final dump 按 EID + 客户端按 EID 两表齐全。
+- 当前任务：**NOF-154（URMA completion push E0/E1 机制取证 · 只读 · 2026-11-28）**。背景：NOF-153 按 EID 分开后**修正 NOF-152**——target 侧 **E0 TOTAL 88.6µs/IO、E1 33.4µs/IO，差 55.2µs；其中 push JFC wait 差 55.2µs=100%**；客户端 query 两侧均 109µs、wait−drain 残差 22/23µs，**客户端无差**。NOF-152 的“target 33µs”是 **E1 单侧值**，同窗口 E0 一直 ~89µs；E1 的 18% 差额在 **target 侧 URMA completion push**，不是 Mooncake 客户端。本单只读取证：`urma_admin show -d udmac0d1e2` 的 EID/端口/link、client `Selected URMA device ... EID`、target EID/jetty/JFC 映射、`num_jetty_per_ep=1`/`jfc_depth=4096`、poll 行为；必要时复跑 null bdev E0/E1 3 遍取 target final dump，确认 55µs；**另加 Trace 臂**（同事提示）：`SPDK_URMA_STAGE_TRACE_US=100` + `SPDK_URMA_TRACE=1`，先 `strings` 核对两端二进制是否支持，仅客户端进程启用，E0/E1 各 1 遍；100 无输出再试 50/10；target 不重启。**不改码、不重启 target/etcd、不写 SSD**；若 trace/配置必须在 target 侧生效 ⇒ 停手回报。预计 15–30 分钟。其他：正式结果仍 NOF-127（P50 1.034×）；后续 E0/E1 对比必须 target final dump 按 EID + 客户端按 EID 两表齐全。
 - 历史：**NOF-094（量 vsegment 读的 plan/submit/wait 三段 · 零改码 · 用 `--warmup_keys=0` 检验“128 样本配额”假设）**。该假设已被 NOF-094 配对实验否证，路线关闭。**替代 NOF-091（三轮概念已混，废弃）。** 关键：bench 走的是 `TransferReadInternal`（be10be29 `client_service.cpp:5926`），三套 `VSEGMENT_READ_*` 里只有这一套在路径上；plain 臂的点位名不同（`GET_INTO_INTERNAL_NOF_READ`）；顺序必须 B1(plain) → B2(建 cid) → B3(vseg)，因为 vseg 写入会覆写 plain 前 400 key 的位置。
 - 历史：**NOF-091 第三轮（用 `--warmup_keys=0` 检验“128 配额被 warmup 吃满”假设）**。前两轮只证明 B1 路线可行、点位有记录；**“128 是配额”的推断已由 NOF-094 否证**（warmup=0 时读取点位 0 条），不得再引用。NOF-092 已完成（源码 = `LeeJace993/Mooncake` @ **`mooncake-vesegment`** @ `be10be29`，2026-11-17）。
 - 历史：**NOF-091 续（B1 路线可行但被两个阻塞卡住，开发侧 20:55 裁决：允许重启 master 建 `vseg_nof091`、不改全局 spdiag 配置改用连跑 ≥6 遍）**。**另更正：测试机源码 HEAD 为 `be10be29`，与开发侧分析用的本地副本 `d371e22` 不是同一份代码 ⇒ 本地得出的三个源码判断降级为「待核」，本单 C 段须回贴 `client_service.cpp` L2170–2340 原文。**
@@ -11297,13 +11297,19 @@ P1 --①1.8--> P2 --②139.9 [drain 121.0]--> P3 --③11.0--> P4 --④5.3--> P5(
 3. target URMA/jetty/JFC 证据：jetty 数、JFC 深度/共享、push C2H 路径、`num_jetty_per_ep=1`、`jfc_depth=4096`；target 日志 `push JFC wait` 行。
 4. 若现有日志不足：用 NOF-153 的 null bdev + 备用端口 plain master 复跑 400 keys E0/E1 各 3 遍，取 target final dump 与客户端 `poll_calls/empty`；不改 target 配置。
 5. 若需要修改 target URMA 配置或重启才能继续 ⇒ 停手列方案，不在本单执行。
+6. **Trace 臂（同事提示，2026-11-28）**：`SPDK_URMA_STAGE_TRACE_US=100` + `SPDK_URMA_TRACE=1`。
+   - 先 precheck：对**客户端 bench 二进制**和**现役 target 二进制**分别 `strings | grep SPDK_URMA_STAGE_TRACE_US` / `SPDK_URMA_TRACE`；记录命中与否（缺失的一侧不得假装打开）。
+   - 命中项只在 **bench 客户端进程** export；target **不重启、不改 env**（现役 target 未带 trace env 起，若 trace 必须在 target 侧生效 ⇒ 停手回报，不重启）。
+   - 用 NOF-153 的 null bdev + 备用端口 plain master，400 keys、chunk=4MiB、diag on，**E0 / E1 各 1 遍**带两个 trace env；若 `STAGE_TRACE_US=100` 无输出，仅客户端重试 50 / 10 两档，target 不动。
+   - 抓：URMA stage trace 行（阶段名 + 耗时）、target push JFC 相关行、客户端 `poll_calls/empty`；与 E0/E1 的 55µs 对齐判读。
 
 ## B. 判读与交付
 
 - EID 映射表 + E0/E1 target TOTAL/push JFC/W9 + 客户端 poll；明确 55µs 是 UB 侧还是客户端/URMA provider。
+- Trace 结果按「阶段名 → E0 耗时 / E1 耗时 → 是否解释 55µs」单列；trace 缺哪一侧、哪一档阈值无输出，都要写明。
 - 若确认 UB 侧 EID/口差异：结论「E1 是部署/URMA 侧旋钮，不是 Mooncake 可优化项」；给后续是否值得做 target EID/配置试验的建议（另单、需重启）。
 - 若证据不足：列缺口，不猜。
 
 ## C. 边界
 
-- 只读/现有日志优先；不改码/不重启 target/etcd/不写 SSD；null bdev/master 测试后清理；预计 15–25 分钟。
+- 只读/现有日志优先；不改码/不重启 target/etcd/不写 SSD；null bdev/master 测试后清理；trace env 只加在客户端进程，不写系统 env；预计 15–30 分钟。
